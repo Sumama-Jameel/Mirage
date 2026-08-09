@@ -1,0 +1,6 @@
+target/
+.cargo/
+.rust
+.opencode/
+.kimchi/
+.DS_Store

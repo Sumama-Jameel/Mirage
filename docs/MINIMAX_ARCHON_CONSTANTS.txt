@@ -1,0 +1,176 @@
+=== MINIMAX ARCHON API CONSTANTS ===
+Extracted: 2026-07-17
+Source: agent.minimax.io web app JS bundle (prod-web-va-0.1.93)
+Bundle: page-03d6c4451dfc5072.js (page_chunk)
+
+These are extracted from the Next.js minified JS bundles served
+from https://cdn.hailuo.ai/mavis-chat/prod-web-va-0.1.93/_next/static/chunks/
+
+Hardcoded in `direct.rs` as `SIGNING_SECRET` and used by
+`build_auth_headers()`. Do NOT change unless the web app ships
+a new bundle version with a different secret.
+
+=== SIGNING CONSTANTS ===
+
+CURRENT (hardcoded in SIGNING_SECRET):
+export MINIMAX_SIGNING_SECRET="I*7Cf%WZ#S&%1RlZJ&C2"
+
+=== AUTHENTICATION ALGORITHM ===
+
+x-timestamp = Math.floor(Date.now() / 1000)   // UNIX SECONDS (NOT ms!)
+x-signature = md5(x-timestamp + SIGNING_SECRET + body)
+  where body = stringified JSON or raw string
+
+yy = md5(encodeURIComponent(hasSearchParamsPath) + "_" + bodyJSON + md5(time_ms) + "ooui")
+  where:
+    hasSearchParamsPath = path + "?" + urlencoded(all_query_params)
+    bodyJSON = JSON.stringify(body) for POST requests, "{}" for non-POST
+    time_ms = Date.now() in MILLISECONDS
+
+token header = JWT from localStorage._token
+
+=== QUERY PARAMS (all requests) ===
+
+device_platform=web
+biz_id=3
+app_id=3001
+version_code=22201
+uuid=<from localStorage>
+device_id=<from localStorage/sessionStorage>
+user_id=<from localStorage.realUserID>
+token=<JWT>
+client=web|h5
+region=en
+unix=<timestamp_ms>
+timezone_offset=<minutes * -60>
+sys_language=en|zh
+lang=en|zh
+os_name=Windows|macOS|Linux|unknown
+browser_name=Chrome|Firefox|Safari|unknown
+device_memory=<navigator.deviceMemory>
+cpu_core_num=<navigator.hardwareConcurrency>
+browser_language=<navigator.language>
+browser_platform=<navigator.platform>
+screen_width=<screen.width>
+screen_height=<screen.height>
+
+=== API ENDPOINTS ===
+
+Base: /archon/api/v1 (resolved to agent.minimax.io or agent-stream.minimax.io)
+Stream: agent-stream.minimax.io (used when the app has BB && ($L || tY))
+
+List agents:    GET  /archon/api/v1/agent
+Agent session:  POST /archon/api/v1/agent/{agentId}/session  (body: {})
+Send message:   POST /archon/api/v1/session/{sessionId}/message
+User renewal:   POST /v1/api/user/renewal
+
+=== AGENTS LIST (GET /archon/api/v1/agent) ===
+
+Array of agents, each with:
+  - name (numeric string ID, e.g. "405561744400588")
+  - display_name (user-facing name, e.g. "Mavis")
+  - agent_role (e.g. "mavis", "general", "coder", "verifier")
+  - avatar, description, created_at, root_session_id
+
+Known built-in agents:
+  "405561744400588" → Mavis (mavis)   ← DEFAULT for chat
+  "405561744400589" → General (general)
+  "405561744400590" → Coder (coder)
+  "405561744400591" → Verifier (verifier)
+  "405561744400587" → (fifth built-in agent)
+
+IMPORTANT: Agent name is the NUMERIC `name` field, NOT
+`user_detail_agent.userID` (which is the user's identity as
+an agent creator, not an agent to interact with).
+
+=== CRITICAL AUTH RULE ===
+
+The `token` in BOTH the header AND the query params must be
+the SAME JWT (from `_token` localStorage key). Using different
+tokens (e.g. `_token` for header and `user_detail_agent.token`
+for query param) results in HTTP 401.
+
+The `user_detail_agent.token` has a DIFFERENT SIGNATURE from
+`_token` even though the payload is identical. The API validates
+that both tokens match.
+
+=== MESSAGE BODY FORMAT ===
+
+All fields must be proper types. The serialized JSON must
+match exactly what the Go server expects:
+  - "content": string
+  - "model": {"provider_id":"MiniMax","model_id":"...","variant":""}
+  - "turn_id": "1"     ← STRING, not number!
+  - "worktreeMode": "false"  ← STRING, not boolean!
+
+=== SSE STREAMING RESPONSE ===
+
+The new archon API uses a different SSE format from the old
+matrix API. No more `messages` array with `is_final`. Instead:
+
+  {"type":10}  ← Session init (ignore)
+  {"type":2,"agent_message":{...}}  ← User echo or final msg (ignore for streaming)
+  {"type":6,"agent_message_chunk":{
+    "chunk_index":0,
+    "thinking_content":"...",
+    "msg_content":"...",
+    "finish":true|false,
+    "finish_reason":"stop"|"toolUse"|null,
+    "thinking_duration_ms":1234
+  }}  ← Streaming chunk! Contains full content up to this point.
+       Client computes delta by comparing with previous content.
+
+Models map:
+  "minimax-m3"           → MiniMax-M3 (450K context, thinking switchable)
+  "minimax-m2.7"         → MiniMax-M2.7 (200K, thinking forced_on)
+  "minimax-m2.7-highspeed" → MiniMax-M2.7-highspeed (200K, thinking forced_on)
+
+Old matrix API (may also be relevant):
+  POST /matrix/api/v1/chat/send_msg
+  POST /matrix/api/v1/cs/init
+  POST /matrix/api/v1/cs/send_message
+
+=== ERROR 2056 / 42212 (TOKEN PLAN EXHAUSTION) ===
+
+The account-level error code 2056 ("Token Plan usage limit reached", also
+surfaced as archon message code 42212) is a billing/quota state on the
+MiniMax account, NOT a signing or protocol failure. The request is accepted
+(HTTP 200) and the server replies in-band with `finish_reason: error`. Per
+MiniMax docs it is NOT retry-able: the quota is governed by 5-hour rolling +
+weekly windows.
+
+Resolution (any one works):
+  - Daily check-in in MiniMax Code (agent.minimax.io) earns free credits
+    (400/day, 1000 on days 4/7, 4000/week).
+  - Purchase Credits or upgrade the Token Plan.
+  - Switch to a pay-as-you-go Open Platform API key.
+  - Wait for the quota window to reset.
+
+The gateway caches the exhausted state (~30 min, TTL in
+`providers/minimax/mod.rs` as QUOTA_BLOCK_TTL) so retries fail fast instead
+of burning a session + ~8s per call, and appends this remediation to the
+surfaced error. Detection markers: "2056", "42212", "Token Plan"
+(`is_minimax_quota_exhaustion` in mod.rs).
+
+The provider sends `region=en`, `sys_language=en`, `lang=en` matching the
+documented browser capture above.
+
+=== RE-EXTRACTION ===
+
+If the signing secret changes (the server returns "invalid signature"
+with the correct algorithm):
+
+1. Load https://agent.minimax.io in a real browser
+2. F12 → Network tab
+3. Look for any XHR/fetch to /archon/api/v1/...
+4. Check the request headers:
+   - x-timestamp (should be ~10 digits = seconds)
+   - x-signature (32 hex chars = md5)
+5. To find the secret in JS:
+   a. Find the latest JS bundle from cdn.hailuo.ai
+   b. Search for "x-signature" or "x-timestamp" in the bundle
+   c. The secret follows the template: md5(timestamp + SECRET + body)
+   d. Current secret was found by locating the string adjacent to
+      the template literal in the L() function
+6. The yy computation is in module 52724, x-signature in module 96467
+   (md5 implementation), and the L() function in the main page chunk.

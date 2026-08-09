@@ -1,0 +1,141 @@
+## OpenAI — ChatGPT / API
+
+
+* **GPT-5.6 Sol** — flagship reasoning model
+* **GPT-5.6 Terra** — balanced intelligence/cost
+* **GPT-5.6 Luna** — cheaper high-volume model
+* **GPT-5.5**
+* **GPT-5.5 Pro**
+* **GPT-5.4 Pro**
+* **gpt-5-chat-latest**
+
+* GPT Image 2 (image generation)
+* GPT-Realtime-Whisper (speech/transcription related models)
+* GPT-4o Transcribe
+* GPT-4o mini Transcribe
+
+
+---
+
+## Anthropic — Claude
+
+* **Claude opus 5**
+* **Claude Fable 5** — newest long-running agent model
+* **Claude Opus 4.8** — complex coding/enterprise reasoning
+* **Claude Sonnet 5** — speed + intelligence balance
+* **Claude Haiku 4.5** — fastest lightweight model
+
+---
+
+## Google — Gemini
+
+
+* **Gemini 3.6 Flash** — latest general fast model
+* **Gemini 3.5 Flash**
+* **Gemini 3.5 Flash-Lite**
+* **Gemini 3.1 Pro**
+* **Gemini 3.5 Audio**
+* **Gemini Omni Flash**
+* **Gemini 3.1 Flash Image**
+
+
+---
+
+## xAI — Grok
+
+
+* **Grok 4.5** — newest flagship
+* **Fast, expert, heavy and build variants of Grok 4.5**
+
+---
+
+## Moonshot AI — Kimi
+
+
+* **Kimi K3** — newest flagship
+* **Kimi K3 instant**
+* **Kimi K3 Swarm**
+* Kimi K2 series
+* Kimi K2.6/K2.x variants and "coder" variants
+
+
+---
+
+## Alibaba — Qwen
+
+* **Qwen3.8-Max-Preview**
+* **Qwen3.7-Plus**
+* **Qwen3.6-Max-Preview**
+* **Qwen3.5-Omni-Plus**
+* **Qwen3.6-Plus**
+* **Qwen3.7-Max**
+* **Qwen3.7**
+* **Qwen3.6**
+* **Qwen3.5**
+* **Qwen3**
+* **Qwen3-VL** (vision-language)
+* **Qwen3-Coder** (coding)
+* **Qwen3-VL-235B-A22B**
+
+---
+
+## MiniMax
+
+* **MiniMax M3**
+* **MiniMax-M2.7**
+* **MiniMax-M2.7-highspeed**
+
+* **MiniMax H3** (video generation)
+* **Music-2.6**
+* **Speech-2.8**
+
+
+---
+
+
+## DeepSeek
+
+
+DeepSeek-V4-Pro — flagship reasoning model
+DeepSeek-V4-Flash — faster/lower-cost model
+DeepSeek-V3.2
+DeepSeek-R1 (reasoning model, older but still widely used)
+Variants of vision, instant, expert, deepthink, research, etc.
+
+
+
+
+## Meta AI — Llama
+
+Musespark 1.1
+Musespark
+Llama 5 (newest generation)
+Llama 4 Maverick
+Llama 4 Scout
+Thinking and instant variants
+
+
+## GLM - Ziphu AI
+
+
+GLM-5.2
+GLM-5.1
+GLM-5-Turbo
+GLM-5V-Turbo
+GLM-4.7
+
+
+## Mimo - Xiaomi
+
+MiMo-V2.5
+MiMo-V2.5-Pro
+MiMo-V2.5-TTS
+MiMo-V2.5-TTS-VoiceDesign
+MiMo-V2.5-TTS-VoiceClone
+MiMo-V2.5-ASR
+
+
+## Mistral
+
+mistral-large-latest(mistral large 3)
+mistral-medium-latest(mistral medium 3.5)

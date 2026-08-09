@@ -1,0 +1,76 @@
+## Linux x86_64
+
+```bash
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz
+tar xzf obscura-x86_64-linux.tar.gz
+./obscura --version
+```
+
+## Linux ARM64
+
+```bash
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+tar xzf obscura-aarch64-linux.tar.gz
+./obscura --version
+```
+
+Linux builds target Ubuntu 22.04 and require glibc 2.35+.
+
+## macOS Apple Silicon
+
+```bash
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+tar xzf obscura-aarch64-macos.tar.gz
+./obscura --version
+```
+
+## macOS Intel
+
+```bash
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+tar xzf obscura-x86_64-macos.tar.gz
+./obscura --version
+```
+
+## Windows
+
+Download the `.zip` from [Releases](https://github.com/h4ckf0r0day/obscura/releases), extract, run `obscura.exe --version`.
+
+## Arch Linux (AUR)
+
+```bash
+yay -S obscura-browser
+```
+
+## Docker
+
+```bash
+docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+```
+
+Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc`, ~57 MB compressed.
+
+## From source
+
+See [Build from source](Build-from-source.md).
+
+## What's in the archive
+
+- `obscura`: CLI and CDP server.
+- `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
+
+## Smoke test
+
+```bash
+./obscura fetch https://example.com --eval "document.title"
+```
+
+Expected output: `"Example Domain"`.
+
+## Troubleshooting
+
+`cannot execute binary file`: wrong arch. Check `uname -m`.
+
+`GLIBC_2.35 not found`: distro is older than Ubuntu 22.04. Use Docker or build from source.
+
+macOS Gatekeeper warning: `xattr -d com.apple.quarantine ./obscura`.

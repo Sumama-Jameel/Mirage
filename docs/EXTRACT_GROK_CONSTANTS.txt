@@ -1,0 +1,114 @@
+=== GROK CHALLENGE CONSTANTS ===
+Extracted: 2026-07-15 (STALE - needs re-extraction)
+Browser: Firefox ESR 140.12
+Session: d6qafzml.default-esr140
+
+These are needed to generate valid x-statsig-id tokens
+for grok.com's anti-bot bypass. They are hardcoded in
+`challenge.rs` as `DEFAULT_HEADER_HEX`, `DEFAULT_SUFFIX`,
+and `DEFAULT_TRAILER`. The env vars override at runtime.
+
+=== CURRENT CONSTANTS (STALE) ===
+
+export GROK_CHALLENGE_HEADER_HEX="009a030e5b3a5ec69fe18b49ad9c77a2fe3d275536e0c8634bce31fc915f8a6dae07e1e58aeba7c358565c32e4805aab04"
+export GROK_CHALLENGE_SUFFIX="obfiowerehiringb94f340f0a3d70a3d70a0570a3d70a3d70c0570a3d70a3d70c0f0a3d70a3d70a00"
+export GROK_CHALLENGE_TRAILER="3"
+
+=== HOW TO RE-EXTRACT ===
+
+When these stop working (403 "anti-bot rules" again):
+
+Method 1: Browser Console (Recommended)
+---------------------------------------
+
+1. Open https://grok.com in Firefox (must be logged in with X Premium)
+2. F12 → Console tab
+3. Paste this and press Enter:
+
+window.__gc={hi:null,tok:null};var _d=crypto.subtle.digest.bind(crypto.subtle);crypto.subtle.digest=async function(a,d){var s=new TextDecoder().decode(d);if(s.includes('!')&&(s.startsWith('GET!')||s.startsWith('POST!')))window.__gc.hi=s;return _d(a,d)};var _f=window.fetch.bind(window);window.fetch=function(u,i){var url=(typeof u=='string'?u:u?.url)||'';if(url.includes('/rest/app-chat/')&&i?.headers){var t=i.headers['x-statsig-id']||i.headers['X-Statsig-Id'];if(t)window.__gc.tok=t}return _f(u,i)};console.log('ready')
+
+4. Send a message in the grok chat
+5. After response appears, paste: JSON.stringify(window.__gc)
+6. The output will look like: {"hi":"POST!/rest/app-chat/conversations/new!1234567890abcdef...","tok":"BASE64_TOKEN..."}
+7. Use Method 3 below to convert these to env vars.
+
+Method 2: DevTools Network Tab
+------------------------------
+
+1. Open https://grok.com in Firefox (must be logged in)
+2. F12 → Network tab
+3. Send a message in the grok chat
+4. Find the POST request to /rest/app-chat/conversations/new
+5. Copy the x-statsig-id header value from Request Headers
+6. Base64-decode it into 70 raw bytes
+7. Bytes 0-48 (hex-encoded) → GROK_CHALLENGE_HEADER_HEX
+8. Byte 69 → GROK_CHALLENGE_TRAILER
+9. To get the suffix, use Method 1 (the console script captures it).
+
+Method 3: Auto-Extract from Browser Console Output
+---------------------------------------------------
+
+If you captured the token via Method 1, paste the JSON output into
+the gateway's update endpoint (if available) or manually compute:
+
+The token is XOR'd with a single random byte. The gateway's
+parse_extracted_data() function brute-forces the XOR key by finding
+the K whose decoded counter (bytes 49-52) is closest to the current
+timestamp.
+
+Alternatively, use this conversion script in the browser console
+(after capturing window.__gc):
+
+(function(){
+  var tok = window.__gc.tok;
+  var raw = new Uint8Array([...atob(tok)].map(c=>c.charCodeAt(0)));
+  // Brute-force XOR key
+  var now = Math.floor(Date.now()/1000) - 1682924400;
+  for (var k = 0; k < 256; k++) {
+    var dec = new Uint8Array(raw);
+    for (var i = 0; i < dec.length; i++) dec[i] ^= k;
+    var counter = dec[49] | (dec[50]<<8) | (dec[51]<<16) | (dec[52]<<24);
+    if (Math.abs(counter - now) < 10) {
+      var headerHex = [...dec.slice(0,49)].map(b=>b.toString(16).padStart(2,'0')).join('');
+      var trailer = dec[69];
+      var suffix = window.__gc.hi.split('!').slice(2).join('!');
+      suffix = suffix.replace(/^-?\d+/, '');
+      console.log('GROK_CHALLENGE_HEADER_HEX=' + headerHex);
+      console.log('GROK_CHALLENGE_SUFFIX=' + suffix);
+      console.log('GROK_CHALLENGE_TRAILER=' + trailer);
+      break;
+    }
+  }
+})();
+
+=== HOW THE ANTI-BOT BYPASS WORKS ===
+
+Grok's web client runs obfuscated JS that generates a per-request
+x-statsig-id. Requests without it get rejected with error code 7
+"Request rejected by anti-bot rules".
+
+Token layout (70 bytes, base64-encoded):
+  header[49] + counter_le32[4] + sha256(method + "!" + path + "!" + counter + suffix)[0..16] + trailer[1]
+
+Every byte is then XOR'd with a random key.
+
+- header: 49-byte static fingerprint extracted once from the browser
+- counter: seconds since epoch 1682924400 (May 1, 2023)
+- suffix: static string baked into the challenge JS
+- trailer: single constant byte
+
+When the Statsig SDK evaluation fails (headless, first paint, etc.),
+grok.com falls back to btoa("x1:" + error.toString()). The gateway
+detects this pattern and logs it. The fallback token is NOT suitable
+for persistent use — it changes per request and is rejected after
+the SDK recovers.
+
+=== NOTES ===
+
+- The hash suffix changes rarely (grok.com deploy cycle).
+- The header changes every page load (contains a random prefix byte)
+  but is functionally equivalent (same verification blob).
+- If grok.com returns 403 with "x1:" or "e:" prefix in the error,
+  the Statsig SDK failed to load. Check browser console for errors.
+- TLS fingerprint impersonation (wreq/BoringSSL) may be required to
+  pass Cloudflare JA3/JA4 checks on grok.com.
