@@ -10,7 +10,7 @@ use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatContent,
     ChatMessage, ChatMessageDelta, ChunkChoice, Usage,
 };
-use crate::providers::tool_call::convert_xml_tool_calls;
+use crate::providers::mtp;
 use crate::providers::streaming_upload::download_and_hash_batch;
 use crate::session::SessionHandle;
 
@@ -324,7 +324,7 @@ impl DirectClient {
                     .and_then(|id| calls_by_id.get(id).copied());
                 let items: Vec<(Option<&crate::models::ToolCall>, Option<&str>, &str)> =
                     vec![(call, m.tool_call_id.as_deref(), &text)];
-                let formatted = crate::providers::tool_call::format_tool_results(&items);
+                let formatted = mtp::format_tool_results(&items);
                 if !formatted.is_empty() {
                     parts.push(formatted);
                 }
@@ -339,24 +339,38 @@ impl DirectClient {
                 };
                 parts.push(format!("{}: {}", label, text));
             }
-            // Render assistant tool calls into the transcript so the model
-            // sees what it previously requested.
+            // Render assistant tool calls into the transcript as MTP blocks
+            // so the model sees the same dialect it is asked to emit.
             if let Some(calls) = &m.tool_calls {
                 for call in calls {
+                    let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                    let mtp_call = mtp::MirageToolCall {
+                        id: Some(call.id.clone()),
+                        name: call.function.name.clone(),
+                        arguments: args,
+                    };
+                    let block = serde_json::to_string(&mtp_call)
+                        .unwrap_or_else(|_| "{}".to_string());
                     parts.push(format!(
-                        "<tool_call>{{\"name\":\"{}\",\"arguments\":{}}}</tool_call>",
-                        call.function.name, call.function.arguments
+                        "{}\n{}\n{}",
+                        mtp::TOOL_CALL_START,
+                        block,
+                        mtp::TOOL_CALL_END
                     ));
                 }
             }
         }
         let joined = parts.join("\n");
         // MiMo has no native function-calling channel (verified live). When
-        // tools are requested, inject the function definitions into the query
-        // text and parse <tool_call> markers out of the reply, matching the
-        // DeepSeek/Gemini XML fallback.
+        // tools are requested, compile them into the MTP system prompt and
+        // parse [MIRAGE_TOOL_CALL_V1] blocks out of the reply.
         if let Some(tools) = &request.tools {
-            crate::providers::tool_call::inject_tool_prompt("mimo", &joined, tools, request.tool_choice.as_ref())
+            format!(
+                "{}\n\nUser request:\n{}",
+                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false),
+                joined
+            )
         } else {
             joined
         }
@@ -370,7 +384,6 @@ impl DirectClient {
     ) -> Result<ChatCompletionResponse, GatewayError> {
         let response_id = format!("chatcmpl-{}", upload::rand_hex(16));
         let model = request.model.clone();
-        let had_tools = request.tools.is_some();
 
         let attachments = self.process_attachments(&request).await?;
         let mut state = self.resolve_conversation(gateway_session_id, &request.session_url).await;
@@ -414,18 +427,6 @@ impl DirectClient {
                             tool_calls.push(call.clone());
                         }
                     }
-                }
-            }
-        }
-
-        if had_tools {
-            // MiMo has no native tool channel; calls always arrive as XML
-            // markers in the content stream. Parse and strip them.
-            let (cleaned, parsed) = convert_xml_tool_calls(&full_content, true);
-            if let Some(calls) = parsed {
-                if !calls.is_empty() {
-                    tool_calls = calls;
-                    full_content = cleaned;
                 }
             }
         }
@@ -502,6 +503,9 @@ impl DirectClient {
 
         let (tx, rx) = mpsc::unbounded_channel::<Result<ChatCompletionChunk, GatewayError>>();
 
+        // Tool definitions for MTP validation inside the stream task.
+        let tool_defs = request.tools.clone().unwrap_or_default();
+
         tokio::spawn({
             let tx = tx.clone();
             let response_id = response_id.clone();
@@ -512,11 +516,10 @@ impl DirectClient {
                 let mut finish_emitted = false;
                 let mut prev_content = String::new();
                 let mut prev_thinking = String::new();
-                // Tool-call XML stripper (used only when tools were
-                // requested): absorbs <tool_call>…</tool_call> regions so they
-                // never leak into streamed text, and collects them for a final
-                // tool_calls chunk.
-                let mut stripper = crate::providers::tool_call::XmlToolCallStripper::new();
+                // MTP stream state: absorbs [MIRAGE_TOOL_CALL_V1] blocks so
+                // they never leak into streamed text, validates them against
+                // the client definitions, and collects OpenAI-shaped calls.
+                let mut mtp_state = mtp::MtpStreamState::new();
                 let mut tool_calls: Vec<crate::models::ToolCall> = Vec::new();
 
                 let mut stream = raw_stream;
@@ -542,10 +545,12 @@ impl DirectClient {
                             };
                             prev_content = c.clone();
                             let clean = if tools_enabled {
-                                let (clean, tc) = stripper.process(&new);
-                                if let Some(tc) = tc {
-                                    if !tool_calls.iter().any(|c| c.id == tc.id) {
-                                        tool_calls.push(tc);
+                                let clean = mtp_state.process_delta(&new, &tool_defs);
+                                if !mtp_state.collected_tool_calls.is_empty() {
+                                    for tc in mtp_state.collected_tool_calls.drain(..) {
+                                        if !tool_calls.iter().any(|c| c.id == tc.id) {
+                                            tool_calls.push(tc);
+                                        }
                                     }
                                 }
                                 clean
@@ -607,8 +612,16 @@ impl DirectClient {
                     }));
                 }
 
-                // Emit collected tool calls as a single final chunk (mirrors
-                // DeepSeek's XML fallback streaming behavior).
+                // Flush any pending MTP block at stream end, then emit
+                // collected tool calls as a single final chunk.
+                if tools_enabled {
+                    mtp_state.finish(&tool_defs);
+                    for tc in mtp_state.collected_tool_calls.drain(..) {
+                        if !tool_calls.iter().any(|c| c.id == tc.id) {
+                            tool_calls.push(tc);
+                        }
+                    }
+                }
                 if tools_enabled && !tool_calls.is_empty() {
                     let calls: Vec<crate::models::ToolCall> = tool_calls.clone();
                     let _ = tx.send(Ok(ChatCompletionChunk {

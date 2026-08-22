@@ -11,7 +11,7 @@ use crate::models::{
     ChatMessageDelta, ChunkChoice, FunctionCall, Tool, ToolCall, Usage,
 };
 use crate::providers::tokenizer::estimate_tokens;
-use crate::providers::tool_call::{convert_xml_tool_calls, inject_tool_prompt};
+use crate::providers::mtp;
 use crate::session::SessionHandle;
 
 use super::auth::{extract_grok_cookies, validate_grok_session};
@@ -394,7 +394,7 @@ impl DirectClient {
             .iter()
             .map(|(c, id, o)| (c.as_ref(), id.as_deref(), o.as_str()))
             .collect();
-        crate::providers::tool_call::format_tool_results(&refs)
+        mtp::format_tool_results(&refs)
     }
 
     fn build_conversation_payload(&self, request: &ChatCompletionRequest, processed_urls: &[String], conversation_id: &str) -> serde_json::Value {
@@ -464,9 +464,10 @@ impl DirectClient {
 
         if let Some(tools) = &request.tools {
             if !tools.is_empty() {
-                let tool_block = inject_tool_prompt("grok", &user_message, tools, request.tool_choice.as_ref());
+                let mtp_prompt =
+                    mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false);
                 payload["message"] =
-                    serde_json::json!(format!("{}\n\n{}", user_message, tool_block));
+                    serde_json::json!(format!("{}\n\nUser request:\n{}", mtp_prompt, user_message));
             }
         }
 
@@ -483,8 +484,7 @@ impl DirectClient {
         let mut full_text = String::new();
         let mut reasoning_text = String::new();
         let mut finish_reason = "stop".to_string();
-        let mut xml_tool_content = String::new();
-        let mut is_collecting_xml_tool = false;
+        let mut mtp_state = mtp::MtpStreamState::new();
 
         let mut stream = response.bytes;
 
@@ -524,13 +524,13 @@ impl DirectClient {
                     }
                 }
 
-                // Priority 2: XML tool call (prompt injection via <tool_call>)
-                if ndjson.token.contains("<tool_call>") {
-                    is_collecting_xml_tool = true;
-                }
-                if is_collecting_xml_tool {
-                    xml_tool_content.push_str(&ndjson.token);
-                    continue;
+                // Priority 2: MTP tool blocks in content tokens (the
+                // universal dialect; blocks are absorbed, never leaked).
+                if !ndjson.is_thinking() && !ndjson.token.is_empty() {
+                    let visible = mtp_state.process_delta(&ndjson.token, tools);
+                    if !visible.is_empty() {
+                        full_text.push_str(&visible);
+                    }
                 }
 
                 // Priority 3: reasoning tokens
@@ -545,24 +545,22 @@ impl DirectClient {
                     continue;
                 }
 
-                // Priority 4: content tokens
-                if !ndjson.token.is_empty() || ndjson.is_soft_stop() {
-                    full_text.push_str(&ndjson.token);
-                }
-                if ndjson.is_soft_stop() {
+                // Priority 4: soft-stop on non-content tokens
+                if ndjson.token.is_empty() && ndjson.is_soft_stop() {
                     finish_reason = "stop".to_string();
                 }
             }
         }
 
-        // After stream ends, check for XML tool calls
-        if !xml_tool_content.is_empty() && !tools.is_empty() {
-            let (remaining_text, maybe_calls) = convert_xml_tool_calls(&xml_tool_content, true);
-            if let Some(tc) = maybe_calls {
-                if !tc.is_empty() {
-                    return Ok((remaining_text, reasoning_text, Some(tc), "tool_calls".to_string()));
-                }
-            }
+        // Flush any pending block and collect validated calls.
+        mtp_state.finish(tools);
+        if !mtp_state.collected_tool_calls.is_empty() {
+            return Ok((
+                full_text,
+                reasoning_text,
+                Some(std::mem::take(&mut mtp_state.collected_tool_calls)),
+                "tool_calls".to_string(),
+            ));
         }
 
         Ok((full_text, reasoning_text, None, finish_reason))
@@ -708,8 +706,7 @@ impl DirectClient {
         let session_url = Some(format!("{}/chat/{}", GROK_BASE_URL, conversation_id));
 
         tokio::spawn(async move {
-            let mut xml_tool_content = String::new();
-            let mut is_collecting_xml_tool = false;
+            let mut mtp_state = mtp::MtpStreamState::new();
             let mut sent_first_chunk = false;
             let mut sent_tool_calls = false;
             let mut stream = response.bytes;
@@ -866,21 +863,31 @@ impl DirectClient {
                         continue;
                     }
 
-                    // XML tool call (prompt injection)
-                    if ndjson.token.contains("<tool_call>") {
-                        is_collecting_xml_tool = true;
-                    }
-                    if is_collecting_xml_tool {
-                        xml_tool_content.push_str(&ndjson.token);
-                        continue;
+                    // Content tokens: feed through the MTP stream state when
+                    // tools are in flight so blocks are absorbed, validated
+                    // against the client definitions, and never leaked.
+                    let mut visible_text: Option<String> = None;
+                    if !ndjson.is_thinking() && !ndjson.token.is_empty() {
+                        if tools.is_empty() {
+                            visible_text = Some(ndjson.token.clone());
+                        } else {
+                            let visible = mtp_state.process_delta(&ndjson.token, &tools);
+                            if !mtp_state.collected_tool_calls.is_empty() {
+                                // Defer emission to the post-loop flush below.
+                                continue;
+                            }
+                            if !visible.is_empty() {
+                                visible_text = Some(visible);
+                            }
+                        }
                     }
 
                     // Normal content tokens
-                    if ndjson.token.is_empty() && !ndjson.is_soft_stop() {
+                    if visible_text.is_none() && !(ndjson.token.is_empty() && ndjson.is_soft_stop()) {
                         continue;
                     }
 
-                    let role = if !sent_first_chunk {
+                    let role = if !sent_first_chunk && visible_text.is_some() {
                         sent_first_chunk = true;
                         Some("assistant".to_string())
                     } else {
@@ -902,7 +909,7 @@ impl DirectClient {
                             index: 0,
                             delta: ChatMessageDelta {
                                 role,
-                                content: if ndjson.token.is_empty() { None } else { Some(ndjson.token.clone()) },
+                                content: visible_text,
                                 reasoning_content: None,
                                 citations: None,
                                 tool_calls: None,
@@ -918,11 +925,13 @@ impl DirectClient {
                 }
             }
 
-            // After stream ends, check for collected XML tool calls
-        if !xml_tool_content.is_empty() && !tools.as_ref().is_empty() && !sent_tool_calls {
-            let (_remaining, maybe_calls) = convert_xml_tool_calls(&xml_tool_content, true);
-            if let Some(tc) = maybe_calls {
-                if !tc.is_empty() {
+            // Flush any pending MTP block and emit collected tool calls.
+            if !tools.is_empty() {
+                mtp_state.finish(&tools);
+            }
+        if !mtp_state.collected_tool_calls.is_empty() && !sent_tool_calls {
+            let tc = std::mem::take(&mut mtp_state.collected_tool_calls);
+            if !tc.is_empty() {
                     sent_tool_calls = true;
                     if !sent_first_chunk {
                         let _ = tx.send(Ok(ChatCompletionChunk {
@@ -962,12 +971,10 @@ impl DirectClient {
                         }],
                         session_url: session_url.clone(),
                     }));
-                }
             }
         }
 
-        let final_finish = if sent_tool_calls {
-            "tool_calls"
+        let final_finish = if sent_tool_calls {            "tool_calls"
         } else {
             "stop"
         };
