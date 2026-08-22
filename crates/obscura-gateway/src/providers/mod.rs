@@ -15,6 +15,8 @@ use crate::state::AppState;
 pub mod authcheck;
 pub mod chatgpt;
 pub mod claude;
+#[cfg(test)]
+pub mod conformance;
 pub mod deepseek;
 pub mod file_upload;
 pub mod gemini;

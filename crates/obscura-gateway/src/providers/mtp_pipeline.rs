@@ -36,6 +36,8 @@ pub struct MtpPipeline {
     state: PipelineState,
     /// Calls collected by legacy dialects (outside MtpStreamState).
     extra_calls: Vec<ToolCall>,
+    /// First invalid block cached for the repair path.
+    pending_repair: Option<(String, mtp::MtpError)>,
     /// Sticky flag: any valid call seen this turn.
     saw_valid_call: bool,
     /// Repair attempts still available for invalid blocks this turn.
@@ -74,6 +76,7 @@ impl MtpPipeline {
             active,
             state: PipelineState::Idle,
             extra_calls: Vec::new(),
+            pending_repair: None,
             saw_valid_call: false,
             repairs_left: 0,
         };
@@ -247,9 +250,23 @@ impl MtpPipeline {
 
     /// Invalid-block errors recorded during the stream.
     pub fn take_errors(&mut self) -> Vec<(String, mtp::MtpError)> {
-        match &mut self.state {
+        let errs = match &mut self.state {
             PipelineState::Mtp(st) => st.take_errors(),
             _ => Vec::new(),
+        };
+        if !errs.is_empty() && self.pending_repair.is_none() {
+            // Cache the first failure for the repair path even after callers
+            // have drained diagnostics.
+            self.pending_repair = Some(errs[0].clone());
+        }
+        errs
+    }
+
+    /// Whether any invalid block was recorded (non-draining).
+    pub fn has_errors(&self) -> bool {
+        match &self.state {
+            PipelineState::Mtp(st) => st.has_errors(),
+            _ => false,
         }
     }
 
@@ -258,13 +275,12 @@ impl MtpPipeline {
     /// plus the raw failed payload (for diagnostics) — or `None` when there
     /// is nothing to repair or no budget left.
     pub fn next_repair_prompt(&mut self) -> Option<(ChatMessage, String)> {
-        let errors = self.take_errors();
-        let (raw, err) = errors.first()?;
+        let (raw, err) = self.pending_repair.take()?;
         if self.repairs_left == 0 {
             return None;
         }
         self.repairs_left -= 1;
-        let prompt = mtp::build_repair_prompt(err, raw);
+        let prompt = mtp::build_repair_prompt(&err, &raw);
         Some((
             ChatMessage {
                 role: "user".to_string(),
