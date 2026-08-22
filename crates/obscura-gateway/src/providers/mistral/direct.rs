@@ -413,13 +413,27 @@ impl DirectClient {
     /// convention for multi-turn history (the web API stores history server
     /// side, so only the latest turn is sent on continuation).
     fn latest_user_text(&self, request: &ChatCompletionRequest) -> String {
-        request
+        let raw = request
             .messages
             .iter()
             .rev()
             .find(|m| m.role == "user")
             .map(|m| m.content.as_text())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Compile client tools into the MTP system prompt (universal
+        // dialect); native `tools` are never forwarded upstream.
+        match request.tools.as_ref() {
+            Some(tools) if !tools.is_empty() => format!(
+                "{}\n\nUser request:\n{}",
+                crate::providers::mtp::build_mtp_system_prompt(
+                    tools,
+                    request.tool_choice.as_ref(),
+                    false
+                ),
+                raw
+            ),
+            _ => raw,
+        }
     }
 
     /// Non-streaming chat: consume the full stream and return one response.
@@ -628,6 +642,7 @@ impl DirectClient {
         let chat_id_hint = chat_id.clone();
         let features_owned = features.to_vec();
         let anonymous_identifier_owned = anonymous_identifier.clone();
+        let tool_defs_owned = request.tools.clone().unwrap_or_default();
 
         tokio::spawn(async move {
             let result = consume_stream(
@@ -640,6 +655,7 @@ impl DirectClient {
                 chat_id_hint.as_deref(),
                 &features_owned,
                 &anonymous_identifier_owned,
+                &tool_defs_owned,
             )
             .await;
             if let Err(e) = result {
@@ -663,7 +679,10 @@ async fn consume_stream(
     chat_id_hint: Option<&str>,
     features: &[String],
     anonymous_identifier: &str,
+    tool_defs: &[crate::models::Tool],
 ) -> Result<(), GatewayError> {
+    // MTP state absorbs [MIRAGE_TOOL_CALL_V1] blocks from content deltas.
+    let mut mtp_state = crate::providers::mtp::MtpStreamState::new();
     // Byte buffer: lines are split on `\n` and only complete lines are decoded
     // to UTF-8, so a multi-byte character split across network chunks is never
     // corrupted (avoids `from_utf8_lossy` per chunk).
@@ -740,10 +759,11 @@ async fn consume_stream(
                             // code-15 patches emitting the full content only
                             // forward the remaining delta.
                             last_content.push_str(&delta);
+                            let visible = feed_mtp(&mut mtp_state, tool_defs, &delta);
                             let _ = tx.send(Ok(build_chunk(
                                 response_id,
                                 model_id,
-                                Some(delta),
+                                visible,
                                 None,
                                 None,
                                 None,
@@ -862,10 +882,11 @@ async fn consume_stream(
                                             );
                                             sent_role = true;
                                         }
+                                        let visible = feed_mtp(&mut mtp_state, tool_defs, &delta);
                                         let _ = tx.send(Ok(build_chunk(
                                             response_id,
                                             model_id,
-                                            Some(delta),
+                                            visible,
                                             None,
                                             None,
                                             None,
@@ -968,6 +989,21 @@ async fn consume_stream(
 
         if finished {
             break;
+        }
+    }
+
+    // Flush any pending MTP block and emit collected calls.
+    if !tool_defs.is_empty() {
+        mtp_state.finish(tool_defs);
+        if !mtp_state.collected_tool_calls.is_empty() {
+            let _ = tx.send(Ok(build_chunk(
+                response_id,
+                model_id,
+                None,
+                None,
+                Some(std::mem::take(&mut mtp_state.collected_tool_calls)),
+                Some("tool_calls".to_string()),
+            )));
         }
     }
 
@@ -1357,6 +1393,24 @@ fn tool_call_from_value(chunk: &Value) -> Option<ToolCall> {
             arguments: arguments_str,
         },
     })
+}
+
+/// Feed one content delta through the MTP stream state. Returns the
+/// user-visible text (tool blocks absorbed), or None when nothing remains.
+fn feed_mtp(
+    state: &mut crate::providers::mtp::MtpStreamState,
+    tool_defs: &[crate::models::Tool],
+    delta: &str,
+) -> Option<String> {
+    if tool_defs.is_empty() {
+        return Some(delta.to_string());
+    }
+    let visible = state.process_delta(delta, tool_defs);
+    if visible.is_empty() && state.collected_tool_calls.is_empty() {
+        None
+    } else {
+        Some(visible)
+    }
 }
 
 fn build_chunk(
