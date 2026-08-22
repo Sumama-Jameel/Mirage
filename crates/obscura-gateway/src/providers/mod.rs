@@ -28,6 +28,7 @@ pub mod minimax;
 pub mod mimo;
 pub mod mistral;
 pub mod mtp;
+pub mod mtp_pipeline;
 pub mod profile;
 pub mod qwen;
 pub mod session_guard;
