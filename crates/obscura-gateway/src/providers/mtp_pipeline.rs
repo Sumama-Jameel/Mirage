@@ -21,8 +21,7 @@ use crate::models::{ChatCompletionRequest, ChatMessage, Tool, ToolCall};
 use super::mtp::{self, MtpStreamState};
 use super::profile::{find_profile_by_model, ProviderProfile, Quirks, ToolDialect, Transport};
 use super::tool_call::{
-    convert_xml_tool_calls, gemini_tool_use_prompt, inject_tool_prompt, parse_gemini_tool_calls,
-    XmlToolCallStripper,
+    gemini_tool_use_prompt, inject_tool_prompt, parse_gemini_tool_calls, XmlToolCallStripper,
 };
 
 /// Request+response pipeline for one chat turn.
@@ -275,11 +274,18 @@ impl MtpPipeline {
     /// plus the raw failed payload (for diagnostics) — or `None` when there
     /// is nothing to repair or no budget left.
     pub fn next_repair_prompt(&mut self) -> Option<(ChatMessage, String)> {
-        let (raw, err) = self.pending_repair.take()?;
-        if self.repairs_left == 0 {
+        // Ensure errors have been drained into the repair cache even if the
+        // caller never inspected take_errors().
+        if self.pending_repair.is_none() {
+            let _ = self.take_errors();
+        }
+        // Peek the budget BEFORE consuming the cached entry so a zero budget
+        // leaves the entry intact for diagnostics.
+        if self.repairs_left == 0 || !self.pending_repair.is_some() {
             return None;
         }
         self.repairs_left -= 1;
+        let (raw, err) = self.pending_repair.take()?;
         let prompt = mtp::build_repair_prompt(&err, &raw);
         Some((
             ChatMessage {

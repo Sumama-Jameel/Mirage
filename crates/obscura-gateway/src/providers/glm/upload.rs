@@ -235,6 +235,21 @@ impl UploadService {
             .and_then(|v| v.as_str())
             .unwrap_or(filename);
 
+        // Prefer the CDN URL from meta when present (capture-verified field:
+        // `meta.cdn_url`, alongside `meta.content_type` / `meta.size`); it is
+        // directly usable as a file reference. Fall back to the historical
+        // `{id}_{filename}` short reference otherwise.
+        if let Some(cdn) = body
+            .get("meta")
+            .and_then(|m| m.get("cdn_url"))
+            .or_else(|| body.get("cdn_url"))
+            .and_then(|v| v.as_str())
+        {
+            if !cdn.is_empty() {
+                return Ok(cdn.to_string());
+            }
+        }
+
         Ok(format!("{}_{}", id, filename))
     }
 }

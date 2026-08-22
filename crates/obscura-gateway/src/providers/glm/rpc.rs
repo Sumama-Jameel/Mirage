@@ -119,21 +119,11 @@ pub fn build_completion_body(
         "current_user_message_parent_id": serde_json::Value::Null,
     });
 
-    if let Some(ref tools) = request.tools {
-        body["tools"] = serde_json::to_value(tools).unwrap_or(serde_json::Value::Null);
-        if let Some(ref choice) = request.tool_choice {
-            body["tool_choice"] = serde_json::to_value(choice).unwrap_or(serde_json::Value::Null);
-        }
-        // CRITICAL: GLM-4.6+ and the glm-5 family require `tool_stream: true`
-        // when tools are present. Without it the model either returns no
-        // tool_calls or calls the wrong tools in a loop, even with a valid
-        // `tools` array. See Z.AI Stream Tool Call docs and the ZeroClaw bug
-        // report. We only enable this for models that support it; older
-        // glm-4 variants either ignore the flag or behave worse with it.
-        if model.supports_tool_streaming {
-            body["tool_stream"] = serde_json::Value::Bool(true);
-        }
-    }
+    // OpenAI `tools`/`tool_choice` are NEVER forwarded upstream: the MTP
+    // pipeline compiles them into the prompted tool protocol instead
+    // (strip_upstream_tools is a hard gateway invariant). The Z.AI endpoint's
+    // native tool fields trigger its own built-in tools, which the MTP policy
+    // explicitly forbids the model from using.
 
     body
 }

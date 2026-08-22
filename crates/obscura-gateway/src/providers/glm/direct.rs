@@ -23,9 +23,8 @@ use crate::models::{
 };
 use crate::providers::retry_after_from_map;
 use crate::providers::tokenizer::estimate_tokens;
-use crate::providers::tool_call::{
-    convert_xml_tool_calls, format_tool_results, inject_tool_prompt,
-};
+use crate::providers::mtp;
+use crate::providers::mtp_pipeline::MtpPipeline;
 use crate::session::{SessionHandle, SessionManager};
 
 use obscura_net::StealthHttpClient;
@@ -361,7 +360,6 @@ impl GlmDirectClient {
     /// Non-streaming chat completion.
     pub async fn chat(self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse, DirectError> {
         let model_id = request.model.clone();
-        let had_tools = request.tools.is_some();
         let store = self.store.clone();
 
         let mut stream = self.chat_stream(request.clone()).await?;
@@ -400,16 +398,8 @@ impl GlmDirectClient {
             }
         }
 
-        if had_tools {
-            let (cleaned_text, parsed) = convert_xml_tool_calls(&text, true);
-            if let Some(calls) = parsed {
-                if !calls.is_empty() {
-                    tool_calls = calls;
-                    text = cleaned_text;
-                }
-            }
-        }
-
+        // Tool-call extraction happens in the streaming path (MTP pipeline),
+        // so chunks already carry structured tool_calls.
         let has_tool_calls = !tool_calls.is_empty();
 
         if let Some(ref url) = session_url {
@@ -477,13 +467,16 @@ impl GlmDirectClient {
             inject_tool_context(&mut request.messages, &tool_context);
         }
 
-        // Inject tool definitions into the last user message when tools are
-        // requested. GLM's internal endpoint does not natively support OpenAI
-        // tool schemas, so the model emits <tool_call> markers instead.
-        if let Some(ref tools) = request.tools {
-            let last_prompt = last_user_text(&request.messages);
-            let injected = inject_tool_prompt("glm", &last_prompt, tools, request.tool_choice.as_ref());
-            update_last_user_text(&mut request.messages, &injected);
+        // Compile client tools into the MTP system prompt (universal
+        // dialect). The prompt is prepended as a system message; native
+        // tools/tool_choice are never forwarded upstream.
+        let mut pipeline = MtpPipeline::prepare("glm", &model_id, &request);
+        if pipeline.active {
+            request.messages = pipeline.upstream_messages(&request);
+            if pipeline.strip_upstream_tools() {
+                request.tools = None;
+                request.tool_choice = None;
+            }
         }
 
         // Upload any attachments in the last user message. On failure, fall back
@@ -541,7 +534,6 @@ impl GlmDirectClient {
         let model_id_for_stream = model_id.clone();
         let session_url_for_stream = session_url.clone();
         let chat_id_for_store = chat_id.clone();
-        let had_tools = request.tools.is_some();
 
         let (tx, rx) = mpsc::unbounded_channel::<Result<ChatCompletionChunk, GatewayError>>();
 
@@ -709,12 +701,13 @@ impl GlmDirectClient {
                     if let Some(ev) = first_event {
                         if let Some(delta) = ev.content_delta {
                             collected_text.push_str(&delta);
+                            let visible = pipeline.feed(&delta);
                             if send_content_chunk(
                                 &tx_clone,
                                 &counter,
                                 &id_prefix_clone,
                                 &model_id_for_stream,
-                                &delta,
+                                &visible,
                                 &session_url_for_stream,
                                 &mut emitted_role,
                             )
@@ -725,12 +718,13 @@ impl GlmDirectClient {
                         }
                         if let Some(delta) = ev.edit_delta {
                             collected_text.push_str(&delta);
+                            let visible = pipeline.feed(&delta);
                             if send_content_chunk(
                                 &tx_clone,
                                 &counter,
                                 &id_prefix_clone,
                                 &model_id_for_stream,
-                                &delta,
+                                &visible,
                                 &session_url_for_stream,
                                 &mut emitted_role,
                             )
@@ -816,12 +810,13 @@ impl GlmDirectClient {
                                     }
                                     if let Some(delta) = event.content_delta {
                                         collected_text.push_str(&delta);
+                                        let visible = pipeline.feed(&delta);
                                         if send_content_chunk(
                                             &tx_clone,
                                             &counter,
                                             &id_prefix_clone,
                                             &model_id_for_stream,
-                                            &delta,
+                                            &visible,
                                             &session_url_for_stream,
                                             &mut emitted_role,
                                         )
@@ -832,12 +827,13 @@ impl GlmDirectClient {
                                     }
                                     if let Some(delta) = event.edit_delta {
                                         collected_text.push_str(&delta);
+                                        let visible = pipeline.feed(&delta);
                                         if send_content_chunk(
                                             &tx_clone,
                                             &counter,
                                             &id_prefix_clone,
                                             &model_id_for_stream,
-                                            &delta,
+                                            &visible,
                                             &session_url_for_stream,
                                             &mut emitted_role,
                                         )
@@ -895,43 +891,41 @@ impl GlmDirectClient {
                         buffer.drain(0..consumed);
                     }
 
-                    // Post-stream tool-call extraction.
+                    // Post-stream tool-call extraction: flush any pending
+                    // MTP block and collect validated calls.
+                    pipeline.finish();
                     let mut finish_reason = "stop".to_string();
-                    if had_tools && !collected_text.is_empty() {
-                        let (_cleaned, parsed) = convert_xml_tool_calls(&collected_text, true);
-                        if let Some(calls) = parsed {
-                            if !calls.is_empty() {
-                                counter.fetch_add(1, Ordering::Relaxed);
-                                let _ = tx_clone.send(Ok(ChatCompletionChunk {
-                                    id: format!(
-                                        "{}-{}",
-                                        id_prefix_clone,
-                                        counter.load(Ordering::Relaxed)
-                                    ),
-                                    object: "chat.completion.chunk".to_string(),
-                                    created: current_timestamp(),
-                                    model: model_id_for_stream.clone(),
-                                    choices: vec![ChunkChoice {
-                                        index: 0,
-                                        delta: ChatMessageDelta {
-                                            role: None,
-                                            content: None,
-                                            reasoning_content: None,
-                                            citations: None,
-                                            tool_calls: Some(calls.clone()),
-                                        },
-                                        finish_reason: None,
-                                    }],
-                                    session_url: session_url_for_stream.clone(),
-                                }));
-                                for call in &calls {
-                                    if !collected_tool_calls.iter().any(|c| c.id == call.id) {
-                                        collected_tool_calls.push(call.clone());
-                                    }
-                                }
-                                finish_reason = "tool_calls".to_string();
+                    let mtp_calls = pipeline.tool_calls();
+                    if !mtp_calls.is_empty() {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        let _ = tx_clone.send(Ok(ChatCompletionChunk {
+                            id: format!(
+                                "{}-{}",
+                                id_prefix_clone,
+                                counter.load(Ordering::Relaxed)
+                            ),
+                            object: "chat.completion.chunk".to_string(),
+                            created: current_timestamp(),
+                            model: model_id_for_stream.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChatMessageDelta {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: None,
+                                    citations: None,
+                                    tool_calls: Some(mtp_calls.clone()),
+                                },
+                                finish_reason: None,
+                            }],
+                            session_url: session_url_for_stream.clone(),
+                        }));
+                        for call in &mtp_calls {
+                            if !collected_tool_calls.iter().any(|c| c.id == call.id) {
+                                collected_tool_calls.push(call.clone());
                             }
                         }
+                        finish_reason = "tool_calls".to_string();
                     }
 
                     if !collected_tool_calls.is_empty() {
@@ -1065,6 +1059,46 @@ impl GlmDirectClient {
         })
     }
 
+    /// Create a chat via the real `/api/v1/chats/new` endpoint. Falls back
+    /// to a local UUID on any failure so chat creation never blocks a turn
+    /// (Z.AI tolerates client-minted ids, but server-created chats keep the
+    /// web history consistent).
+    async fn create_chat_upstream(&self, internal_model_id: &str) -> Option<String> {
+        let url = format!("{CHAT_Z_AI_URL}/api/v1/chats/new");
+        let body = serde_json::json!({
+            "title": "New Chat",
+            "models": [internal_model_id],
+            "enable_thinking": self.model.id.contains("thinking"),
+            "auto_web_search": false,
+            "chat_type": 1,
+        });
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers.insert("Authorization".to_string(), format!("Bearer {}", self.auth.token));
+        headers.insert("Cookie".to_string(), format!("token={}", self.auth.token));
+        headers.insert("Origin".to_string(), CHAT_Z_AI_URL.to_string());
+        let parsed = url::Url::parse(&url).ok()?;
+        let resp = self.stealth.send_single("POST", &parsed, &headers, &body.to_string()).await.ok()?;
+        if resp.status != 200 {
+            warn!(status = resp.status, "GLM /api/v1/chats/new failed; using local chat id");
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_slice(&resp.body).ok()?;
+        // Response shapes seen in captures: {id} or {data:{id}} or {chatId}.
+        value
+            .get("id")
+            .or_else(|| value.get("chatId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                value
+                    .get("data")
+                    .and_then(|d| d.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    }
+
     /// Resolve an existing chat from `session_url` or create a new chat id.
     async fn resolve_or_create_chat(
         &self,
@@ -1087,7 +1121,10 @@ impl GlmDirectClient {
             return Ok(chat_id);
         }
 
-        Ok(uuid::Uuid::new_v4().to_string())
+        // Prefer a server-created chat; degrade to the historical local UUID.
+        let internal = self.model.internal_id.clone();
+        Ok(self.create_chat_upstream(&internal).await
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
     }
 
     /// Look up stored tool calls for this chat and format the results.
@@ -1111,7 +1148,7 @@ impl GlmDirectClient {
             .map(|(c, id, o)| (c.as_ref(), id.as_deref(), o.as_str()))
             .collect();
 
-        format_tool_results(&refs)
+        mtp::format_tool_results(&refs)
     }
 }
 

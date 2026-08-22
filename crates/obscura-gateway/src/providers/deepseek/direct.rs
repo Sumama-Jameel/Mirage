@@ -29,10 +29,6 @@ use crate::session::SessionHandle;
 
 use crate::providers::mtp;
 use crate::providers::solver::{PoWHeader, SolverChain, SolverRegistry};
-use crate::providers::tool_call::{
-    convert_xml_tool_calls, inject_tool_prompt,
-    XmlToolCallStripper,
-};
 #[cfg(test)]
 use crate::providers::tool_call::parse_tool_calls_from_content;
 use crate::providers::send_with_retry;
@@ -218,15 +214,9 @@ impl DirectClient {
             .replace_all(&text, "")
             .to_string();
 
-        // The internal endpoint ignores native `tools`. If the user supplied
-        // tools, try to parse any <tool_call> markers the model emitted.
-        if request.tools.is_some() {
-            let (cleaned_text, parsed) = convert_xml_tool_calls(&text, true);
-            if let Some(calls) = parsed {
-                tool_calls = calls;
-                text = cleaned_text;
-            }
-        }
+        // The streaming path already extracts MTP tool blocks into
+        // structured `tool_calls` chunks, so no legacy marker parsing is
+        // needed here.
 
         // Remember the assistant's tool calls so a later `role: "tool"` turn
         // can reference the exact call that was made.
@@ -1577,6 +1567,24 @@ mod tests {
         assert_eq!(calls[0].function.arguments, r#"{"path":"main.py"}"#);
     }
 
+    /// Tool definition used by the MTP stream-state tests: validation runs
+    /// against the client-supplied definitions, so the name must exist.
+    fn read_file_tool_def() -> crate::models::Tool {
+        crate::models::Tool {
+            r#type: "function".to_string(),
+            function: crate::models::FunctionDefinition {
+                name: "read_file".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                })),
+                strict: None,
+            },
+        }
+    }
+
     #[test]
     fn parse_multiple_tool_calls() {
         let content = concat!(
@@ -1591,9 +1599,10 @@ mod tests {
 
     #[test]
     fn process_content_text_streams_text_and_collects_tool_call() {
-        let mut state = StreamState::new(&[]);
+        let tools = vec![read_file_tool_def()];
+        let mut state = StreamState::new(&tools);
         let text = process_content_text(
-            "Hello <tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}</tool_call> world",
+            "Hello [MIRAGE_TOOL_CALL_V1]{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}[/MIRAGE_TOOL_CALL_V1] world",
             &mut state,
         );
         assert_eq!(text, "Hello  world");
@@ -1603,14 +1612,15 @@ mod tests {
 
     #[test]
     fn process_content_text_handles_split_tool_call() {
-        let mut state = StreamState::new(&[]);
-        let t1 = process_content_text("Hello <tool_call>{\"name\":\"read_", &mut state);
+        let tools = vec![read_file_tool_def()];
+        let mut state = StreamState::new(&tools);
+        let t1 = process_content_text("Hello [MIRAGE_TOOL_CALL_", &mut state);
         assert_eq!(t1, "Hello ");
         // The tool call is not closed yet, so no call has been collected.
         assert!(!state.saw_tool_calls);
 
         let t2 = process_content_text(
-            "file\",\"arguments\":{\"path\":\"a\"}}</tool_call> done",
+            "V1]{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}[/MIRAGE_TOOL_CALL_V1] done",
             &mut state,
         );
         assert_eq!(t2, " done");
@@ -1621,9 +1631,10 @@ mod tests {
 
     #[test]
     fn snapshot_streams_text_and_collects_tool_call() {
-        let line = br#"data: {"v":{"response":{"message_id":123,"fragments":[{"type":"RESPONSE","content":"I will read <tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"main.py\"}}</tool_call> for you"}]}}}"#;
+        let tools = vec![read_file_tool_def()];
+        let line = br#"data: {"v":{"response":{"message_id":123,"fragments":[{"type":"RESPONSE","content":"I will read [MIRAGE_TOOL_CALL_V1]{\"name\":\"read_file\",\"arguments\":{\"path\":\"main.py\"}}[/MIRAGE_TOOL_CALL_V1] for you"}]}}}"#;
         let mut counter = 0;
-        let mut state = StreamState::new(&[]);
+        let mut state = StreamState::new(&tools);
         let (chunks, msg_id) = parse_sse_line(
             line,
             "deepseek-chat",
