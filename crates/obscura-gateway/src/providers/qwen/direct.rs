@@ -12,7 +12,7 @@ use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatContent,
     ChatMessage, ChatMessageDelta, ChunkChoice, ToolCall, Usage,
 };
-use crate::providers::tool_call::inject_tool_prompt;
+use crate::providers::mtp;
 use crate::providers::streaming_upload::download_and_hash_batch;
 use crate::session::{SessionHandle, SessionManager};
 
@@ -385,7 +385,7 @@ impl DirectClient {
             .map(|(c, id, o)| (c.as_ref(), id.as_deref(), o.as_str()))
             .collect();
 
-        crate::providers::tool_call::format_tool_results(&refs)
+        crate::providers::mtp::format_tool_results(&refs)
     }
 
     /// Build the messages payload body matching the web app exact format.
@@ -405,9 +405,17 @@ impl DirectClient {
             .collect::<Vec<_>>()
             .join("\n");
         let tool_context = self.handle_tool_results(gateway_session_id, &request.messages).await;
-        let mut content = if let Some(ref tools) = request.tools {
+        let mut content = if let Some(tools) = &request.tools {
             if !tools.is_empty() {
-                inject_tool_prompt("qwen", &raw_content, tools, request.tool_choice.as_ref())
+                format!(
+                    "{}\n\nUser request:\n{}",
+                    crate::providers::mtp::build_mtp_system_prompt(
+                        tools,
+                        request.tool_choice.as_ref(),
+                        false
+                    ),
+                    raw_content
+                )
             } else {
                 raw_content
             }
@@ -781,21 +789,18 @@ impl DirectClient {
         }
 
         let has_tools = request.tools.is_some();
-        // Qwen models support native tool_calls via the OpenAI-compatible SSE
-        // delta.tool_calls field. Do NOT fall back to XML `<tool_call>` marker
-        // parsing: the upstream API already handles tools natively, and XML
-        // markers are just informational text the model sometimes echoes.
-        // Parse XML <tool_call> markers from the response text.
-        // Qwen's server rejects custom tools in the native payload, so the
-        // model emits <tool_call> XML in content instead.
+        // Native tool_calls from the SSE delta take precedence; otherwise
+        // parse MTP blocks from the content text (the server rejects custom
+        // tools in the native payload, so the model emits MTP markers).
         let (full_text, tool_calls) = if has_tools && !native_calls.is_empty() {
-            // Native tool_calls from the SSE delta (unlikely without payload tools)
             (raw_text, Some(native_calls))
         } else if has_tools {
-            // XML fallback: parse <tool_call>...</tool_call> from content text
-            let (stripped, calls) = crate::providers::tool_call::convert_xml_tool_calls(&raw_text, true);
-            if calls.is_some() {
-                (stripped, calls)
+            let defs: Vec<crate::models::Tool> = request.tools.clone().unwrap_or_default();
+            let mut st = crate::providers::mtp::MtpStreamState::new();
+            let stripped = st.process_delta(&raw_text, &defs);
+            st.finish(&defs);
+            if !st.collected_tool_calls.is_empty() {
+                (stripped, Some(std::mem::take(&mut st.collected_tool_calls)))
             } else {
                 (raw_text, None)
             }
@@ -941,6 +946,7 @@ impl DirectClient {
         let session_url = Some(format!("{}/c/{}", BASE_URL, chat_id));
 
         let has_tools = request.tools.is_some();
+        let tool_defs: Vec<crate::models::Tool> = request.tools.clone().unwrap_or_default();
         let byte_stream = resp.bytes_stream();
 
         // Spawn a task to process the SSE stream incrementally.
@@ -951,6 +957,9 @@ impl DirectClient {
             let mut full_content_buf = String::new();
             let mut sent_tool_calls = false;
             let mut line_buf = String::new();
+            // MTP state: absorbs [MIRAGE_TOOL_CALL_V1] blocks from content
+            // deltas so they never leak to the client, and collects calls.
+            let mut mtp_state = crate::providers::mtp::MtpStreamState::new();
             // Per-call-id argument and name accumulation for native tool call
             // deltas split across multiple SSE frames.
             let mut native_arg_bufs: HashMap<String, String> = HashMap::new();
@@ -1139,6 +1148,45 @@ impl DirectClient {
                                 full_content_buf.push_str(&content);
                             }
 
+                            // Feed non-thinking content through the MTP
+                            // state; blocks are absorbed and validated.
+                            let visible = if !is_thinking && has_tools {
+                                let visible =
+                                    mtp_state.process_delta(&content, &tool_defs);
+                                if !mtp_state.collected_tool_calls.is_empty() {
+                                    for tc in mtp_state.collected_tool_calls.drain(..) {
+                                        if !native_calls_list.iter().any(|c| c.id == tc.id) {
+                                            native_calls_list.push(tc.clone());
+                                        }
+                                        store.store_tool_calls(&gateway_session_id_owned, std::slice::from_ref(&tc)).await;
+                                        let _ = tx.try_send(Ok(ChatCompletionChunk {
+                                            id: response_id.clone(),
+                                            object: "chat.completion.chunk".to_string(),
+                                            created: current_timestamp(),
+                                            model: model_id.clone(),
+                                            choices: vec![ChunkChoice {
+                                                index: choice.index,
+                                                delta: ChatMessageDelta {
+                                                    role: None,
+                                                    content: None,
+                                                    reasoning_content: None,
+                                                    citations: None,
+                                                    tool_calls: Some(vec![tc]),
+                                                },
+                                                finish_reason: None,
+                                            }],
+                                            session_url: session_url.clone(),
+                                        }));
+                                        sent_tool_calls = true;
+                                    }
+                                }
+                                Some(visible)
+                            } else if is_thinking {
+                                None
+                            } else {
+                                Some(content.clone())
+                            };
+
                             let _ = tx.try_send(Ok(ChatCompletionChunk {
                                 id: response_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
@@ -1148,7 +1196,7 @@ impl DirectClient {
                                     index: choice.index,
                                     delta: ChatMessageDelta {
                                         role,
-                                        content: if is_thinking { None } else { Some(content.clone()) },
+                                        content: visible.filter(|v| !v.is_empty()),
                                         reasoning_content: if is_thinking { Some(content) } else { None },
                                         citations: None,
                                         tool_calls: None,
@@ -1190,36 +1238,31 @@ impl DirectClient {
                 }
             }
 
-            // Parse XML <tool_call> markers from accumulated content.
-            // Qwen's server rejects custom tools in the native payload, so the
-            // model emits <tool_call> XML in content instead. We parse those
-            // into structured tool_calls here.
-            if !sent_tool_calls && has_tools {
-                let (_stripped, calls) = crate::providers::tool_call::convert_xml_tool_calls(&full_content_buf, true);
-                if let Some(calls) = calls {
-                    if !calls.is_empty() {
+            // Flush any pending MTP block at stream end.
+            if has_tools {
+                mtp_state.finish(&tool_defs);
+                for tc in mtp_state.collected_tool_calls.drain(..) {
+                    if !native_calls_list.iter().any(|c| c.id == tc.id) {
+                        store.store_tool_calls(&gateway_session_id_owned, std::slice::from_ref(&tc)).await;
+                        let _ = tx.try_send(Ok(ChatCompletionChunk {
+                            id: response_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created: current_timestamp(),
+                            model: model_id.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChatMessageDelta {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: None,
+                                    citations: None,
+                                    tool_calls: Some(vec![tc]),
+                                },
+                                finish_reason: None,
+                            }],
+                            session_url: session_url.clone(),
+                        }));
                         sent_tool_calls = true;
-                        for tc in &calls {
-                            store.store_tool_calls(&gateway_session_id_owned, std::slice::from_ref(tc)).await;
-                            let _ = tx.try_send(Ok(ChatCompletionChunk {
-                                id: response_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created: current_timestamp(),
-                                model: model_id.clone(),
-                                choices: vec![ChunkChoice {
-                                    index: 0,
-                                    delta: ChatMessageDelta {
-                                        role: None,
-                                        content: None,
-                                        reasoning_content: None,
-                                        citations: None,
-                                        tool_calls: Some(vec![tc.clone()]),
-                                    },
-                                    finish_reason: None,
-                                }],
-                                session_url: session_url.clone(),
-                            }));
-                        }
                     }
                 }
             }

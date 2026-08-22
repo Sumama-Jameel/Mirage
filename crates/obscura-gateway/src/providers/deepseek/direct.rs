@@ -210,7 +210,7 @@ impl DirectClient {
 
         // DeepSeek returns inline citation markers such as [citation:2]. Strip
         // them from the final text because the citations are exposed separately.
-        let mut text = citation_marker_regex()
+        let text = citation_marker_regex()
             .replace_all(&text, "")
             .to_string();
 
