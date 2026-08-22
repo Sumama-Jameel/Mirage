@@ -16,8 +16,9 @@ use crate::models::{
     ChatMessageDelta, ChunkChoice, Citation, ToolCall, ToolChoice, Usage,
 };
 use crate::providers::tokenizer::estimate_tokens;
+use crate::providers::mtp;
 use crate::providers::tool_call::{
-    convert_xml_tool_calls, format_tool_results,
+    format_tool_results,
 };
 use crate::providers::send_with_retry;
 use crate::session::{SessionHandle, SessionManager};
@@ -727,26 +728,10 @@ impl ChatGptDirectClient {
             return;
         }
 
-        let is_required = request.tool_choice.as_ref().map_or(false, |tc| match tc {
-            ToolChoice::Mode(m) => m == "required",
-            _ => false,
-        });
-
-        let mut instruction = if is_required {
-            String::from("You MUST call a function to answer. Do NOT search the web or use any built-in tools. Output:")
-        } else {
-            String::from("You can call functions by outputting, if you do, we will return you the output of the tool:")
-        };
-        instruction.push('\n');
-        for tool in tools {
-            instruction.push_str(&format!("<tool_call>{{\"name\":\"{}\",\"arguments\":{{}}}}</tool_call>\n", tool.function.name));
-        }
-        instruction.push_str("\nReplace the arguments with real values. ");
-        if is_required {
-            instruction.push_str("You MUST NOT answer directly.");
-        } else {
-            instruction.push_str("Do not answer directly.");
-        }
+        // Universal MTP/1 dialect: compile tools into the prompted
+        // tool-output protocol (replaces the legacy <tool_call> hint).
+        let instruction =
+            mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false);
 
         messages.insert(0, ChatMessage {
             role: "system".to_string(),
@@ -986,14 +971,17 @@ impl ChatGptDirectClient {
 
                 tracing::debug!(text_len = text.len(), text_snippet = %text.chars().take(200).collect::<String>(), has_native = native_tool_calls.is_some(), "SSE parsed text");
 
-                // Prefer native tool calls from SSE, fall back to XML markers
+                // Prefer native tool calls from SSE, fall back to MTP blocks
                 let (clean_text, parsed_tool_calls) = if let Some(calls) = native_tool_calls {
                     tracing::debug!(call_count = calls.len(), "using native tool calls from SSE");
                     (text, Some(calls))
                 } else {
-                    let result = convert_xml_tool_calls(&text, true);
-                    tracing::debug!(found_xml = result.1.is_some(), "XML tool call parsing result");
-                    result
+                    let defs: Vec<crate::models::Tool> = request.tools.clone().unwrap_or_default();
+                    let mut st = mtp::MtpStreamState::new();
+                    let stripped = st.process_delta(&text, &defs);
+                    st.finish(&defs);
+                    let calls = std::mem::take(&mut st.collected_tool_calls);
+                    if calls.is_empty() { (text, None) } else { (stripped, Some(calls)) }
                 };
 
                 // Extract conversation_id from the response
@@ -1298,7 +1286,9 @@ impl ChatGptDirectClient {
             let mut stored_conv_id: Option<String> = None;
             let mut stored_msg_id: Option<String> = None;
             let mut conv_token = conv_token.clone();
-            let mut xml_tool_state = crate::providers::tool_call::XmlToolCallStripper::new();
+            let tool_defs_stream: Vec<crate::models::Tool> =
+                request.tools.clone().unwrap_or_default();
+            let mut mtp_state = mtp::MtpStreamState::new();
 
             while let Some(chunk) = stream.next().await {
                 let bytes = match chunk {
@@ -1383,21 +1373,24 @@ impl ChatGptDirectClient {
                                     }).collect()
                                 }).filter(|c: &Vec<ToolCall>| !c.is_empty());
 
-                                // Strip prompt-injected <tool_call> XML markers
-                                // from the delta during streaming so raw tags
-                                // never reach the client. Complete tool calls
-                                // are emitted as structured chunks immediately.
-                                let (clean_delta, xml_tool_call) = if had_tools {
+                                // Strip prompt-injected MTP tool blocks from
+                                // the delta during streaming so raw markers
+                                // never reach the client. Complete validated
+                                // calls are emitted as structured chunks.
+                                let (clean_delta, mtp_calls) = if had_tools {
                                     if let Some(d) = &delta {
-                                        xml_tool_state.process(d)
+                                        let clean = mtp_state.process_delta(d, &tool_defs_stream);
+                                        let calls =
+                                            std::mem::take(&mut mtp_state.collected_tool_calls);
+                                        (clean, calls)
                                     } else {
-                                        (String::new(), None)
+                                        (String::new(), Vec::new())
                                     }
                                 } else {
-                                    (delta.unwrap_or_default(), None)
+                                    (delta.unwrap_or_default(), Vec::new())
                                 };
 
-                                if let Some(tc) = xml_tool_call {
+                                for tc in mtp_calls {
                                     if !collected_tool_calls.iter().any(|c| c.id == tc.id) {
                                         collected_tool_calls.push(tc.clone());
                                         let idx = counter.fetch_add(1, Ordering::Relaxed);
@@ -1460,7 +1453,8 @@ impl ChatGptDirectClient {
             // complete (truncated closing tag) and ensures the finish_reason
             // reflects any collected tool calls.
             if had_tools {
-                if let Some(tc) = xml_tool_state.finish_pending() {
+                mtp_state.finish(&tool_defs_stream);
+                for tc in std::mem::take(&mut mtp_state.collected_tool_calls) {
                     if !collected_tool_calls.iter().any(|c| c.id == tc.id) {
                         collected_tool_calls.push(tc.clone());
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
@@ -1493,7 +1487,12 @@ impl ChatGptDirectClient {
             };
 
             if had_tools && !previous_text.is_empty() {
-                let (clean_text, parsed) = convert_xml_tool_calls(&previous_text, true);
+                // Recover any truncated MTP block the inline stripper could
+                // not complete.
+                mtp_state.finish(&tool_defs_stream);
+                let parsed_opt = std::mem::take(&mut mtp_state.collected_tool_calls);
+                let clean_text = previous_text.clone();
+                let parsed = if parsed_opt.is_empty() { None } else { Some(parsed_opt) };
                 if let Some(calls) = parsed {
                     if !calls.is_empty() {
                         // Emit the tool calls as a single structured

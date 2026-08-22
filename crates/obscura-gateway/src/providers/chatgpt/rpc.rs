@@ -600,12 +600,11 @@ pub fn build_request_payload(
         body["frequency_penalty"] = serde_json::json!(f);
     }
 
-    if let Some(ref tools) = request.tools {
-        body["tools"] = serde_json::to_value(tools).unwrap_or(serde_json::Value::Null);
-    }
-    // tool_choice is NOT sent to the conversation endpoint — the endpoint
-    // ignores the standard OpenAI tool_choice parameter. The choice is
-    // controlled through prompt injection in direct.rs instead.
+    // OpenAI tools/tool_choice are NEVER forwarded upstream (MTP gateway
+    // invariant): the conversation endpoint ignores client tool schemas, and
+    // forwarding them only invites built-in tool confusion. The compiled MTP
+    // system prompt in direct.rs carries the tool contract instead.
+    let _ = &request.tools;
 
     // Forward native JSON mode if provided (ChatGPT web API supports it for gpt-4o, gpt-4o-mini).
     if let Some(ref fmt) = request.response_format {
@@ -837,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_payload_includes_tools() {
+    fn build_request_payload_strips_tools() {
         use crate::models::{FunctionDefinition, Tool};
         let msgs = vec![];
         let mut req = default_request("model-1");
@@ -857,10 +856,8 @@ mod tests {
             },
         }]);
         let payload = build_request_payload(&msgs, None, None, "model-1", "parent-1", None, &req);
-        let tools = payload.get("tools");
-        assert!(tools.is_some(), "payload should include tools");
-        assert!(tools.unwrap().is_array(), "tools should be an array");
-        assert_eq!(tools.unwrap().as_array().unwrap().len(), 1);
+        // MTP invariant: client tools are never forwarded upstream.
+        assert!(payload.get("tools").is_none(), "payload must not include tools");
     }
 
     #[test]
