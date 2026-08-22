@@ -72,33 +72,11 @@ pub fn build_request_payload(
         None => (None, None, None),
     };
 
-    let tools_val = if let Some(tool_list) = tools {
-        Value::Array(
-            tool_list
-                .iter()
-                .map(|t| {
-                    let params = t
-                        .function
-                        .parameters
-                        .as_ref()
-                        .map(|p| p.to_string())
-                        .unwrap_or_default();
-                    let desc = t
-                        .function
-                        .description
-                        .as_deref()
-                        .unwrap_or("");
-                    Value::Array(vec![
-                        Value::String(t.function.name.clone()),
-                        Value::String(desc.to_string()),
-                        Value::String(params),
-                    ])
-                })
-                .collect(),
-        )
-    } else {
-        Value::Array(vec![])
-    };
+    // OpenAI tools are NEVER forwarded upstream (MTP gateway invariant):
+    // the compiled MTP system prompt carries the tool contract instead.
+    // Slot [9] must stay an array for the upstream envelope.
+    let _ = tools;
+    let tools_val = Value::Array(vec![]);
 
     let images = image_list
         .cloned()
@@ -243,7 +221,29 @@ pub fn parse_response_line(line: &str) -> Option<ResponseData> {
 
     let thinking = extract_thinking(payload_arr);
     let conversation = extract_conversation(payload_arr);
-    let tool_calls = extract_tool_calls(payload_arr, &raw_text);
+
+    // Absorb MTP tool blocks first: they are the universal dialect and must
+    // never leak into visible text. Extracted calls join native/Gemini ones.
+    let mut mtp_parser = crate::providers::mtp::MtpStreamParser::new();
+    let (mtp_clean, mtp_blocks) = mtp_parser.process_all(&raw_text);
+    let mut mtp_blocks = mtp_blocks;
+    mtp_blocks.extend(mtp_parser.finish_all());
+    let mtp_calls: Vec<ToolCall> = mtp_blocks
+        .iter()
+        .filter_map(|raw| crate::providers::mtp::parse_tool_block(raw).ok())
+        .map(|call| {
+            let tc = crate::providers::mtp::to_openai_tool_call(&call);
+            tc
+        })
+        .collect();
+
+    let display_text = if mtp_calls.is_empty() { &mtp_clean } else { "" };
+    let tool_calls = match extract_tool_calls(payload_arr, &raw_text) {
+        Some(calls) => Some(calls),
+        None => {
+            if mtp_calls.is_empty() { None } else { Some(mtp_calls) }
+        }
+    };
     let citations = extract_citations(payload_arr);
 
     // Gemini wraps some responses in a `card_content` URL prefix (tool calls,
@@ -251,17 +251,18 @@ pub fn parse_response_line(line: &str) -> Option<ResponseData> {
     // case; use it as the display text when no tool call was extracted. When a
     // tool call was extracted, keep the text clean (card render must not leak).
     let text = if tool_calls.is_none() {
-        if is_tool_call_in_progress(&raw_text) {
-            // The call is still streaming (unclosed paren/fence): suppress the
-            // partial text so it never reaches the client as content.
+        if is_tool_call_in_progress(display_text) || display_text.contains(crate::providers::mtp::TOOL_CALL_START) {
+            // The call is still streaming (unclosed paren/fence or an open
+            // MTP block): suppress the partial text so it never reaches the
+            // client as content.
             String::new()
         } else {
-            let candidate_text = if raw_text.contains("googleusercontent.com/card_content/") {
+            let candidate_text = if display_text.contains("googleusercontent.com/card_content/") {
                 extract_card_fallback(payload_arr)
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| strip_citation_markers(&raw_text))
+                    .unwrap_or_else(|| strip_citation_markers(display_text))
             } else {
-                strip_citation_markers(&raw_text)
+                strip_citation_markers(display_text)
             };
             clean_response_text(&strip_gemini_card_prefix(&candidate_text))
         }
@@ -769,9 +770,8 @@ mod tests {
         }];
         let payload = build_request_payload("search", None, Some(&tools), None, 4, 1, test_uuid(), false).unwrap();
         let arr = payload.as_array().unwrap();
-        assert_eq!(arr[9].as_array().unwrap().len(), 1);
-        assert_eq!(arr[9][0][0], "search");
-        assert_eq!(arr[9][0][1], "Search the web");
+        // MTP invariant: client tools are never forwarded upstream.
+        assert_eq!(arr[9].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -873,8 +873,8 @@ mod tests {
         }];
         let payload = build_request_payload("weather", None, Some(&tools), None, 4, 1, test_uuid(), false).unwrap();
         let arr = payload.as_array().unwrap();
-        assert_eq!(arr[9].as_array().unwrap().len(), 1);
-        assert_eq!(arr[9][0][0], "get_weather");
+        // MTP invariant: client tools are never forwarded upstream.
+        assert_eq!(arr[9].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -902,7 +902,8 @@ mod tests {
             build_request_payload("analyze this", None, Some(&tools), Some(&images), 4, 1, test_uuid(), false).unwrap();
         let arr = payload.as_array().unwrap();
         assert_eq!(arr[0][3].as_array().unwrap().len(), 1);
-        assert_eq!(arr[9].as_array().unwrap().len(), 1);
+        // MTP invariant: client tools are never forwarded upstream.
+        assert_eq!(arr[9].as_array().unwrap().len(), 0);
     }
 
     #[test]

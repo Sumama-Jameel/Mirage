@@ -15,7 +15,8 @@ use crate::models::{
     ChatMessageDelta, ChunkChoice, Citation, Tool, ToolCall, Usage,
 };
 use crate::providers::tokenizer::estimate_tokens;
-use crate::providers::tool_call::{format_tool_results, gemini_tool_use_prompt};
+use crate::providers::mtp;
+use crate::providers::tool_call::format_tool_results;
 use crate::providers::send_with_retry;
 use crate::session::{SessionHandle, SessionManager};
 
@@ -424,12 +425,20 @@ impl GeminiDirectClient {
             format!("{tool_result_prompt}\n\n{prompt}")
         };
 
-        // Inject a tool-use instruction into the prompt so the model emits a
-        // stable, parseable `function_call` fence. Native tools are still
-        // passed to build_request_payload for request[9].
+        // Compile client tools into the MTP system prompt (universal
+        // dialect). Native tool schemas are NOT forwarded upstream: the
+        // gateway never sends OpenAI tools to the provider.
         if let Some(tools) = &request.tools {
             (
-                gemini_tool_use_prompt("gemini", &base_prompt, tools, request.tool_choice.as_ref()),
+                format!(
+                    "{}\n\nUser request:\n{}",
+                    crate::providers::mtp::build_mtp_system_prompt(
+                        tools,
+                        request.tool_choice.as_ref(),
+                        false
+                    ),
+                    base_prompt
+                ),
                 Some(tools.clone()),
             )
         } else {
