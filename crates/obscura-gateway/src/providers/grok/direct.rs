@@ -1,5 +1,7 @@
 use futures::stream::{BoxStream, StreamExt};
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -9,18 +11,11 @@ use crate::models::{
     ChatMessageDelta, ChunkChoice, FunctionCall, Tool, ToolCall, Usage,
 };
 use crate::providers::tokenizer::estimate_tokens;
-use crate::providers::tool_call::{
-    convert_xml_tool_calls, inject_tool_prompt,
-};
-use crate::providers::send_with_retry;
-use crate::session::{SessionHandle, SessionManager};
+use crate::providers::tool_call::{convert_xml_tool_calls, inject_tool_prompt};
+use crate::session::SessionHandle;
 
-use std::sync::Arc;
-
-use super::auth::{build_cookie_header, extract_grok_cookies, validate_grok_session};
-use super::challenge::ChallengeStore;
+use super::auth::{extract_grok_cookies, validate_grok_session};
 use super::state::GrokSessionStore;
-use super::statsig::generate_statsig_id;
 use super::upload::{self, UploadCache};
 
 const GROK_BASE_URL: &str = "https://grok.com";
@@ -68,10 +63,6 @@ struct GrokStreamResponse {
     tool_usage_card_id: String,
     #[serde(default)]
     tool_usage_card: Option<serde_json::Value>,
-    #[serde(default)]
-    response_id: String,
-    #[serde(default)]
-    model_response: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -236,83 +227,122 @@ fn estimate_cost(prompt_text: &str, completion_text: &str) -> Usage {
     }
 }
 
+/// Send a request through the wreq stealth client and return a streaming
+/// response, retrying transient 5xx/429 statuses. The Chrome TLS emulation is
+/// what clears the Cloudflare Enterprise gate on grok.com; a plain rustls
+/// reqwest fingerprint is answered with an anti-bot 403 even with valid
+/// sso + sso-rw cookies (same pattern as the Mistral provider).
+async fn send_stealth_stream(
+    stealth: &obscura_net::StealthHttpClient,
+    method: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    body: &str,
+) -> Result<obscura_net::StreamingResponse, GatewayError> {
+    let parsed_url = url::Url::parse(url)
+        .map_err(|e| GatewayError::Internal(format!("invalid URL {url}: {e}")))?;
+
+    for attempt in 1..=3 {
+        match stealth
+            .send_single_streaming(method, &parsed_url, headers, body)
+            .await
+        {
+            Ok(resp) => {
+                let code = resp.status;
+                if code >= 500 || code == 429 {
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                        continue;
+                    }
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                    continue;
+                }
+                return Err(GatewayError::Internal(format!("stealth request failed: {e}")));
+            }
+        }
+    }
+    Err(GatewayError::Internal(
+        "stealth request exhausted retries".to_string(),
+    ))
+}
+
 pub struct DirectClient {
-    http: reqwest::Client,
-    stealth: Option<Arc<obscura_net::StealthHttpClient>>,
-    session: SessionHandle,
-    sessions: SessionManager,
+    stealth: Arc<obscura_net::StealthHttpClient>,
     mode_id: String,
     store: GrokSessionStore,
-    challenge_store: ChallengeStore,
-    grok_cookies: Vec<obscura_net::CookieInfo>,
     upload_cache: UploadCache,
 }
 
 impl DirectClient {
     pub async fn new(
         session: SessionHandle,
-        sessions: &SessionManager,
         model_id: &str,
         store: GrokSessionStore,
-        challenge_store: ChallengeStore,
     ) -> Result<Self, GatewayError> {
-        let grok_cookies = extract_grok_cookies(&session);
-        validate_grok_session(&grok_cookies)?;
+        // Validate the logged-in session; the stealth client reads cookies
+        // from the filtered jar on every request.
+        validate_grok_session(&extract_grok_cookies(&session))?;
 
-        let http = Self::build_http_client()?;
-
-        let stealth = obscura_net::StealthHttpClient::new(session.cookie_jar.clone()).into();
+        // wreq Chrome TLS emulation. Grok sits behind Cloudflare Enterprise,
+        // which rejects native rustls/reqwest ClientHello fingerprints with
+        // an anti-bot 403 even with valid sso + sso-rw cookies (verified in
+        // OmniRoute's GrokWebExecutor and the Mistral provider).
+        //
+        // The jar is filtered to sso + sso-rw: the profile's cf_clearance is
+        // pinned to the Firefox TLS fingerprint that earned it and replaying
+        // it under Chrome TLS is itself an anti-bot trigger.
+        let stealth = Arc::new(obscura_net::StealthHttpClient::with_timeouts(
+            super::auth::filtered_grok_jar(&session),
+            None,
+            Some(obscura_net::Timeouts::streaming()),
+        ));
 
         Ok(Self {
-            http,
-            stealth: Some(stealth),
-            session,
-            sessions: sessions.clone(),
+            stealth,
             mode_id: mode_id_for_wire(model_id).to_string(),
             store,
-            challenge_store,
-            grok_cookies,
             upload_cache: UploadCache::new(),
         })
     }
 
-    fn build_http_client() -> Result<reqwest::Client, GatewayError> {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    /// Headers matching the live grok.com web client (OmniRoute capture).
+    /// `x-statsig-id` is a fresh per-request browser error marker; cookies are
+    /// applied by the stealth client from the shared jar, so no Cookie header
+    /// is needed here (the jar already carries sso + sso-rw).
+    fn build_request_headers(&self) -> std::collections::HashMap<String, String> {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Accept".into(), "*/*".into());
+        headers.insert("Accept-Language".into(), "en-US,en;q=0.9".into());
+        headers.insert("Baggage".into(), "sentry-environment=production,sentry-release=d6add6fb0460641fd482d767a335ef72b9b6abb8,sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c".into());
+        headers.insert("Cache-Control".into(), "no-cache".into());
+        headers.insert("Content-Type".into(), "application/json".into());
+        headers.insert("Origin".into(), "https://grok.com".into());
+        headers.insert("Pragma".into(), "no-cache".into());
+        headers.insert("Referer".into(), "https://grok.com/".into());
         headers.insert(
-            "User-Agent",
-            HeaderValue::from_static(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            ),
+            "Sec-Ch-Ua".into(),
+            "\"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\", \"Not(A:Brand\";v=\"24\"".into(),
         );
-        headers.insert("Accept", HeaderValue::from_static("*/*"));
-        headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
-        headers.insert("Origin", HeaderValue::from_static("https://grok.com"));
-        headers.insert("Referer", HeaderValue::from_static("https://grok.com/"));
-        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
-        headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
-        headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
-
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| GatewayError::Internal(format!("failed to build HTTP client: {e}")))?;
-
-        Ok(client)
-    }
-
-    fn build_request_headers(&self, method: &str, path: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-
-        let cookie_value = build_cookie_header(&self.grok_cookies);
-        headers.insert(COOKIE, HeaderValue::from_str(&cookie_value).unwrap());
-
-        let config = self.challenge_store.get_config();
-        let statsig_id = generate_statsig_id(&config, method, path);
-        headers.insert("x-statsig-id", HeaderValue::from_str(&statsig_id).unwrap());
-
-        headers.insert("x-xai-request-id", HeaderValue::from_str(&new_uuid()).unwrap());
+        headers.insert("Sec-Ch-Ua-Mobile".into(), "?0".into());
+        headers.insert("Sec-Ch-Ua-Platform".into(), "\"Windows\"".into());
+        headers.insert("Sec-Fetch-Dest".into(), "empty".into());
+        headers.insert("Sec-Fetch-Mode".into(), "cors".into());
+        headers.insert("Sec-Fetch-Site".into(), "same-origin".into());
+        headers.insert(
+            "User-Agent".into(),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".into(),
+        );
+        headers.insert("x-statsig-id".into(), super::statsig::browser_statsig_id());
+        headers.insert("x-xai-request-id".into(), new_uuid());
+        let trace_id: String = (0..16).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
+        let span_id: String = (0..8).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
+        headers.insert("traceparent".into(), format!("00-{trace_id}-{span_id}-00"));
         headers
     }
 
@@ -335,8 +365,7 @@ impl DirectClient {
                     data,
                     &filename,
                     &mime,
-                    &self.grok_cookies,
-                    &self.challenge_store.get_config(),
+                    &self.stealth,
                     &self.upload_cache,
                 ).await?;
                 processed.push(uploaded);
@@ -418,11 +447,24 @@ impl DirectClient {
             "deepsearchPreset": "",
             "isReasoning": request.thinking.unwrap_or(false),
             "skipResponseCache": true,
+            "disableTextFollowUps": false,
+            "disableMemory": true,
+            "forceSideBySide": false,
+            "isAsyncChat": false,
+            "disableSelfHarmShortCircuit": false,
+            "deviceEnvInfo": {
+                "darkModeEnabled": false,
+                "devicePixelRatio": 2,
+                "screenWidth": 2056,
+                "screenHeight": 1329,
+                "viewportWidth": 2056,
+                "viewportHeight": 1083,
+            },
         });
 
         if let Some(tools) = &request.tools {
             if !tools.is_empty() {
-                let tool_block = inject_tool_prompt(&user_message, tools, request.tool_choice.as_ref());
+                let tool_block = inject_tool_prompt("grok", &user_message, tools, request.tool_choice.as_ref());
                 payload["message"] =
                     serde_json::json!(format!("{}\n\n{}", user_message, tool_block));
             }
@@ -435,7 +477,7 @@ impl DirectClient {
     /// Returns (text, reasoning, tool_calls, finish_reason) where tool_calls
     /// being Some means the response should end with finish_reason: "tool_calls".
     async fn process_stream(
-        response: reqwest::Response,
+        response: obscura_net::StreamingResponse,
         tools: &[Tool],
     ) -> Result<(String, String, Option<Vec<ToolCall>>, String), GatewayError> {
         let mut full_text = String::new();
@@ -443,9 +485,8 @@ impl DirectClient {
         let mut finish_reason = "stop".to_string();
         let mut xml_tool_content = String::new();
         let mut is_collecting_xml_tool = false;
-        let mut sent_tool_calls = false;
 
-        let mut stream = Box::pin(response.bytes_stream());
+        let mut stream = response.bytes;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| GatewayError::Internal(format!("stream read error: {e}")))?;
@@ -469,20 +510,14 @@ impl DirectClient {
 
                 // Priority 1: structured native tool card
                 if let Some((id, tool_name, args)) = parse_native_tool_card(&ndjson, tools) {
-                    if !sent_tool_calls {
-                        sent_tool_calls = true;
-                        let tc = build_tool_call(&id, &tool_name, args);
-                        return Ok((full_text, reasoning_text, Some(vec![tc]), "tool_calls".to_string()));
-                    }
+                    let tc = build_tool_call(&id, &tool_name, args);
+                    return Ok((full_text, reasoning_text, Some(vec![tc]), "tool_calls".to_string()));
                 }
 
                 // Fallback: native tool card as XML in token text
-                if ndjson.is_thinking() && parse_xml_tool_card(&ndjson.token).is_some()
-                    && !sent_tool_calls
-                {
+                if ndjson.is_thinking() && parse_xml_tool_card(&ndjson.token).is_some() {
                     if let Some((id, tool_name, args)) = parse_xml_tool_card(&ndjson.token) {
                         if let Some(mapped_name) = tool_for_native_intent(tools, &tool_name) {
-                            sent_tool_calls = true;
                             let tc = build_tool_call(&id, &mapped_name, args);
                             return Ok((full_text, reasoning_text, Some(vec![tc]), "tool_calls".to_string()));
                         }
@@ -533,159 +568,68 @@ impl DirectClient {
         Ok((full_text, reasoning_text, None, finish_reason))
     }
 
-    fn is_403_error(response: &reqwest::Response) -> bool {
-        response.status().as_u16() == 403
-    }
-
     async fn send_chat_request(
         &self,
         payload: &serde_json::Value,
-    ) -> Result<reqwest::Response, GatewayError> {
-        let url_str = format!("{}{}", GROK_BASE_URL, CONVERSATIONS_PATH);
-        let headers = self.build_request_headers("POST", CONVERSATIONS_PATH);
-
-        // Diagnostic: try stealth client and log result
-        // self.diagnose_stealth(&url_str, &headers, payload).await;
-
-        let builder = self
-            .http
-            .post(&url_str)
-            .headers(headers)
-            .json(payload);
-        send_with_retry(builder).await
+    ) -> Result<obscura_net::StreamingResponse, GatewayError> {
+        let url = format!("{GROK_BASE_URL}{CONVERSATIONS_PATH}");
+        let body = serde_json::to_string(payload)
+            .map_err(|e| GatewayError::Internal(format!("JSON serialization failed: {e}")))?;
+        let headers = self.build_request_headers();
+        send_stealth_stream(&self.stealth, "POST", &url, &headers, &body).await
     }
 
-    /*
-    /// Diagnostic: send one request via the stealth client and log the status/body.
-    /// This never changes the real request path.
-    async fn diagnose_stealth(
+    /// Drain up to 2 KB of a streaming response body into a String for error
+    /// messages. Consumes the response body.
+    async fn drain_error_body(&self, response: &mut obscura_net::StreamingResponse) -> String {
+        let mut out = String::new();
+        while out.len() < 2000 {
+            match response.bytes.next().await {
+                Some(Ok(b)) => out.push_str(&String::from_utf8_lossy(&b)),
+                _ => break,
+            }
+        }
+        out.chars().take(2000).collect()
+    }
+
+    /// Check the response status. On 200-299 return it unchanged. On 403
+    /// (anti-bot) retry once with a fresh `x-statsig-id` marker: the browser
+    /// error marker is generated per request, so the retry naturally carries
+    /// a new one. No browser navigation or constant re-extraction is involved
+    /// (the retired 70-byte challenge blob is what caused the 403s).
+    async fn check_and_retry(
         &self,
-        url: &str,
-        headers: &reqwest::header::HeaderMap,
+        response: obscura_net::StreamingResponse,
         payload: &serde_json::Value,
-    ) {
-        tracing::warn!("[stealth-diagnose] Entering diagnose_stealth");
-        let stealth = match self.stealth.as_ref() {
-            Some(s) => s,
-            None => {
-                tracing::warn!("[stealth-diagnose] No stealth client available");
-                return;
-            }
-        };
-        let parsed_url: url::Url = match url.parse() {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!("[stealth-diagnose] invalid url: {e}");
-                return;
-            }
-        };
-        let mut h = HashMap::new();
-        for (k, v) in headers.iter() {
-            if let Ok(v) = v.to_str() {
-                h.insert(k.to_string(), v.to_string());
-            }
-        }
-        let body_str = match serde_json::to_string(payload) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("[stealth-diagnose] serialize: {e}");
-                return;
-            }
-        };
-        match stealth.send_single("POST", &parsed_url, &h, &body_str).await {
-            Ok(resp) => {
-                let preview = String::from_utf8_lossy(&resp.body[..resp.body.len().min(200)]);
-                tracing::warn!(
-                    "[stealth-diagnose] status={} body={}",
-                    resp.status,
-                    preview,
-                );
-            }
-            Err(e) => {
-                tracing::warn!("[stealth-diagnose] error: {e}");
-            }
-        }
-        tracing::warn!("[stealth-diagnose] Exiting (completed)");
-    }
-    */
-
-    fn is_grok_403_status(status: u16, body: &str) -> bool {
-        if status == 403 {
-            tracing::warn!(
-                body = %body,
-                "Grok API 403 — challenge constants may be stale"
-            );
-            true
-        } else {
-            false
-        }
-    }
-
-    async fn try_heal_challenge(&self) -> Result<bool, GatewayError> {
-        tracing::warn!("Attempting to auto-heal Grok challenge constants");
-        match self
-            .challenge_store
-            .renew(&self.sessions, &self.session.id)
-            .await
-        {
-            Ok(()) => {
-                tracing::info!("Grok challenge constants healed; retrying request");
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to heal Grok challenge constants");
-                Ok(false)
-            }
-        }
-    }
-
-    /// Check response status and return Ok(response) on success,
-    /// or Err with optional auto-heal of challenge constants on 403.
-    async fn check_and_heal(
-        &self,
-        response: reqwest::Response,
-        payload: &serde_json::Value,
-    ) -> Result<reqwest::Response, GatewayError> {
-        let status = response.status().as_u16();
-        if status == 200 {
+    ) -> Result<obscura_net::StreamingResponse, GatewayError> {
+        let status = response.status;
+        if (200..300).contains(&status) {
             return Ok(response);
         }
 
-        let body = response.text().await.unwrap_or_default();
+        let mut response = response;
+        let body = self.drain_error_body(&mut response).await;
 
-        if Self::is_grok_403_status(status, &body) {
-            if self.try_heal_challenge().await? {
-                let retry = self.send_chat_request(payload).await?;
-                let retry_status = retry.status().as_u16();
-                if retry_status != 200 {
-                    let retry_body = retry.text().await.unwrap_or_default();
-                    if Self::is_grok_403_status(retry_status, &retry_body) {
-                        return Err(GatewayError::Provider(format!(
-                            "Grok API 403 after challenge refresh: {}. \
-                             Your grok.com login session may have expired. \
-                             Re-login to grok.com and re-run.",
-                            retry_body
-                        )));
-                    }
-                    return Err(GatewayError::Provider(format!(
-                        "Grok API error after retry ({}): {}",
-                        retry_status, retry_body
-                    )));
-                }
+        if status == 403 {
+            tracing::warn!(
+                body = %body,
+                "Grok API 403 anti-bot; retrying once with a fresh x-statsig-id marker"
+            );
+            let retry = self.send_chat_request(payload).await?;
+            if (200..300).contains(&retry.status) {
                 return Ok(retry);
             }
+            let mut retry = retry;
+            let retry_body = self.drain_error_body(&mut retry).await;
             return Err(GatewayError::Provider(format!(
-                "Grok API 403 Forbidden: {}. \
-                 Auto-heal failed — the x-statsig-id constants could not \
-                 be refreshed. Ensure grok.com is accessible and the \
-                 browser session is logged in.",
-                body
+                "Grok API 403 after marker refresh: {}. The grok.com session may be \
+                 expired; re-login to grok.com and re-import the browser profile.",
+                retry_body
             )));
         }
 
         Err(GatewayError::Provider(format!(
-            "Grok API error ({}): {}",
-            status, body
+            "Grok API error ({status}): {body}"
         )))
     }
 
@@ -700,7 +644,7 @@ impl DirectClient {
         let payload = self.build_conversation_payload(&request, &processed_urls, &conversation_id);
 
         let response = self.send_chat_request(&payload).await?;
-        let response = self.check_and_heal(response, &payload).await?;
+        let response = self.check_and_retry(response, &payload).await?;
 
         let tools = request.tools.as_deref().unwrap_or(&[]);
         let (full_text, reasoning_text, tool_calls, finish_reason) =
@@ -755,7 +699,7 @@ impl DirectClient {
         let payload = self.build_conversation_payload(&request, &processed_urls, &conversation_id);
 
         let response = self.send_chat_request(&payload).await?;
-        let response = self.check_and_heal(response, &payload).await?;
+        let response = self.check_and_retry(response, &payload).await?;
 
         let model_id = request.model.clone();
         let tools: Arc<[Tool]> = request.tools.clone().unwrap_or_default().into();
@@ -768,7 +712,7 @@ impl DirectClient {
             let mut is_collecting_xml_tool = false;
             let mut sent_first_chunk = false;
             let mut sent_tool_calls = false;
-            let mut stream = Box::pin(response.bytes_stream());
+            let mut stream = response.bytes;
 
             loop {
                 let chunk = match stream.next().await {

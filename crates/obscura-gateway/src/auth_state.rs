@@ -37,11 +37,12 @@ pub fn find_cookies_by_domain(
     names: &[&str],
 ) -> HashMap<String, String> {
     let all = cookie_jar.get_all_cookies();
-    let domain_lower = domain.to_lowercase();
+    let domain_lower = domain.trim_start_matches('.').to_lowercase();
     let mut result = HashMap::new();
     for cookie in &all {
-        if cookie.domain.to_lowercase() == domain_lower
-            || cookie.domain.trim_start_matches('.') == domain_lower
+        let cookie_domain = cookie.domain.trim_start_matches('.').to_lowercase();
+        if cookie_domain == domain_lower
+            || cookie.domain.to_lowercase() == domain_lower
         {
             if names.contains(&cookie.name.as_str()) {
                 result.insert(cookie.name.clone(), cookie.value.clone());
@@ -58,11 +59,11 @@ pub fn find_all_cookies_for_domain(
     domain: &str,
 ) -> Vec<CookieInfo> {
     let all = cookie_jar.get_all_cookies();
-    let domain_lower = domain.to_lowercase();
+    let domain_lower = domain.trim_start_matches('.').to_lowercase();
     all.into_iter()
         .filter(|c| {
-            let d = c.domain.to_lowercase();
-            d == domain_lower || d.trim_start_matches('.') == domain_lower
+            let d = c.domain.trim_start_matches('.').to_lowercase();
+            d == domain_lower || c.domain.to_lowercase() == domain_lower
         })
         .collect()
 }

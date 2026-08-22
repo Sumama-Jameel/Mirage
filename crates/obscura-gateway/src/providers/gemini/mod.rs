@@ -11,7 +11,7 @@ use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model,
 };
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use self::state::SessionStore;
 use crate::session::SessionManager;
 use crate::state::AppState;
@@ -21,7 +21,7 @@ mod direct;
 mod models;
 mod rpc;
 mod state;
-mod upload;
+pub(crate) mod upload;
 
 pub use models::to_public_models;
 
@@ -70,9 +70,6 @@ impl Provider for GeminiProvider {
         to_public_models()
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn supports_attachments(&self) -> bool {
         true
@@ -171,21 +168,9 @@ impl Provider for GeminiProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["textarea", "[contenteditable='true']"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[type='submit']", "button.send-button"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        ".response, .conversation-turn"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        Some(".thinking, .reasoning-panel")
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // Gemini web API support for JSON mode is unclear.
@@ -284,9 +269,6 @@ impl Provider for GeminiProvider {
         Ok(())
     }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(2000))
-    }
 }
 
 /// A stream wrapper that releases the browser session when the consumer is
@@ -303,7 +285,7 @@ mod tests {
         assert_eq!(p.url(), "https://gemini.google.com");
         assert!(p.models().iter().any(|m| m.id == "gemini-3.5-flash"));
         assert!(p.models().iter().any(|m| m.id == "gemini-3.1-pro"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+
     }
 
     #[test]

@@ -266,6 +266,7 @@ fn extract_token_from_html(html: &str) -> Option<String> {
 }
 
 /// Extract the `/__rd_verify_<token>` path from the 403 challenge page body.
+#[cfg(test)]
 fn extract_challenge_path(html: &str) -> Option<String> {
     challenge_re().find(html).map(|m| m.as_str().to_string())
 }

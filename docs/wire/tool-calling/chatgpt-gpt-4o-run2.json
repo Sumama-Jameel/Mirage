@@ -1,0 +1,46 @@
+{
+  "request_body": {
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a file called hello.txt with the content Hello, world!"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "write_file",
+          "description": "Write content to a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The filename"
+              },
+              "content": {
+                "type": "string",
+                "description": "The file content"
+              }
+            },
+            "required": [
+              "name",
+              "content"
+            ]
+          }
+        }
+      }
+    ],
+    "stream": false
+  },
+  "http_status": 401,
+  "elapsed_s": 0.0,
+  "response": {
+    "error": {
+      "message": "authentication error: model 'gpt-4o' provider 'chatgpt' is not logged in; missing: /__Secure-next-auth.session-token, __Host-next-auth.csrf-token cookie on chatgpt.com",
+      "type": "gateway_error"
+    }
+  }
+}

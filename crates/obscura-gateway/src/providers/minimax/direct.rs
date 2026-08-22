@@ -23,7 +23,6 @@ const API_HOST: &str = "https://agent.minimax.io";
 const STREAM_HOST: &str = "https://agent-stream.minimax.io";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:140.12) Gecko/20100101 Firefox/140.12";
 const AGENT_BASE: &str = "/archon/api/v1";
-const MAVIS_BASE: &str = "/mavis/api";
 const MAVIS_AGENT_ID: &str = "405561744400588";
 
 fn new_uuid() -> String {

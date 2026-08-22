@@ -1,0 +1,62 @@
+{
+  "request_body": {
+    "model": "deepseek-chat",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a file called hello.txt with the content Hello, world!"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "write_file",
+          "description": "Write content to a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The filename"
+              },
+              "content": {
+                "type": "string",
+                "description": "The file content"
+              }
+            },
+            "required": [
+              "name",
+              "content"
+            ]
+          }
+        }
+      }
+    ],
+    "stream": false
+  },
+  "http_status": 200,
+  "elapsed_s": 6.2,
+  "response": {
+    "id": "chatcmpl-cb7970db-b6c7-479d-9178-3613822a3fc7",
+    "object": "chat.completion",
+    "created": 1787304589,
+    "model": "deepseek-chat",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "I cannot directly write files to your system, but I can give you the content and instructions to create the file yourself.\n\n**Content for `hello.txt`:**\n```\nHello, world!\n```\n\n**How to create the file:**\n\n- **On Windows (Command Prompt):**\n  ```\n  echo Hello, world! > hello.txt\n  ```\n\n- **On Mac/Linux (Terminal):**\n  ```\n  echo \"Hello, world!\" > hello.txt\n  ```\n\n- **Using Python:**\n  ```python\n  with open('hello.txt', 'w') as f:\n      f.write('Hello, world!')\n  ```\n\n- **Manually:** Open any text editor (Notepad, VS Code, etc.), paste `Hello, world!`, and save as `hello.txt`."
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 13,
+      "completion_tokens": 160,
+      "total_tokens": 173
+    },
+    "session_url": "https://chat.deepseek.com/a/chat/s/deepseek_6996ba60cfd94582820a471bbc67efe4"
+  }
+}

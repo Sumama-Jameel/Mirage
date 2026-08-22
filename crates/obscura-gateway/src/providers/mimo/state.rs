@@ -96,6 +96,7 @@ impl MiMoSessionStore {
         store.get(gateway_session_id).cloned()
     }
 
+    #[allow(dead_code)]
     pub async fn remove(&self, gateway_session_id: &str) -> Option<MiMoSessionState> {
         self.ensure_loaded().await;
         let mut store = self.inner.lock().await;

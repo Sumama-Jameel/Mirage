@@ -31,9 +31,17 @@ pub fn read_cookies(db_path: &Path) -> Result<Vec<FirefoxCookie>, GatewayError> 
         )));
     }
 
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+    // The snapshot copies cookies.sqlite together with its WAL/SHM sidecars.
+    // Firefox keeps the DB in WAL mode and may not have checkpointed recent
+    // cookie writes (session rotations, refreshed tokens) into the main file.
+    // A read-only open cannot replay the WAL when the -shm index is absent,
+    // which leaves the snapshot with stale cookies. Open the copy read-write
+    // (it is our private snapshot) and checkpoint so the WAL is folded into
+    // the main DB before reading.
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
         |e| GatewayError::Internal(format!("failed to open cookies.sqlite: {e}")),
     )?;
+    let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
 
     // Modern Firefox (ESR 128+) stores cookies as plaintext in the `value`
     // column and no longer has `encryptedValue`. Older Firefox stores plaintext

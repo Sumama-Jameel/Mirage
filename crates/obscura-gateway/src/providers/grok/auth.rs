@@ -18,12 +18,25 @@ pub fn extract_grok_cookies(session: &SessionHandle) -> Vec<CookieInfo> {
         .collect()
 }
 
-pub fn build_cookie_header(cookies: &[CookieInfo]) -> String {
-    cookies
-        .iter()
-        .map(|c| format!("{}={}", c.name, c.value))
-        .collect::<Vec<_>>()
-        .join("; ")
+/// Build a cookie jar containing only the cookies Grok's anti-bot requires.
+///
+/// The full profile jar also carries a `cf_clearance` cookie issued to the
+/// Firefox browser that solved the challenge; replaying it from a different
+/// TLS fingerprint (our Chrome-emulated stealth client) is a pinned-cookie
+/// mismatch that grok.com's anti-bot rejects (OmniRoute documents this exact
+/// failure). OmniRoute's GrokWebExecutor forwards exactly `sso` + `sso-rw`,
+/// which grok.com's anti-bot requires as a pair.
+pub fn filtered_grok_jar(session: &SessionHandle) -> std::sync::Arc<obscura_net::CookieJar> {
+    const ALLOWED: &[&str] = &["sso", "sso-rw"];
+    let jar = obscura_net::CookieJar::new();
+    let filtered: Vec<CookieInfo> = session
+        .cookie_jar
+        .get_all_cookies()
+        .into_iter()
+        .filter(|c| ALLOWED.contains(&c.name.as_str()))
+        .collect();
+    jar.set_cookies_from_cdp(filtered);
+    std::sync::Arc::new(jar)
 }
 
 pub fn get_cookie<'a>(cookies: &'a [CookieInfo], name: &str) -> Option<&'a str> {

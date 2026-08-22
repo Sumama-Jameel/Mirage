@@ -28,7 +28,8 @@ use super::auth::{
 use super::models::{resolve_model, KimiModelDef};
 use super::rpc::{
     build_request_payload, collect_text_from_new_sse, collect_text_from_sse,
-    collect_tool_calls_from_sse, parse_new_sse_line, parse_sse_line,
+    collect_tool_calls_from_sse, extract_new_sse_tool_calls, parse_new_sse_line,
+    parse_sse_line,
 };
 use super::state::{SessionStore, StoredConversation};
 use super::upload::{decode_data_uri, derive_filename, upload_files};
@@ -79,31 +80,28 @@ impl KimiDirectClient {
             GatewayError::BadRequest(format!("unknown Kimi model: {model_id}"))
         })?;
 
-        // Try imported data first (cookie > localStorage) — fast, no navigation.
-        // Only navigate + JS eval if import fails.
-        let auth = match extract_from_import(&session.local_storage, Some(session.cookie_jar.as_ref())) {
-            Some(data) => {
-                info!("Kimi auth extracted from imported data");
-                data
-            }
-            None => {
-                // Navigation fallback: go to www.kimi.com and extract live token
-                navigate_to_kimi(sessions, &session.id).await?;
-                match extract_refresh_token(sessions, &session.id).await {
-                    Ok(data) => {
-                        info!("Kimi auth extracted after navigation");
-                        data
-                    }
-                    Err(_) => {
-                        // Last resort: retry import after navigation (cookie might have updated)
-                        extract_from_import(&session.local_storage, Some(session.cookie_jar.as_ref()))
-                            .ok_or_else(|| GatewayError::Auth(
-                                "Kimi auth not found. Ensure you are logged into https://www.kimi.com \
-                                 and re-run with --browser-source=firefox".to_string()
-                            ))?
-                    }
+        // A Firefox profile is a snapshot. Always give the live page a chance
+        // to refresh a server-invalidated token before trusting imported data,
+        // even when the JWT's local exp claim is still in the future.
+        let imported = extract_from_import(
+            &session.local_storage,
+            Some(session.cookie_jar.as_ref()),
+        );
+        let auth = match navigate_to_kimi(sessions, &session.id).await {
+            Ok(()) => match extract_refresh_token(
+                sessions,
+                &session.id,
+                Some(session.cookie_jar.as_ref()),
+            )
+            .await
+            {
+                Ok(data) => {
+                    info!("Kimi auth extracted after live page refresh");
+                    data
                 }
-            }
+                Err(error) => imported.ok_or(error)?,
+            },
+            Err(error) => imported.ok_or(error)?,
         };
 
         let headers = build_request_headers(&auth.access_token, &auth.device_id)?;
@@ -486,7 +484,7 @@ impl KimiDirectClient {
     /// Returns true if this model uses the new `/mavis/api/session/{id}/message` API
     /// instead of the legacy `/api/chat/{id}/completion/stream` endpoint.
     fn uses_message_api(&self) -> bool {
-        self.model_id == "kimi-k3"
+        matches!(self.model_id.as_str(), "kimi-k3" | "kimi-k3-instant" | "kimi-k3-swarm")
     }
 
     pub async fn chat(
@@ -536,7 +534,7 @@ impl KimiDirectClient {
                 .and_then(|c| c.segment_id.as_deref());
 
             let tool_prompt = match request.tools.as_ref() {
-                Some(tools) => inject_tool_prompt(&user_content, tools, request.tool_choice.as_ref()),
+                Some(tools) => inject_tool_prompt("kimi", &user_content, tools, request.tool_choice.as_ref()),
                 None => String::new(),
             };
             let final_content = if tool_prompt.is_empty() {
@@ -572,8 +570,22 @@ impl KimiDirectClient {
 
             // Extract tool calls from the response if tools were requested
             let has_tools = request.tools.is_some();
-            let (clean_text, tool_calls) = if has_tools {
-                tracing::info!("K3 path: extracting tool calls from response text");
+            let native_tool_calls = if has_tools {
+                let native = body
+                    .split(|&b| b == b'\n')
+                    .filter_map(|line| std::str::from_utf8(line).ok())
+                    .find_map(extract_new_sse_tool_calls);
+                if native.is_some() {
+                    tracing::info!("K3 message API returned native tool_calls");
+                }
+                native
+            } else {
+                None
+            };
+            let (clean_text, tool_calls) = if let Some(native) = native_tool_calls {
+                (text.clone(), Some(native))
+            } else if has_tools {
+                tracing::info!("K3 path: falling back to XML tool-call parsing");
                 convert_xml_tool_calls(&text, true)
             } else {
                 (text.clone(), None)
@@ -591,7 +603,11 @@ impl KimiDirectClient {
 
             // Store tool calls for multi-turn continuation
             if let Some(ref calls) = tool_calls {
-                if let Some(token) = conv_token.as_deref() {
+                let token_to_use = session_url
+                    .as_deref()
+                    .and_then(extract_session_token)
+                    .or_else(|| conv_token.clone());
+                if let Some(token) = token_to_use.as_deref() {
                     self.store.store_tool_calls(token, calls).await;
                 }
             }
@@ -628,7 +644,7 @@ impl KimiDirectClient {
         }
 
         let tool_prompt = match request.tools.as_ref() {
-            Some(tools) => inject_tool_prompt(&prompt, tools, request.tool_choice.as_ref()),
+            Some(tools) => inject_tool_prompt("kimi", &prompt, tools, request.tool_choice.as_ref()),
             None => String::new(),
         };
 
@@ -780,7 +796,20 @@ impl KimiDirectClient {
             let (tx, rx) = mpsc::unbounded_channel::<Result<ChatCompletionChunk, GatewayError>>();
             let stored_chat_id = chat_id.clone();
             let stored_model_id = model_id.clone();
-            let stored_conv_token = conv_token.clone();
+            // Allocate the gateway continuation handle before reading the
+            // upstream stream. K3 may omit `turn_id` on a successful stream,
+            // but the chat id is still sufficient for the next message.
+            let stream_token = conv_token
+                .clone()
+                .unwrap_or_else(new_session_token);
+            let initial_session_url = make_session_url(&stream_token, &chat_id);
+            let initial_conv = StoredConversation {
+                chat_id: chat_id.clone(),
+                model_id: model_id.clone(),
+                segment_id: stored_conv.as_ref().and_then(|c| c.segment_id.clone()),
+            };
+            store.insert(stream_token.clone(), &initial_conv, &model_id).await;
+            let stored_conv_token = Some(stream_token);
             let id_prefix2 = id_prefix.clone();
             let file_refs_k3 = file_refs.clone();
             let image_refs_k3 = image_refs.clone();
@@ -793,7 +822,7 @@ impl KimiDirectClient {
                     .join("\n");
 
                 let tool_prompt = match request.tools.as_ref() {
-                    Some(tools) => inject_tool_prompt(&prompt, tools, request.tool_choice.as_ref()),
+                    Some(tools) => inject_tool_prompt("kimi", &prompt, tools, request.tool_choice.as_ref()),
                     None => String::new(),
                 };
                 let final_content = if tool_prompt.is_empty() {
@@ -850,7 +879,7 @@ impl KimiDirectClient {
                 let mut previous_text = String::new();
                 let mut emitted_role = false;
                 let mut collected_tool_calls: Vec<ToolCall> = Vec::new();
-                let mut session_url: Option<String> = None;
+                let mut session_url: Option<String> = Some(initial_session_url.clone());
                 let mut stored_turn_id: Option<String> = None;
                 let mut conv_token = stored_conv_token.clone();
                 let counter = AtomicU32::new(0);
@@ -891,6 +920,25 @@ impl KimiDirectClient {
                                 tracing::debug!("K3 SSE raw: {preview}");
                             }
 
+                            if had_tools {
+                                if let Some(native_calls) = extract_new_sse_tool_calls(trimmed) {
+                                    build_streaming_chunk(
+                                        &tx,
+                                        &counter,
+                                        &id_prefix2,
+                                        &stored_model_id,
+                                        String::new(),
+                                        None,
+                                        Some(native_calls),
+                                        None,
+                                        None,
+                                        &mut previous_text,
+                                        &mut collected_tool_calls,
+                                        session_url.as_deref(),
+                                    );
+                                }
+                            }
+
                             match parse_new_sse_line(trimmed) {
                                 Some((delta, think, turn_id, is_done, is_error, error_msg)) => {
                                     if is_error {
@@ -917,6 +965,18 @@ impl KimiDirectClient {
                                     // Strip XML tool call markers from delta during
                                     // streaming so raw <tool_call> tags never leak
                                     // into content chunks (same as the legacy path).
+                                    // `complete_message` may repeat the full response after
+                                    // incremental deltas. Emit only the unseen suffix so a
+                                    // streaming client does not receive duplicated text.
+                                    let delta = delta.map(|d| {
+                                        if d.starts_with(&previous_text) {
+                                            d[previous_text.len()..].to_string()
+                                        } else if previous_text.starts_with(&d) {
+                                            String::new()
+                                        } else {
+                                            d
+                                        }
+                                    });
                                     let (clean_delta, xml_tool_call) = if had_tools {
                                         if let Some(d) = &delta {
                                             xml_tool_state.process(d)
@@ -1025,26 +1085,23 @@ impl KimiDirectClient {
                     "stop".to_string()
                 };
 
-                if let Some(ref tid) = stored_turn_id {
-                    let conv = StoredConversation {
-                        chat_id: stored_chat_id.clone(),
-                        model_id: stored_model_id.clone(),
-                        segment_id: Some(tid.clone()),
-                    };
-                    let token = conv_token
-                        .clone()
-                        .unwrap_or_else(new_session_token);
-                    store.insert(token.clone(), &conv, &stored_model_id).await;
+                let conv = StoredConversation {
+                    chat_id: stored_chat_id.clone(),
+                    model_id: stored_model_id.clone(),
+                    segment_id: stored_turn_id.clone(),
+                };
+                let token = conv_token
+                    .clone()
+                    .unwrap_or_else(new_session_token);
+                store.insert(token.clone(), &conv, &stored_model_id).await;
 
-                    if !collected_tool_calls.is_empty() {
-                        store
-                            .store_tool_calls(&token, &collected_tool_calls)
-                            .await;
-                    }
-
-                    if session_url.is_none() {
-                        session_url = Some(make_session_url(&token, &stored_chat_id));
-                    }
+                if !collected_tool_calls.is_empty() {
+                    store
+                        .store_tool_calls(&token, &collected_tool_calls)
+                        .await;
+                }
+                if session_url.is_none() {
+                    session_url = Some(make_session_url(&token, &stored_chat_id));
                 }
 
                 let _ = tx.send(Ok(ChatCompletionChunk {
@@ -1073,7 +1130,7 @@ impl KimiDirectClient {
 
         tokio::spawn(async move {
             let tool_prompt = match request.tools.as_ref() {
-                Some(tools) => inject_tool_prompt(&prompt, tools, request.tool_choice.as_ref()),
+                Some(tools) => inject_tool_prompt("kimi", &prompt, tools, request.tool_choice.as_ref()),
                 None => String::new(),
             };
 

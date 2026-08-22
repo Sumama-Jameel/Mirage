@@ -23,7 +23,7 @@ mod version;
 pub use version::{build_firefox_ua, firefox_version_or_default};
 
 /// A single localStorage entry imported from a browser.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LocalStorageEntry {
     /// Exact origin that owns this value. localStorage is origin-scoped and
     /// must never be replayed into a different provider's page.

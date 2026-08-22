@@ -30,6 +30,7 @@ const MAX_FILE_SIZE: usize = 20 * 1024 * 1024;
 
 /// Chunk size for streaming hash computation (64 KB).
 /// Balances memory usage vs. syscall overhead.
+#[allow(dead_code)]
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Result of downloading and hashing a single file.

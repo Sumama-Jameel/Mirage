@@ -51,6 +51,7 @@ pub fn resolve_model(model_id: &str) -> Option<ClaudeModelDef> {
     match model_id {
         "claude-fable-5" => Some(current_gen("claude-fable-5", "claude-fable-5")),
         "claude-sonnet-5" => Some(current_gen("claude-sonnet-5", "claude-sonnet-5")),
+        "claude-opus-5" => Some(current_gen("claude-opus-5", "claude-opus-5")),
         "claude-opus-4-8" => Some(current_gen("claude-opus-4-8", "claude-opus-4-8")),
         "claude-haiku-4-5-20251001" => Some(current_gen("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001")),
         "claude-haiku-4-5" => Some(current_gen("claude-haiku-4-5", "claude-haiku-4-5")),
@@ -69,6 +70,7 @@ pub fn to_public_models() -> Vec<Model> {
     const KNOWN: &[&str] = &[
         "claude-fable-5",
         "claude-sonnet-5",
+        "claude-opus-5",
         "claude-opus-4-8",
         "claude-haiku-4-5-20251001",
         "claude-haiku-4-5",
@@ -106,6 +108,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_opus_5() {
+        let m = resolve_model("claude-opus-5").unwrap();
+        assert_eq!(m.id, "claude-opus-5");
+        assert!(m.supports_thinking);
+        assert!(m.supports_search);
+        assert!(m.supports_vision);
+        assert!(m.supports_tools);
+    }
+
+    #[test]
     fn resolve_opus_4_8() {
         let m = resolve_model("claude-opus-4-8").unwrap();
         assert_eq!(m.id, "claude-opus-4-8");
@@ -135,6 +147,7 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"claude-sonnet-5"));
         assert!(ids.contains(&"claude-fable-5"));
+        assert!(ids.contains(&"claude-opus-5"));
         assert!(ids.contains(&"claude-opus-4-8"));
         assert!(ids.contains(&"claude-haiku-4-5"));
         assert!(ids.contains(&"claude-sonnet-4-6"));

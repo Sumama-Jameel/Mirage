@@ -12,9 +12,7 @@ use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatContent,
     ChatMessage, ChatMessageDelta, ChunkChoice, ToolCall, Usage,
 };
-use crate::providers::tool_call::{
-    convert_xml_tool_calls, inject_tool_prompt,
-};
+use crate::providers::tool_call::inject_tool_prompt;
 use crate::providers::streaming_upload::download_and_hash_batch;
 use crate::session::{SessionHandle, SessionManager};
 
@@ -23,18 +21,11 @@ use super::state::QwenSessionStore;
 
 const BASE_URL: &str = "https://chat.qwen.ai";
 const API_PATH: &str = "/api/v2";
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-fn unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
 
 fn unix_secs() -> i64 {
     SystemTime::now()
@@ -58,6 +49,20 @@ fn upstream_model(model_id: &str) -> String {
         "qwen-flash" => "qwen3.5-flash".to_string(),
         "qwen-coder" => "qwen3-coder-plus".to_string(),
         "qwen-vl" => "qwen3-vl-plus".to_string(),
+        "qwen3.8-max"
+        | "qwen3.8-max-preview"
+        | "qwen3.7-plus"
+        | "qwen3.6-max-preview"
+        | "qwen3.5-omni-plus"
+        | "qwen3.6-plus"
+        | "qwen3.7-max"
+        | "qwen3.7"
+        | "qwen3.6"
+        | "qwen3.5"
+        | "qwen3"
+        | "qwen3-vl"
+        | "qwen3-coder"
+        | "qwen3-vl-235b-a22b" => model_id.to_string(),
         _ => {
             // Pass through unknown model IDs so we can probe the API directly
             model_id.to_string()
@@ -96,6 +101,7 @@ struct QwenToolCallDelta {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     r#type: Option<String>,
     #[serde(default)]
     function: Option<QwenFunctionDelta>,
@@ -112,6 +118,7 @@ struct QwenFunctionDelta {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct QwenSSEDelta {
     #[serde(default)]
+    #[allow(dead_code)]
     role: Option<String>,
     #[serde(default)]
     content: Option<String>,
@@ -127,13 +134,22 @@ struct QwenSSEDelta {
 struct QwenSSEEvent {
     #[serde(default)]
     choices: Vec<QwenSSEChoice>,
+    /// `response.created` carries the id of the assistant message being
+    /// streamed. The next turn must link to it via `parent_id`.
+    #[serde(rename = "response.created", default)]
+    response_created: Option<QwenResponseCreated>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct QwenResponseCreated {
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 /// A single direct-API request context for Qwen.
 pub struct DirectClient {
     stealth: Arc<StealthHttpClient>,
     session: SessionHandle,
-    sessions: SessionManager,
     model_id: String,
     request_id: String,
     store: QwenSessionStore,
@@ -205,7 +221,7 @@ async fn send_stealth(
 impl DirectClient {
     pub async fn new(
         session: SessionHandle,
-        sessions: &SessionManager,
+        _sessions: &SessionManager,
         model_id: &str,
         store: QwenSessionStore,
     ) -> Result<Self, GatewayError> {
@@ -225,7 +241,6 @@ impl DirectClient {
         Ok(Self {
             stealth,
             session,
-            sessions: sessions.clone(),
             model_id: model_id.to_string(),
             request_id,
             store,
@@ -236,7 +251,10 @@ impl DirectClient {
     /// Create a new upstream chat session.
     /// Returns (id, parent_id, chat_id) matching qwen2api-rs fields.
     async fn create_chat_session(&self, has_vision: bool) -> Result<(String, String, String), GatewayError> {
-        let chat_type = if has_vision { "v2t" } else { "t2t" };
+        // The web app only ever uses `t2t` (even with attached images); `v2t`
+        // is not a valid chat_type and yields Bad_Request.
+        let _ = has_vision;
+        let chat_type = "t2t";
         let payload = serde_json::json!({
             "title": "New Chat",
             "models": [""],
@@ -371,7 +389,13 @@ impl DirectClient {
     }
 
     /// Build the messages payload body matching the web app exact format.
-    async fn build_completion_payload(&self, request: &ChatCompletionRequest, chat_id: &str, _parent_id: &str, stream: bool, file_objects: &[serde_json::Value], has_vision: bool, gateway_session_id: &str) -> serde_json::Value {
+    ///
+    /// `last_message_id` is the id of the previous assistant message (from the
+    /// prior turn's `response.created` SSE event). The new user message links
+    /// to it via `parent_id` so the server reconstructs conversation context;
+    /// null on the first turn of a chat.
+    async fn build_completion_payload(&self, request: &ChatCompletionRequest, chat_id: &str, last_message_id: Option<&str>, stream: bool, file_objects: &[serde_json::Value], has_vision: bool, gateway_session_id: &str) -> serde_json::Value {
+        let _ = has_vision;
         let ts = unix_secs();
         let fid = new_uuid();
         let child_id = new_uuid();
@@ -383,7 +407,7 @@ impl DirectClient {
         let tool_context = self.handle_tool_results(gateway_session_id, &request.messages).await;
         let mut content = if let Some(ref tools) = request.tools {
             if !tools.is_empty() {
-                inject_tool_prompt(&raw_content, tools, request.tool_choice.as_ref())
+                inject_tool_prompt("qwen", &raw_content, tools, request.tool_choice.as_ref())
             } else {
                 raw_content
             }
@@ -396,20 +420,36 @@ impl DirectClient {
 
         let files = file_objects.to_vec();
 
-        let chat_type = if has_vision { "v2t" } else { "t2t" };
+        // The web app only uses `t2t` (even with attached images).
+        let chat_type = "t2t";
 
-        let mut payload = serde_json::json!({
+        // Message-tree linkage: the new user message becomes a child of the
+        // previous assistant message (its id came back in `response.created`).
+        // First turn of a chat: `parentId` is empty and `parent_id` null.
+        let top_parent_id = match last_message_id {
+            Some(id) => serde_json::Value::String(id.to_string()),
+            None => serde_json::Value::String(String::new()),
+        };
+        let null_parent_id = match last_message_id {
+            Some(id) => serde_json::Value::String(id.to_string()),
+            None => serde_json::Value::Null,
+        };
+        let parent_id = last_message_id.unwrap_or("");
+
+        let payload = serde_json::json!({
             "stream": stream,
             "version": "2.1",
             "incremental_output": true,
+            "chatId": chat_id,
+            "parentId": top_parent_id,
             "chat_id": chat_id,
             "chat_mode": "normal",
             "model": model,
-            "parent_id": null,
+            "parent_id": null_parent_id,
             "messages": [{
                 "id": null,
                 "fid": fid,
-                "parentId": null,
+                "parentId": parent_id,
                 "childrenIds": [child_id],
                 "role": "user",
                 "content": content,
@@ -434,24 +474,17 @@ impl DirectClient {
                     }
                 },
                 "sub_chat_type": chat_type,
-                "parent_id": null
+                "parent_id": null_parent_id
             }],
             "timestamp": ts
         });
 
-        // Native tool definitions: serialize the OpenAI-style `tools` array
-        // directly into the request payload. The Qwen /api/v2/chat/completions
-        // endpoint is OpenAI-compatible and accepts a root-level `tools` array.
-        if let Some(ref tools) = request.tools {
-            if !tools.is_empty() {
-                payload["tools"] = serde_json::to_value(tools)
-                    .unwrap_or(serde_json::Value::Null);
-                if let Some(ref choice) = request.tool_choice {
-                    payload["tool_choice"] = serde_json::to_value(choice)
-                        .unwrap_or(serde_json::Value::Null);
-                }
-            }
-        }
+        // DO NOT send a `tools` array in the payload. Qwen's server validates
+        // tool names against its own built-in registry (code_interpreter,
+        // web_search, web_extractor) and responds with "Tool X does not exists"
+        // for any custom tool name. Instead, tools are injected as XML text
+        // via inject_tool_prompt above, and the model emits <tool_call>
+        // XML markers in the content which we parse below.
 
         payload
     }
@@ -559,16 +592,18 @@ impl DirectClient {
         text
     }
 
-    /// Parse SSE body into accumulated text, reasoning, and native tool calls.
+    /// Parse SSE body into accumulated text, reasoning, native tool calls,
+    /// and the id of the created assistant message (from `response.created`).
     ///
     /// Native tool calls arrive as OpenAI-style `delta.tool_calls` objects.
     /// Arguments may be split across multiple deltas, so they are accumulated
     /// by call index and merged into complete `ToolCall` objects.
-    fn parse_sse_events(body: &str) -> (String, String, String, Vec<ToolCall>) {
+    fn parse_sse_events(body: &str) -> (String, String, String, Vec<ToolCall>, Option<String>) {
         let mut full_text = String::new();
         let mut reasoning_text = String::new();
         let mut finish_reason = "stop".to_string();
         let mut native_calls: Vec<ToolCall> = Vec::new();
+        let mut created_message_id: Option<String> = None;
 
         for line in body.lines() {
             let line = line.trim();
@@ -583,6 +618,11 @@ impl DirectClient {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            if let Some(created) = &event.response_created {
+                if created_message_id.is_none() {
+                    created_message_id = created.parent_id.clone();
+                }
+            }
             for choice in event.choices {
                 if let Some(ref fr) = choice.finish_reason {
                     finish_reason = fr.clone();
@@ -649,7 +689,7 @@ impl DirectClient {
         // Drop empty placeholder tool calls (no name/arguments were ever set).
         native_calls.retain(|c| !c.function.name.is_empty());
 
-        (full_text, reasoning_text, finish_reason, native_calls)
+        (full_text, reasoning_text, finish_reason, native_calls, created_message_id)
     }
 
     /// Non-streaming chat completion. Accumulates SSE deltas in-memory.
@@ -664,20 +704,27 @@ impl DirectClient {
         let (file_urls, has_vision) = self.process_attachments(&request).await?;
 
         // Step 1: get or create session
-        let (session_id, parent_id, chat_id) = if let Some(existing) = self.store.get(gateway_session_id).await {
-            (existing.chat_id.clone(), "0".to_string(), existing.chat_id)
-        } else {
-            let (sid, pid, cid) = self.create_chat_session(has_vision).await?;
-            self.store.insert(gateway_session_id.to_string(), super::state::QwenSessionState {
-                chat_id: cid.clone(),
-                model: self.model_id.clone(),
-                tool_calls: HashMap::new(),
-            }).await;
-            (sid, pid, cid)
-        };
+        let (session_id, _parent_id, chat_id, last_message_id) =
+            if let Some(existing) = self.store.get(gateway_session_id).await {
+                (
+                    existing.chat_id.clone(),
+                    "0".to_string(),
+                    existing.chat_id,
+                    existing.last_message_id.clone(),
+                )
+            } else {
+                let (sid, pid, cid) = self.create_chat_session(has_vision).await?;
+                self.store.insert(gateway_session_id.to_string(), super::state::QwenSessionState {
+                    chat_id: cid.clone(),
+                    model: self.model_id.clone(),
+                    tool_calls: HashMap::new(),
+                    last_message_id: None,
+                }).await;
+                (sid, pid, cid, None)
+            };
 
         // Step 2: stream and accumulate
-        let payload = self.build_completion_payload(&request, &chat_id, &parent_id, true, &file_urls, has_vision, gateway_session_id).await;
+        let payload = self.build_completion_payload(&request, &chat_id, last_message_id.as_deref(), true, &file_urls, has_vision, gateway_session_id).await;
         let url = format!(
             "{}{}/chat/completions?chat_id={}",
             BASE_URL, API_PATH, session_id,
@@ -725,17 +772,32 @@ impl DirectClient {
         }
 
         tracing::info!(body_len = body.len(), "Qwen completion response has content");
-        let (raw_text, reasoning_text, mut finish_reason, native_calls) = Self::parse_sse_events(&body);
+        let (raw_text, reasoning_text, mut finish_reason, native_calls, created_message_id) =
+            Self::parse_sse_events(&body);
+
+        // Record the created assistant message id so the next turn links to it.
+        if let Some(msg_id) = &created_message_id {
+            self.store.store_last_message_id(gateway_session_id, msg_id).await;
+        }
 
         let has_tools = request.tools.is_some();
-        // Native tool calls are the primary path. If the upstream model
-        // produced none, fall back to XML `<tool_call>` marker parsing.
-        let (full_text, tool_calls) = if has_tools {
-            if !native_calls.is_empty() {
-                (raw_text, Some(native_calls))
+        // Qwen models support native tool_calls via the OpenAI-compatible SSE
+        // delta.tool_calls field. Do NOT fall back to XML `<tool_call>` marker
+        // parsing: the upstream API already handles tools natively, and XML
+        // markers are just informational text the model sometimes echoes.
+        // Parse XML <tool_call> markers from the response text.
+        // Qwen's server rejects custom tools in the native payload, so the
+        // model emits <tool_call> XML in content instead.
+        let (full_text, tool_calls) = if has_tools && !native_calls.is_empty() {
+            // Native tool_calls from the SSE delta (unlikely without payload tools)
+            (raw_text, Some(native_calls))
+        } else if has_tools {
+            // XML fallback: parse <tool_call>...</tool_call> from content text
+            let (stripped, calls) = crate::providers::tool_call::convert_xml_tool_calls(&raw_text, true);
+            if calls.is_some() {
+                (stripped, calls)
             } else {
-                let (cleaned, maybe_calls) = convert_xml_tool_calls(&raw_text, true);
-                (cleaned, maybe_calls)
+                (raw_text, None)
             }
         } else {
             (raw_text, None)
@@ -794,20 +856,26 @@ impl DirectClient {
         let (file_urls, has_vision) = self.process_attachments(&request).await?;
 
         // Step 1: get or create session
-        let (session_id, parent_id, chat_id) = if let Some(existing) = self.store.get(gateway_session_id).await {
-            (existing.chat_id.clone(), "0".to_string(), existing.chat_id)
-        } else {
-            let (sid, pid, cid) = self.create_chat_session(has_vision).await?;
-            self.store.insert(gateway_session_id.to_string(), super::state::QwenSessionState {
-                chat_id: cid.clone(),
-                model: self.model_id.clone(),
-                tool_calls: HashMap::new(),
-            }).await;
-            (sid, pid, cid)
-        };
+        let (session_id, _parent_id, chat_id, last_message_id) =
+            if let Some(existing) = self.store.get(gateway_session_id).await {
+                (
+                    existing.chat_id.clone(),
+                    "0".to_string(),
+                    existing.chat_id,
+                    existing.last_message_id.clone(),
+                )
+            } else {
+                let (sid, pid, cid) = self.create_chat_session(has_vision).await?;
+                self.store.insert(gateway_session_id.to_string(), super::state::QwenSessionState {
+                    chat_id: cid.clone(),
+                    model: self.model_id.clone(),
+                    tool_calls: HashMap::new(),
+                    last_message_id: None,
+                }).await;
+                (sid, pid, cid, None)
+            };
 
-        // Step 2: start the completion request
-        let payload = self.build_completion_payload(&request, &chat_id, &parent_id, request.stream, &file_urls, has_vision, gateway_session_id).await;
+        let payload = self.build_completion_payload(&request, &chat_id, last_message_id.as_deref(), request.stream, &file_urls, has_vision, gateway_session_id).await;
         let url = format!(
             "{}{}/chat/completions?chat_id={}",
             BASE_URL, API_PATH, session_id
@@ -851,6 +919,10 @@ impl DirectClient {
         let status = resp.status();
         if status != 200 {
             let err_body = resp.text().await.unwrap_or_default();
+            // A failed completion invalidates the stored chat reference. Drop
+            // the store entry and delete the upstream chat so a retry (or the
+            // next turn) creates a fresh chat instead of reusing a broken id.
+            self.store.remove(gateway_session_id).await;
             let _ = Self::delete_chat_session(&session_id, self.stealth.as_ref()).await;
             if err_body.trim_start().starts_with("<!") {
                 return Err(GatewayError::Provider(
@@ -872,7 +944,6 @@ impl DirectClient {
         let byte_stream = resp.bytes_stream();
 
         // Spawn a task to process the SSE stream incrementally.
-        let stealth_clone = self.stealth.clone();
         let store = self.store.clone();
         let gateway_session_id_owned = gateway_session_id.to_string();
         tokio::spawn(async move {
@@ -920,6 +991,15 @@ impl DirectClient {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
+
+                        // Capture the created assistant message id from the
+                        // first `response.created` event so the next turn can
+                        // link to it via parent_id.
+                        if let Some(created) = &event.response_created {
+                            if let Some(parent_id) = &created.parent_id {
+                                store.store_last_message_id(&gateway_session_id_owned, parent_id).await;
+                            }
+                        }
 
                         for choice in event.choices {
                             if sent_tool_calls {
@@ -1090,6 +1170,11 @@ impl DirectClient {
                 // Try to parse it as a final SSE event
                 if let Some(json_str) = remaining.strip_prefix("data: ") {
                     if let Ok(event) = serde_json::from_str::<QwenSSEEvent>(json_str) {
+                        if let Some(created) = &event.response_created {
+                            if let Some(parent_id) = &created.parent_id {
+                                store.store_last_message_id(&gateway_session_id_owned, parent_id).await;
+                            }
+                        }
                         for choice in event.choices {
                             if let Some(content) = choice.delta.content {
                                 if !content.is_empty() {
@@ -1105,14 +1190,17 @@ impl DirectClient {
                 }
             }
 
-            // After all events, check for tool calls in accumulated content
-            if has_tools && !full_content_buf.is_empty() {
-                let (_cleaned, maybe_calls) = convert_xml_tool_calls(&full_content_buf, true);
-                if let Some(calls) = maybe_calls {
+            // Parse XML <tool_call> markers from accumulated content.
+            // Qwen's server rejects custom tools in the native payload, so the
+            // model emits <tool_call> XML in content instead. We parse those
+            // into structured tool_calls here.
+            if !sent_tool_calls && has_tools {
+                let (_stripped, calls) = crate::providers::tool_call::convert_xml_tool_calls(&full_content_buf, true);
+                if let Some(calls) = calls {
                     if !calls.is_empty() {
                         sent_tool_calls = true;
-                        store.store_tool_calls(&gateway_session_id_owned, &calls).await;
                         for tc in &calls {
+                            store.store_tool_calls(&gateway_session_id_owned, std::slice::from_ref(tc)).await;
                             let _ = tx.try_send(Ok(ChatCompletionChunk {
                                 id: response_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
@@ -1151,8 +1239,10 @@ impl DirectClient {
                 session_url: session_url.clone(),
             }));
 
-            // Cleanup: delete the chat session
-            Self::delete_chat_session(&chat_id, &stealth_clone).await;
+            // The upstream chat is intentionally kept alive: the Qwen web app
+            // persists every chat in the sidebar, and the store reuses the same
+            // chat_id for the next turn (session continuation) or tool
+            // roundtrip. Deleting it here broke both with CHAT_NOT_FOUND.
         });
 
         Ok(rx_stream.boxed())

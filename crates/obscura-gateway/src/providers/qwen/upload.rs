@@ -105,7 +105,17 @@ fn oss_urlencode(s: &str) -> String {
 
 /// Compute OSS V4 signing key and signature.
 ///
-/// Matches the ali-oss SDK with `authorizationV4: true`.
+/// Matches the ali-oss SDK (`ali-oss-vendor.js`) with `authorizationV4: true`
+/// and no additional signed headers. Key points that differ from the AWS-style
+/// scheme:
+/// - The canonical URI includes the bucket prefix (`/{bucket}/{object}`).
+/// - `host` is NOT part of the canonical headers; only `content-type`,
+///   `content-md5`, and `x-oss-*` headers (present on the request) plus any
+///   additional headers are signed.
+/// - The Authorization header carries no `SignedHeaders=` parameter; it is
+///   just `Credential=...,Signature=...` (an optional `AdditionalHeaders=`
+///   appears only when extra headers are signed, which we never do).
+/// - The signing-key seed is `aliyun_v4{secret}`, not `OSS4{secret}`.
 fn oss_v4_sign(
     method: &str,
     file_path: &str,
@@ -115,24 +125,27 @@ fn oss_v4_sign(
     access_key_id: &str,
     access_key_secret: &str,
     security_token: &str,
+    content_type: &str,
     date_time: &DateTime<Utc>,
 ) -> Vec<(String, String)> {
     let yyyymmdd = date_time.format("%Y%m%d").to_string();
     let iso8601 = date_time.format("%Y%m%dT%H%M%SZ").to_string();
 
-    // Canonical URI = /{urlencode(object_key)}
-    let canonical_uri = format!("/{}", oss_urlencode(file_path));
+    // Canonical URI = /{bucket}/{urlencoded(object_key)} with %2F restored to /
+    let canonical_uri = format!("/{}/{}", bucket, oss_urlencode(file_path)).replace("%2F", "/");
 
     // Canonical Query String = empty for direct PUT (no query params)
     let canonical_query_string = "";
 
-    // Canonical Headers (sorted by lowercase key name)
-    let host = format!("{}.{}", bucket, endpoint);
-    let signed_headers = "host;x-oss-content-sha256;x-oss-date;x-oss-security-token";
+    // Canonical Headers: sorted `key:value\n` lines for the x-oss-* headers we
+    // send plus content-type. `host` is intentionally excluded.
     let canonical_headers = format!(
-        "host:{}\nx-oss-content-sha256:UNSIGNED-PAYLOAD\nx-oss-date:{}\nx-oss-security-token:{}\n",
-        host, iso8601, security_token
+        "content-type:{}\nx-oss-content-sha256:UNSIGNED-PAYLOAD\nx-oss-date:{}\nx-oss-security-token:{}\n",
+        content_type, iso8601, security_token
     );
+
+    // Signed headers list: empty (no additional headers signed)
+    let signed_headers = "";
 
     // Canonical Request
     let canonical_request = format!(
@@ -152,8 +165,8 @@ fn oss_v4_sign(
 
     tracing::debug!(string_to_sign = %string_to_sign, "OSS V4 string to sign");
 
-    // Signing Key: OSS4-HMAC-SHA256 derivation chain
-    let init_key = format!("OSS4{}", access_key_secret);
+    // Signing Key: seed is "aliyun_v4" + secret (SDK getSignatureV4)
+    let init_key = format!("aliyun_v4{}", access_key_secret);
     let date_key = hmac_sha256(init_key.as_bytes(), yyyymmdd.as_bytes());
     let date_region_key = hmac_sha256(&date_key, region.as_bytes());
     let date_region_service_key = hmac_sha256(&date_region_key, b"oss");
@@ -162,10 +175,11 @@ fn oss_v4_sign(
     // Signature
     let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
 
-    // Authorization header
+    // Authorization header (no SignedHeaders= parameter)
+    let host = format!("{}.{}", bucket, endpoint);
     let authorization = format!(
-        "OSS4-HMAC-SHA256 Credential={}/{}/{}/oss/aliyun_v4_request,SignedHeaders={},Signature={}",
-        access_key_id, yyyymmdd, region, signed_headers, signature
+        "OSS4-HMAC-SHA256 Credential={}/{}/{}/oss/aliyun_v4_request,Signature={}",
+        access_key_id, yyyymmdd, region, signature
     );
 
     vec![
@@ -332,9 +346,12 @@ async fn request_sts_token(
 /// Upload raw bytes to Alibaba Cloud OSS using STS temporary credentials with
 /// OSS V4 signature (matching the web app's `ali-oss` SDK with `authorizationV4: true`).
 ///
-/// The web app does NOT use the pre-signed `file_url` — it creates an OSS SDK client
-/// with the STS body credentials and lets the SDK sign each PUT. We replicate that
-/// by computing the V4 signature ourselves.
+/// The web app does NOT use the pre-signed `file_url` for the PUT — it creates
+/// an OSS SDK client with the STS body credentials and lets the SDK sign each
+/// PUT. We replicate that by computing the V4 signature ourselves. The file's
+/// `url` in the chat payload, however, IS the server-signed `file_url` (the app
+/// passes `onUploadSuccess(fileId, fileCDNUrl)` straight through), so we return
+/// that rather than reconstructing a bare CDN URL.
 async fn upload_to_oss(
     data: &[u8],
     content_type: &str,
@@ -353,12 +370,20 @@ async fn upload_to_oss(
     }
 
     let now = Utc::now();
+    // The OSS V4 signing region is the standard region WITHOUT the `oss-`
+    // prefix: the web app's ali-oss SDK runs `getStandardRegion` =
+    // `region.replace(/^oss-/, "")` before building the credential scope
+    // (`ap-southeast-1`, not `oss-ap-southeast-1` or `accelerate`). Passing
+    // the raw STS region or `accelerate` yields "Invalid signing region".
+    let sign_region = region.strip_prefix("oss-").unwrap_or(region);
     let oss_headers = oss_v4_sign(
-        "PUT", file_path, bucket, endpoint, region,
-        access_key_id, access_key_secret, security_token, &now,
+        "PUT", file_path, bucket, endpoint, sign_region,
+        access_key_id, access_key_secret, security_token, content_type, &now,
     );
 
-    let url = format!("https://{}.{}/{}", bucket, endpoint, oss_urlencode(file_path));
+    // Object key goes in the URL path with `/` preserved (like the SDK's
+    // `encodeURIComponent(...).replace(/%2F/g, "/")`).
+    let url = format!("https://{}.{}/{}", bucket, endpoint, oss_urlencode(file_path).replace("%2F", "/"));
     tracing::info!(url = %url, file_path = %file_path, "Qwen OSS V4 upload starting");
 
     let client = reqwest::Client::builder()
@@ -388,12 +413,18 @@ async fn upload_to_oss(
         )));
     }
 
-    // Return the canonical CDN URL (without query params) for use in the chat API
-    let cdn_url = format!("https://{}.{}/{}", bucket, endpoint, file_path);
-    Ok(cdn_url)
+    // Return the server-signed `file_url` (presigned GET with expiry) for use in
+    // the chat API — the web app sends exactly this string as the file's `url`.
+    let file_url = sts_data["file_url"].as_str().unwrap_or("");
+    if file_url.is_empty() {
+        return Err(GatewayError::Internal("STS response missing file_url".to_string()));
+    }
+    Ok(file_url.to_string())
 }
 
-/// Build the full file metadata object that Qwen expects in the chat API.
+/// Build the full file metadata object that Qwen expects in the chat API,
+/// matching the web app's file item shape (extra `user_id`, `lastModified`,
+/// `name`, `webkitRelativePath`, `size`, `type` fields on the inner `file`).
 fn build_file_metadata(
     file_url: &str,
     filename: &str,
@@ -406,6 +437,17 @@ fn build_file_metadata(
     let file_class = if mime_type.starts_with("image/") { "vision" } else { "file" };
     let now_ms = unix_ms();
 
+    // user_id is the folder segment in the object key:
+    // https://{bucket}.{endpoint}/{user_id}/{file_id}_{filename}?...
+    let user_id = file_url
+        .split('/')
+        .nth(3)
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
     serde_json::json!({
         "type": show_type,
         "file": {
@@ -414,12 +456,18 @@ fn build_file_metadata(
             "filename": filename,
             "hash": null,
             "id": file_id,
+            "user_id": user_id,
             "meta": {
                 "name": filename,
                 "size": file_size,
                 "content_type": mime_type,
             },
             "update_at": now_ms,
+            "lastModified": now_ms,
+            "name": filename,
+            "webkitRelativePath": "",
+            "size": file_size,
+            "type": mime_type,
         },
         "id": file_id,
         "url": file_url,

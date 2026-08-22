@@ -4,3 +4,6 @@ target/
 .opencode/
 .kimchi/
 .DS_Store
+.gateway.pid
+gateway.log
+*.log

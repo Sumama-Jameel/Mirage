@@ -4,6 +4,8 @@ Status: LIVE-TESTED 2026-08-07 against the running gateway
 (`target/release/obscura-gateway`, `127.0.0.1:8080`, config
 `obscura-gateway.toml`, browser profile firefox-esr). Every entry below is
 based on an actual live HTTP test, not on code inspection or assumptions.
+Re-verified 2026-08-15 for the deepseek, metaai, gemini, and qwen rows; items
+fixed and re-tested live as of that date have been removed from this file.
 
 Scope per GOAL.md: for each provider, NATIVE tool calling, NATIVE streaming +
 non-streaming, NATIVE file upload, NATIVE thinking toggle, NATIVE
@@ -45,11 +47,6 @@ provider refuses. `userId` is a required cookie in `MIMO_PROTOCOL.md` and it
 is missing from the profile, so no MiMo test is possible.
 Evidence: smoke test, 5/5 MiMo models -> 401.
 
-### 1.5 Meta AI — all 3 models, basic chat — HTTP 401
-`no meta.ai cookies found`. Profile has no `meta.ai` / `ecto_1_sess` cookies,
-so the DGW path is unreachable.
-Evidence: smoke test, 3/3 Meta AI models -> 401.
-
 ### 1.6 GLM — all 16 models broken or empty
 - `glm-5.2`, `glm-5.1`, `glm-5`, `glm-5-turbo`, `glm-5v-turbo`, `glm-4.7`,
   `glm-4.6v`, `glm-4.6`, `glm-4-plus`, `glm-4-zero`, `glm-4-think` -> 502
@@ -70,23 +67,6 @@ Evidence: smoke test, 16/16 GLM models fail or return empty.
   body`.
 Evidence: smoke test.
 
-### 1.8 Qwen research — `qwen-research` basic chat — HTTP 502
-`Qwen completion failed (200): {"success":false,"data":{"code":"Not_Found",
-"details":"Model not found"}}`. The wire/internal model name for the research
-model is wrong or no longer exists server-side.
-Evidence: smoke test.
-
-### 1.9 Gemini — native tool calling BROKEN
-`gemini-3.5-flash` with a `get_weather` tool returns a plain text answer
-(finish `stop`, no `tool_calls`) instead of calling the tool; forced
-round-trip also produces no tool call. Under an explicit "only emit a
-function call" prompt the model DOES emit the tool call, but as raw inline
-JSON in `content` (prefixed `http://googleusercontent.com/card_content/0\n
-```json {...}````) that the gateway never parses into `tool_calls`. The
-XML/JSON tool-call extraction layer is not matching the live Gemini output.
-Evidence: deep test + forced-tool test — `NO-TOOLCALL`, raw JSON leaked into
-content.
-
 ### 1.10 Kimi K3 — streaming, tool calling, upload, thinking, search all degraded
 - Stream: 1 data chunk, 0 content deltas, **no `session_url`** in stream
   (continuation broken in stream mode).
@@ -98,22 +78,6 @@ content.
 - Thinking: no `reasoning_content` returned.
 - Search: no citations returned.
 Evidence: deep test + gateway log.
-
-### 1.11 DeepSeek — streaming loses reasoning content
-`deepseek-reasoner` non-stream returns `reasoning_content`, but the streaming
-path emits 0 `reasoning_content` deltas (only text). Reasoning is dropped in
-stream mode.
-Evidence: deep test — stream reasoning_deltas=0.
-
-### 1.12 DeepSeek vision — `data:` URL upload not delivered (http URLs work)
-With a `data:image/png;base64,...` image part (the standard OpenAI client
-format) `deepseek-vision` returns 200 but the model replies "I don't see an
-image attached". Root cause confirmed in the gateway log: the DeepSeek upload
-step downloads the attachment and fails with `no host in URL: data:image/
-png;base64,...`. With a real `https://` image URL the same model describes
-the image correctly ("I see the Google logo with its multicolored letters").
-So the vision path works, but `data:` URI content parts are unsupported.
-Evidence: deep test + ds_vision test + gateway log.
 
 ### 1.13 ChatGPT — native tool calling BROKEN (gpt-4o-mini, chatgpt-auto)
 With a `get_weather` tool, `chatgpt-auto` and `gpt-4o-mini` answer in text
@@ -136,16 +100,6 @@ Evidence: deep test + forced-tool test — NO-TOOLCALL, roundtrip 502.
   (the dedicated research model returns no citations either).
 Only DeepSeek returns citations (12) today.
 Evidence: deep test, final probe (`gemini-deep-research` -> 0 citations).
-
-### 1.15 Qwen — tool calling, upload, and research broken
-- `qwen-auto` tool-calling and tool-roundtrip -> 502 `CHAT_NOT_FOUND:
-  "Invalid input the chat 8358bfd9... is not exist."` The tool path hands the
-  API a chat id that does not exist server-side (session/chat-id bug in the
-  tool flow).
-- `qwen-auto` image upload -> 502 `All file uploads failed ... JWT token is
-  missing or expired`. Same for `qwen-vl`.
-- `qwen-research` -> 502 `Model not found` (wrong internal model id).
-Evidence: deep test.
 
 ### 1.16 Minimax stream — connection cut
 `minimax-m3` stream returned `IncompleteRead(201 bytes read)` — the SSE
@@ -177,18 +131,9 @@ history for ChatGPT, unlike DeepSeek/Gemini/Kimi.
 Evidence: follow-up test — LOST-CONTEXT with new-message-only, OK with full
 history.
 
-### 1.19 Qwen — session continuation broken
-Two-turn test on `qwen-auto` with `session_url` -> 502 `CHAT_NOT_FOUND:
-Invalid input the chat 8358bfd9... is not exist`. The same chat id that was
-just created by the first turn is reported as non-existent on the second.
-Session continuation is completely broken on Qwen.
-Evidence: follow-up test.
-
-### 1.20 ChatGPT thinking accepted but no reasoning surfaced
-`o1`, `o1-mini`, `o3-mini` accept `thinking: true` (200 OK) but return no
-`reasoning_content` in the message. The toggle is accepted but the reasoning
-text is not delivered.
-Evidence: follow-up test, 3/3 models -> reasoning=NONE.
+### 1.20 ChatGPT thinking accepted but no reasoning surfaced — auth-blocked (code present)
+`o1`, `o1-mini`, `o3-mini`... wait, only `o1`/`o1-mini`/`o3-mini` exist. These accept `thinking: true` (200 OK) but return no `reasoning_content`. The gateway DOES wire the full path: `set_thinking_effort` (PATCH settings, direct.rs:878), SSE parsing of `weight:0`/`parts/1` deltas (rpc.rs:188-206), and `reasoning_content: thinking` (direct.rs:1032); unit tests `parse_sse_line_extracts_thinking_*` pass. One historical gateway request returned `401 token_expired`, so that particular live verification was inconclusive. This report does not infer the current browser login state; the feature must be retested through the currently authenticated session.
+Evidence: historical live request -> 401 token_expired; unit tests in rpc.rs for thinking extraction pass.
 
 ### 1.21 Mistral session continuation blocked
 `mistral-medium-latest` two-turn test -> 429 rate limit before it can run;
@@ -235,35 +180,18 @@ hang or error.
 not comply; the gateway returns a 502 error instead of a tool call. The
 feature is advertised but cannot produce a result.
 
-### 2.6 Streaming session_url not emitted uniformly
-Kimi K3 stream emits no `session_url` (all other working providers do). A
-client that streams cannot resume a Kimi K3 conversation.
-
 ### 2.7 GLM models returning empty content
 Six GLM models respond 200 with empty content and a session_url. The
 response parser is not extracting the actual text, or the upstream returns an
 empty body that is accepted as a valid answer.
 
-### 2.8 Qwen tool flow uses a non-existent chat id
-`qwen-auto` with tools sends a chat reference that the upstream rejects with
-`CHAT_NOT_FOUND`. The tool-call integration starts a fresh chat but the id it
-passes back does not exist server-side, so tools are unusable.
-
-### 2.9 Qwen upload auth + OSS signing
-`qwen-auto` / `qwen-vl` uploads fail. Gateway log root cause: `Qwen OSS V4
-upload failed (400 Bad Request): <Code>InvalidArgument</Code><Message>Invalid
-signing region in Authorization header.</Message>`. The Alibaba OSS V4
-signature is built with the wrong region, so every upload is rejected before
-the file is stored; the gateway then reports "JWT token is missing or
-expired".
-
-### 2.10 Session continuation — only 3 of 6 providers work as documented
+### 2.10 Session continuation — 2 of 6 providers fail it
 Live two-turn codeword test (new message + `session_url`, no history resend):
-- Works: deepseek-chat, gemini-3.5-flash, kimi-k2.7-code (all recall the
-  codeword).
-- Broken: chatgpt-auto (needs full history resend, 1.18), qwen-auto
-  (CHAT_NOT_FOUND, 1.19), mistral-medium-latest (429 rate-limited, 1.21).
-Session continuation is a GOAL.md hard requirement; half the working
+- Works: deepseek-chat, gemini-3.5-flash, kimi-k2.7-code, qwen-auto (all
+  recall the codeword).
+- Broken: chatgpt-auto (needs full history resend, 1.18), mistral-medium-latest
+  (429 rate-limited, 1.21).
+Session continuation is a GOAL.md hard requirement; two of the six working
 providers fail it.
 
 ---
@@ -327,40 +255,46 @@ endpoints have no verified native JSON channel. Per GOAL.md this is correct
 fail-closed behavior until live-verified.
 
 ### 4.5 Vision uploads are provider-flaky
-DeepSeek vision says the image is not attached (1.12); Kimi K3 uploads an
-image but returns empty (1.10). Only Gemini and ChatGPT gpt-4o-mini correctly
-describe the test image today.
+Kimi K3 uploads an image but returns empty content (1.10). DeepSeek (data:
+URLs), Qwen (OSS), Gemini, and ChatGPT gpt-4o-mini image attachments work.
 
 ### 4.6 Reasoning content in streaming and via toggle
-No provider surfaces `reasoning_content` reliably today: DeepSeek drops it in
-streaming, Kimi K3 shows none, ChatGPT o1/o1-mini/o3-mini accept the thinking
-toggle but return no reasoning text. Only DeepSeek non-streaming returns
-reasoning_content (verified).
+DeepSeek reasoner models stream `reasoning_content` by default in both
+streaming and non-streaming. Still absent: Kimi K3 shows none, ChatGPT
+o1/o1-mini/o3-mini accept the thinking toggle but return no reasoning text.
 
 ### 4.7 Tool-calling reliability
-Only DeepSeek and Kimi K2.7-Code produce a real `tool_calls` result today.
-Gemini and ChatGPT never emit a tool call in live tests; Kimi K3 emits none;
-Qwen fails with CHAT_NOT_FOUND; GLM is captcha-blocked.
+DeepSeek, Gemini, Qwen, and Kimi K2.7-Code emit native `tool_calls`. ChatGPT
+never emits a tool call in live tests; Kimi K3 emits none; GLM is
+captcha-blocked.
 
 ### 4.8 Model coverage lags `LatestAImodels` and current model names
-Compared live `/v1/models` output against `docs/LatestAImodels` (user's
-source of truth): several latest models are not exposed as explicit gateway
-model IDs.
-- OpenAI: no `gpt-5.6-sol/terra/luna`, `gpt-5.5-pro`, `gpt-5.4-pro`,
-  `gpt-5-chat-latest`.
-- Anthropic: no `claude-opus-5` (only `claude-opus-4-8`).
-- Google: no `gemini-3.6-flash`, no `gemini-3.5-flash-lite`,
-  `gemini-omni-flash` (gateway has `gemini-3.1-*`).
-- xAI: no `grok-4.5-build` variant.
-- Moonshot: no `kimi-k3-instant`, `kimi-k3-swarm`.
-- Qwen: no versioned ids (`qwen3.8-max-preview`, `qwen3.7-*`, `qwen3.6-*`,
-  `qwen3-vl-235b-a22b`); only generic `qwen-{auto,plus,max,flash,coder,vl,
-  research}`.
-- Meta: no `musespark-1.1`, `llama-5`, `llama-4-*`.
-The `*-auto` / `*-web` aliases route to whatever the account's web app
-currently defaults to, so "latest model" is partially covered by auto-routing,
-but the explicitly named latest models from `LatestAImodels` are absent from
-`/v1/models`.
+Re-verified 2026-08-17: most gaps are now closed and live-tested. Added and
+verified via live `/v1/chat/completions`:
+- OpenAI: `gpt-5.6-sol/terra/luna`, `gpt-5.5-pro`, `gpt-5.4-pro`,
+  `gpt-5-chat-latest` added (routes to the ChatGPT provider; the model picker
+  slug is the same as the public id).
+- Anthropic: `claude-opus-5` added (routes; blocked by missing `sessionKey`
+  cookie, see 4.1).
+- Google: `gemini-3.6-flash` (mode 1), `gemini-3.5-flash-lite` (mode 6)
+  added and live-tested OK (non-Pro models carry no `x-goog-ext-525001261-jspb`
+  header; field 79 selects the model).
+- Moonshot: `kimi-k3-instant`, `kimi-k3-swarm` present.
+- Qwen: versioned ids (`qwen3.8-max-preview`, `qwen3.7-*`, `qwen3.6-*`,
+  `qwen3-vl-235b-a22b`) present. (`qwen-research` is intentionally absent:
+  it requires the paid DashScope API, not the free chat.qwen.ai endpoint.)
+- Mistral: `mistral-large-latest` added and live-tested OK.
+- DeepSeek: `deepseek-v4-pro`, `deepseek-v4-flash`, `deepseek-v3.2`,
+  `deepseek-r1` aliases added and live-tested OK (v4-pro/r1 route to the
+  `expert` wire type, v4-flash/v3.2 to `default`; streaming works too).
+Remaining absent because there is no verified wire value (not a code gap):
+- Google `gemini-omni-flash`: a video-generation model, not a chat model on
+  the gemini.google.com StreamGenerate path.
+- xAI `grok-4.5-build`: Grok Build is a separate harness; the grok.com chat
+  API `modeId` values are `fast`/`expert`/`heavy` only (no verified build id).
+- Meta `musespark-1.1`, `llama-5`, `llama-4-*`: the meta.ai DGW endpoint only
+  exposes the three `muse-spark` reasoning modes; no verified routing exists
+  for these ids.
 
 ---
 
@@ -377,20 +311,23 @@ but the explicitly named latest models from `LatestAImodels` are absent from
 
 | Provider | Models | Basic chat OK | Notes |
 |----------|--------|---------------|-------|
-| deepseek | 5 | 5 | vision upload not delivered |
-| gemini | 4 | 4 | tool calling broken; search no citations |
+| deepseek | 5 | 5 | reasoning streams by default on reasoner models; vision data: URLs work |
+| gemini | 4 | 4 | search no citations |
 | chatgpt | 15 | 15 | tool calling broken; forced roundtrip 502 |
 | kimi | 7 | 4 | k3/highspeed/research broken; k3 features degraded |
 | glm | 16 | 0 | 502 captcha/textarea timeout or empty content |
 | claude | 10 | 0 | 401 auth (no sessionKey cookie) |
 | grok | 6 | 0 | 403 anti-bot, constants expired |
-| qwen | 7 | 6 | research model not found; tools/upload broken |
+| qwen | 6 | 6 | research model removed (paid API only); other 6 models OK |
 | minimax | 3 | 0 | account token plan exhausted (2056); fails fast |
 | mimo | 5 | 0 | 401 missing userId |
 | mistral | 10 | 10 | rate-limited to 429 under load |
-| metaai | 3 | 0 | 401 no cookies |
+| metaai | 3 | 3 | OK end-to-end (chat, continuation, streaming, native tool calling, native image attachment) |
 
-Working end-to-end today: DeepSeek (except vision/stream-reasoning), Gemini
-(except tools/search-citations), ChatGPT (except tools/forced-tools), Kimi
-k2.7-code/k2.6/k2.5/kimi-search, Qwen (basic chat only), Mistral (basic chat
-only; rate-limited otherwise).
+Working end-to-end today: DeepSeek (reasoner streaming reasoning, vision
+data: URLs, tools, citations), Gemini (except search-citations), ChatGPT
+(except tools/forced-tools), Kimi k2.7-code/k2.6/k2.5/kimi-search, Qwen (basic
+chat, native tool calling, continuation, vision upload), Mistral (basic chat
+only; rate-limited otherwise), Meta AI (all 3
+muse-spark models, native web_search tool calls, native image attachment via
+rupload).

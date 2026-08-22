@@ -14,7 +14,7 @@ use futures::stream::StreamExt;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::providers::solver::{SolverChain, SolverRegistry};
 use crate::session::SessionManager;
 use crate::state::AppState;
@@ -51,6 +51,7 @@ impl DeepSeekProvider {
     /// `solvers` must contain at least one solver matching an entry in
     /// `solver_chain` (e.g. `"deepseek-v1"`), otherwise every request
     /// will fail with a "no PoW solvers configured" error.
+    #[cfg(test)]
     pub fn new(solvers: SolverRegistry, solver_chain: SolverChain) -> Self {
         Self {
             solvers,
@@ -114,12 +115,35 @@ impl Provider for DeepSeekProvider {
                 created: 1_700_000_000,
                 owned_by: "deepseek".to_string(),
             },
+            // V4 / R1 aliases from docs/LatestAImodels, routed to the same
+            // verified wire types (v4-pro/r1 -> expert, v4-flash/v3.2 -> default).
+            Model {
+                id: "deepseek-v4-pro".to_string(),
+                object: "model".to_string(),
+                created: 1_700_000_000,
+                owned_by: "deepseek".to_string(),
+            },
+            Model {
+                id: "deepseek-v4-flash".to_string(),
+                object: "model".to_string(),
+                created: 1_700_000_000,
+                owned_by: "deepseek".to_string(),
+            },
+            Model {
+                id: "deepseek-v3.2".to_string(),
+                object: "model".to_string(),
+                created: 1_700_000_000,
+                owned_by: "deepseek".to_string(),
+            },
+            Model {
+                id: "deepseek-r1".to_string(),
+                object: "model".to_string(),
+                created: 1_700_000_000,
+                owned_by: "deepseek".to_string(),
+            },
         ]
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn chat(
         &self,
@@ -196,22 +220,9 @@ impl Provider for DeepSeekProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        // Not used in Direct mode, but kept for trait completeness.
-        &["textarea"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[type='submit']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        ".response"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        None
-    }
 
     fn supports_attachments(&self) -> bool {
         true
@@ -234,11 +245,11 @@ impl Provider for DeepSeekProvider {
 
         let supports_thinking = matches!(
             request.model.as_str(),
-            "deepseek-reasoner" | "deepseek-expert"
+            "deepseek-reasoner" | "deepseek-expert" | "deepseek-v4-pro" | "deepseek-r1"
         );
         if request.thinking == Some(true) && !supports_thinking {
             return Err(GatewayError::BadRequest(format!(
-                "DeepSeek model '{}' does not support thinking (use deepseek-reasoner or deepseek-expert)",
+                "DeepSeek model '{}' does not support thinking (use deepseek-reasoner, deepseek-expert, deepseek-v4-pro, or deepseek-r1)",
                 request.model
             )));
         }
@@ -253,9 +264,6 @@ impl Provider for DeepSeekProvider {
         Ok(())
     }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(1500))
-    }
 }
 
 /// A stream wrapper that releases the browser session when the consumer is
@@ -269,12 +277,16 @@ mod tests {
         let p = DeepSeekProvider::new(SolverRegistry::new(), vec!["deepseek-v1".to_string()]);
         assert_eq!(p.name(), "deepseek");
         assert_eq!(p.url(), "https://chat.deepseek.com");
-        assert_eq!(p.models().len(), 5);
+        assert_eq!(p.models().len(), 9);
         assert!(p.models().iter().any(|m| m.id == "deepseek-chat"));
         assert!(p.models().iter().any(|m| m.id == "deepseek-instant"));
         assert!(p.models().iter().any(|m| m.id == "deepseek-reasoner"));
         assert!(p.models().iter().any(|m| m.id == "deepseek-expert"));
         assert!(p.models().iter().any(|m| m.id == "deepseek-vision"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+        assert!(p.models().iter().any(|m| m.id == "deepseek-v4-pro"));
+        assert!(p.models().iter().any(|m| m.id == "deepseek-v4-flash"));
+        assert!(p.models().iter().any(|m| m.id == "deepseek-v3.2"));
+        assert!(p.models().iter().any(|m| m.id == "deepseek-r1"));
+
     }
 }

@@ -74,6 +74,7 @@ impl SessionStore {
     ///
     /// If the file doesn't exist or is corrupt, returns an empty store.
     /// The file path is remembered for future auto-saves.
+    #[allow(dead_code)]
     pub async fn load_from_file(path: &Path) -> Self {
         let mut store = Self::new();
         store.persist_to(path.to_path_buf());
@@ -94,6 +95,7 @@ impl SessionStore {
 
     /// Run once at provider startup: load sessions from the persisted file.
     /// Safe to call even without persistence enabled (no-op).
+    #[allow(dead_code)]
     pub async fn load_persisted_sessions(&self) {
         self.reload_from_disk().await;
     }

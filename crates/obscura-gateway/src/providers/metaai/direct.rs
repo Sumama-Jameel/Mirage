@@ -28,10 +28,13 @@
 //! continuation reuses the cached conversation id, sends only the latest user
 //! turn with the CHAT template, and lets Meta append to the existing tree.
 //!
-//! Tool calling is prompt-injected via [`crate::providers::tool_call`]
-//! (`<tool_call>` XML markers) and converted to native OpenAI `tool_calls` on
-//! the way out — the same fallback used by the DeepSeek/Gemini/Grok adapters.
-//! The DGW endpoint exposes no native function-calling channel.
+//! Tool calling uses the platform's native protocol: the DGW model invokes
+//! server-side tools (web search, weather) by emitting a structured block
+//! (`[<id>] <query> (search-results://query?query=<query>)` plus a line dump)
+//! into a bare `{"text": ...}` event, delivered separately from the visible
+//! section stream. Those blocks are collected and converted to OpenAI
+//! `tool_calls`; the prompt-injected `<tool_call>` XML markers from
+//! [`crate::providers::tool_call`] remain as a secondary fallback only.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -65,6 +68,13 @@ use super::templates::{CHAT_TEMPLATE_B64, HOME_TEMPLATE_B64};
 const GRAPHQL_API_URL: &str = "https://www.meta.ai/api/graphql";
 /// DGW WebSocket endpoint.
 const WS_URL: &str = "wss://gateway.meta.ai/ws/clippy";
+/// Resumable upload endpoint for image attachments (captured from the web
+/// client). Each upload uses a fresh uuid path segment and returns a media id
+/// that is embedded in the DGW prompt proto at `.2.3.1.1`.
+const RUPLOAD_URL: &str = "https://rupload.meta.ai/gen_ai_document_gen_ai_tenant";
+/// Upload handler the rupload endpoint requires (captured from the web
+/// client's fetch headers).
+const RUPLOAD_HANDLER: &str = "genai_document";
 
 /// Persisted-query doc ids from the meta.ai web app bundle. The previous
 /// Abra send mutation was retired when Meta removed its input types from the
@@ -354,6 +364,129 @@ fn set_nested_bytes(raw: &mut Vec<u8>, number: u32, replacement: &[u8]) {
     }
 }
 
+/// Insert a length-delimited field into a nested message, replacing it if it
+/// already exists. The web client serializes submessages with fields in
+/// ascending number order, so insert at the matching position to keep the
+/// wire bytes identical to a real attachment turn.
+fn insert_nested_field(raw: &mut Vec<u8>, number: u32, value: &[u8]) {
+    if let Some(mut nested) = parse_proto_fields(raw) {
+        if let Some(field) = nested.iter_mut().find(|f| f.number == number) {
+            field.value = ProtoValue::Bytes(value.to_vec());
+        } else {
+            let pos = nested
+                .iter()
+                .position(|f| f.number > number)
+                .unwrap_or(nested.len());
+            nested.insert(
+                pos,
+                ProtoField {
+                    number,
+                    wire_type: 2,
+                    value: ProtoValue::Bytes(value.to_vec()),
+                },
+            );
+        }
+        *raw = serialize_proto_fields(&nested);
+    }
+}
+
+/// Build the DGW attachment submessage that lands at prompt-field `[2,3]`
+/// (`.2.3`), matching the captured web-client wire format:
+///
+/// ```text
+/// .3.1 msg { .1 varint = media_id }
+/// .3.2 varint = 1
+/// .3.3 str = ""
+/// .3.5 varint = 0
+/// .3.6 str = <mime>
+/// .3.7 str = <filename>
+/// ```
+fn build_attachment_block(media_id: u64, mime: &str, filename: &str) -> Vec<u8> {
+    let mut block = Vec::new();
+
+    let mut media_id_msg = Vec::new();
+    media_id_msg.extend_from_slice(&encode_varint((1 << 3) | 0));
+    media_id_msg.extend_from_slice(&encode_varint(media_id));
+    block.extend_from_slice(&encode_varint((1 << 3) | 2));
+    block.extend_from_slice(&encode_varint(media_id_msg.len() as u64));
+    block.extend_from_slice(&media_id_msg);
+
+    block.extend_from_slice(&encode_varint((2 << 3) | 0));
+    block.push(1);
+
+    block.extend_from_slice(&encode_varint((3 << 3) | 2));
+    block.push(0);
+
+    block.extend_from_slice(&encode_varint((5 << 3) | 0));
+    block.push(0);
+
+    block.extend_from_slice(&encode_varint((6 << 3) | 2));
+    block.extend_from_slice(&encode_varint(mime.len() as u64));
+    block.extend_from_slice(mime.as_bytes());
+
+    block.extend_from_slice(&encode_varint((7 << 3) | 2));
+    block.extend_from_slice(&encode_varint(filename.len() as u64));
+    block.extend_from_slice(filename.as_bytes());
+
+    block
+}
+
+/// Split a `data:` URL into `(mime, payload, is_base64)`. Returns None for
+/// anything that does not look like a data URL.
+fn parse_data_url(url: &str) -> Option<(String, String, bool)> {
+    let rest = url.strip_prefix("data:")?;
+    let (head, data) = rest.split_once(',')?;
+    let is_base64 = head.ends_with(";base64");
+    let mime = head
+        .trim_end_matches(";base64")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let mime = if mime.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        mime
+    };
+    Some((mime, data.to_string(), is_base64))
+}
+
+/// Percent-decode a non-base64 data URL payload.
+fn percent_decode(encoded: &str) -> Vec<u8> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Derive a filename from a mime type (data URLs carry no name).
+fn attachment_filename(mime: &str) -> String {
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" | "image/heif" => "heic",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => "bin",
+    };
+    format!("attachment.{ext}")
+}
+
 fn write_u24_le(value: usize, out: &mut [u8]) {
     out[0] = (value & 0xff) as u8;
     out[1] = ((value >> 8) & 0xff) as u8;
@@ -382,6 +515,7 @@ fn build_ws_intro_frame(conversation_id: &str) -> Vec<u8> {
 /// `buildWsPromptFrame`: `[1,1,5]` conversation id, `[2,1,1]` user message
 /// id, `[2,1,2]` conv id + submitted-ms + unique-message-id, `[2,2]` prompt
 /// text, `[1,5]` timestamps, `[1,6]` request id, `[1,10,4]` conversation id.
+/// An uploaded image attachment is injected at `[2,3]` when present.
 #[allow(clippy::too_many_arguments)]
 fn build_ws_prompt_frame(
     prompt: &str,
@@ -391,6 +525,7 @@ fn build_ws_prompt_frame(
     user_message_id: &str,
     submitted_ms: i64,
     unique_message_id: i64,
+    attachment_block: Option<&[u8]>,
 ) -> Result<Vec<u8>, GatewayError> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
@@ -400,12 +535,12 @@ fn build_ws_prompt_frame(
         GatewayError::Internal("meta.ai template is not valid protobuf".to_string())
     })?;
 
-    // [1,1,5] conversationId
+    // [1,1,5,5,1] conversationId (wrapped in a nested submessage)
     let conv = conversation_id.as_bytes();
-    let mut set_conv_at_115 = |raw: &mut Vec<u8>| set_nested_bytes(raw, 5, conv);
-    if !traverse_and_mutate(&mut proto_fields, &[1, 1], &mut set_conv_at_115) {
+    let mut set_conv_at_115 = |raw: &mut Vec<u8>| set_nested_bytes(raw, 1, conv);
+    if !traverse_and_mutate(&mut proto_fields, &[1, 1, 5, 5], &mut set_conv_at_115) {
         return Err(GatewayError::Internal(
-            "meta.ai template: missing [1,1] for conversation id".to_string(),
+            "meta.ai template: missing [1,1,5,5] for conversation id".to_string(),
         ));
     }
     // [2,1,1] userMessageId
@@ -442,6 +577,15 @@ fn build_ws_prompt_frame(
         return Err(GatewayError::Internal(
             "meta.ai template: missing [2] for prompt text".to_string(),
         ));
+    }
+    // [2,3] attachment (rupload media id) when an image is attached
+    if let Some(block) = attachment_block {
+        let mut insert_attach_at_2 = |raw: &mut Vec<u8>| insert_nested_field(raw, 3, block);
+        if !traverse_and_mutate(&mut proto_fields, &[2], &mut insert_attach_at_2) {
+            return Err(GatewayError::Internal(
+                "meta.ai template: missing [2] for attachment".to_string(),
+            ));
+        }
     }
     // [1,5] timestamps: field 1 = submitted_ms + 1, field 3 = submitted_ms
     let mut set_ts_at_15 = |raw: &mut Vec<u8>| {
@@ -506,7 +650,6 @@ fn build_ws_url(authorization: &str, request_id: &str) -> String {
             ("Authorization", authorization),
             ("x-dgw-app-origin", "meta.ai"),
             ("x-dgw-app-clippy-request-id", request_id),
-            ("x-dgw-app-clippy-async", "true"),
         ])
         .finish();
     format!("{WS_URL}?{query}")
@@ -518,11 +661,28 @@ fn build_ws_url(authorization: &str, request_id: &str) -> String {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct WsResponseEvent {
     #[serde(rename = "type")]
+    #[serde(default)]
     event_type: String,
     #[serde(default)]
     response: Option<WsResponseBody>,
     #[serde(default)]
     operations: Option<Vec<WsPatchOperation>>,
+    /// Terminal completion marker. The DGW ends a turn with a `full`-shaped
+    /// event that carries the final `response_id` at the TOP level (no `seq`,
+    /// no `type`), where the thinking section reports `is_in_progress: false`.
+    #[serde(default)]
+    response_id: Option<String>,
+    /// Top-level `sections` (the terminal frame carries them directly, not
+    /// under a `response` key like streaming `full` events).
+    #[serde(default)]
+    sections: Vec<WsSection>,
+    /// Bare `{"text": ...}` events. The DGW delivers native tool results in a
+    /// separate `web_search` sub-message (not the visible section stream): the
+    /// model emits the invocation header plus the fetched line dump here, e.g.
+    /// `[<id>] <query> (search-results://query?query=<query>)` followed by the
+    /// `**viewing lines**` header and `L0:`..`L<N>:` dump.
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -548,6 +708,11 @@ struct WsViewModel {
 struct WsPrimitive {
     #[serde(default)]
     text: Option<String>,
+    /// Present on the `GenAIBotThinkingStatusPrimitive` section. `false` on
+    /// the terminal frame signals the turn is fully streamed.
+    #[serde(rename = "is_in_progress")]
+    #[serde(default)]
+    is_in_progress: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -609,40 +774,81 @@ fn parse_ws_response_events(payload: &str) -> Vec<WsResponseEvent> {
     events
 }
 
+impl WsResponseEvent {
+    fn sections(&self) -> &[WsSection] {
+        self.response
+            .as_ref()
+            .map(|b| b.sections.as_slice())
+            .unwrap_or(&self.sections)
+    }
+}
+
 /// Accumulator that reassembles `full`/`patch` events into content deltas.
 #[derive(Debug, Default)]
 struct WsAccumulator {
     content: String,
     deltas: Vec<String>,
+    /// Native tool-result blocks (`search-results://` invocation headers plus
+    /// the fetched line dump), collected from bare `{"text": ...}` events and
+    /// deduped. These arrive in a separate DGW channel from the visible
+    /// section stream, so they never appear in `content`.
+    tool_blocks: Vec<String>,
+    /// Set when the terminal DGW frame (top-level `response_id`, thinking
+    /// `is_in_progress: false`) arrives, signalling the turn is complete.
+    done: bool,
 }
 
 impl WsAccumulator {
     fn apply(&mut self, raw: &str) {
         for event in parse_ws_response_events(raw) {
-            if event.event_type == "full" {
-                if let Some(body) = event.response {
-                    for section in body.sections {
-                        let text = section
+            // Terminal completion frame: the DGW ends a turn with a `full`-
+            // shaped event carrying the final `response_id` at the top level
+            // and no `seq`/`type`. The thinking section reports
+            // `is_in_progress: false`.
+            if event.response_id.is_some() && event.event_type.is_empty() {
+                for section in event.sections() {
+                    if section
+                        .view_model
+                        .as_ref()
+                        .and_then(|vm| vm.primitive.as_ref())
+                        .and_then(|p| p.is_in_progress)
+                        == Some(false)
+                        || section
                             .view_model
-                            .and_then(|vm| vm.primitive)
-                            .and_then(|p| p.text)
-                            .unwrap_or_default();
-                        if text.is_empty() || text == self.content {
-                            continue;
-                        }
-                        let delta = if self.content.is_empty() {
-                            text.clone()
-                        } else if text.starts_with(&self.content) {
-                            text[self.content.len()..].to_string()
-                        } else {
-                            // Server reset/refresh: treat the whole text as new.
-                            text.clone()
-                        };
-                        if !delta.is_empty() {
-                            self.deltas.push(delta);
-                        }
-                        self.content = text;
+                            .as_ref()
+                            .and_then(|vm| vm.primitive.as_ref())
+                            .and_then(|p| p.text.as_ref())
+                            .map(|t| !t.is_empty())
+                            .unwrap_or(false)
+                    {
+                        self.done = true;
                     }
+                }
+            }
+            if event.event_type == "full" || (event.response_id.is_some() && event.event_type.is_empty())
+            {
+                for section in event.sections() {
+                    let text = section
+                        .view_model
+                        .as_ref()
+                        .and_then(|vm| vm.primitive.as_ref())
+                        .and_then(|p| p.text.clone())
+                        .unwrap_or_default();
+                    if text.is_empty() || text == self.content {
+                        continue;
+                    }
+                    let delta = if self.content.is_empty() {
+                        text.clone()
+                    } else if text.starts_with(&self.content) {
+                        text[self.content.len()..].to_string()
+                    } else {
+                        // Server reset/refresh: treat the whole text as new.
+                        text.clone()
+                    };
+                    if !delta.is_empty() {
+                        self.deltas.push(delta);
+                    }
+                    self.content = text;
                 }
             } else if event.event_type == "patch" {
                 if let Some(operations) = event.operations {
@@ -658,8 +864,147 @@ impl WsAccumulator {
                     }
                 }
             }
+            // Native tool results come through as bare `{"text": ...}` events
+            // (the `web_search` sub-message inside the DGW protobuf), separate
+            // from the visible section stream. Collect the invocation blocks,
+            // deduped; callers turn them into OpenAI `tool_calls`.
+            if let Some(tool_text) = &event.text {
+                if tool_text.contains("search-results://query?query=")
+                    && !self.tool_blocks.iter().any(|b| b == tool_text)
+                {
+                    self.tool_blocks.push(tool_text.clone());
+                }
+            }
         }
     }
+}
+
+// ─── Native tool-call extraction ─────────────────────────────────────────────
+//
+// The DGW model invokes server-side tools (web search, weather) by emitting a
+// structured block into the markdown stream:
+//
+//   [<tool_id>] <query> (search-results://query?query=<query>)
+//   **viewing lines [0 - 89] of 89**
+//
+//   L0: # Search Results
+//   L1: ...
+//
+// This is the platform's native tool protocol (no `<tool_call>` prompt
+// injection). We detect these blocks and convert them into OpenAI `tool_calls`,
+// stripping the invocation header and the raw line-dump from the visible
+// assistant content.
+
+/// A native tool invocation parsed from the DGW text stream.
+struct NativeToolCall {
+    /// Server-side tool id (used as the OpenAI tool_call id).
+    tool_id: String,
+    /// Tool name to report. `web_search` for search-results invocations.
+    name: String,
+    /// Query string argument.
+    query: String,
+}
+
+/// Detect the first `search-results://query?query=<q>)` invocation block header
+/// at/after `from`, returning the parsed invocation and the byte offset just
+/// past the whole block (header + `**viewing lines**` + line dump).
+fn parse_native_tool_block(text: &str, from: usize) -> Option<(NativeToolCall, usize)> {
+    let marker = "search-results://query?query=";
+    let start = text[from..].find(marker)? + from;
+    // The invocation header begins before the marker: `[<id>] <query> (`.
+    // Recover it by scanning backward for `[`.
+    let head_start = text[..start].rfind('[')?;
+    let close_paren = text[start..].find(')')? + start;
+    let query = &text[start + marker.len()..close_paren];
+    if query.is_empty() {
+        return None;
+    }
+    let head = &text[head_start..start];
+    let tool_id = head
+        .trim_start_matches('[')
+        .split([']', ' '])
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    // Skip the `**viewing lines [0 - N] of M**` line and the following blank
+    // line plus the `L*:` dump that carries the fetched results.
+    let mut end = close_paren + 1;
+    while end < text.len() && !text[end..].starts_with('\n') {
+        end += 1;
+    }
+    if end < text.len() {
+        end += 1;
+    }
+    // Consume the `**viewing lines ...**` line (and blank) if present.
+    if text[end..].trim_start().starts_with("**viewing lines") {
+        let nl = text[end..].find('\n').map(|p| end + p + 1).unwrap_or(text.len());
+        end = nl;
+        if end < text.len() && text[end..].starts_with('\n') {
+            end += 1;
+        }
+    }
+    // Consume the `L0:`..`L<N>:` result dump.
+    loop {
+        let line_end = text[end..].find('\n').map(|p| end + p).unwrap_or(text.len());
+        let line = text[end..line_end].trim_end();
+        if line.starts_with("L") && line[1..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        {
+            if line_end == text.len() {
+                end = line_end;
+                break;
+            }
+            end = line_end + 1;
+            continue;
+        }
+        break;
+    }
+    let call = NativeToolCall {
+        tool_id,
+        name: "web_search".to_string(),
+        query: query.to_string(),
+    };
+    Some((call, end))
+}
+
+/// Convert a `NativeToolCall` into an OpenAI `ToolCall`.
+fn native_call_to_openai(call: &NativeToolCall) -> ToolCall {
+    let arguments = serde_json::json!({ "query": call.query }).to_string();
+    ToolCall {
+        id: if call.tool_id.is_empty() {
+            crate::providers::tool_call::stable_call_id(&call.name, &arguments)
+        } else {
+            format!("call_{}", call.tool_id)
+        },
+        r#type: "function".to_string(),
+        function: crate::models::FunctionCall {
+            name: call.name.clone(),
+            arguments,
+        },
+    }
+}
+
+/// Extract all native `search-results://` tool invocations from a full turn's
+/// text. Returns `(cleaned_content, tool_calls)` where the cleaned content has
+/// every invocation header and result-dump removed.
+fn extract_native_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
+    let mut clean = String::new();
+    let mut calls = Vec::new();
+    let mut from = 0usize;
+    loop {
+        match parse_native_tool_block(content, from) {
+            Some((call, end)) => {
+                // The whole block (header + viewing-lines + result dump) is
+                // tool machinery, not user-facing answer text: strip it all.
+                calls.push(native_call_to_openai(&call));
+                from = end;
+            }
+            None => {
+                clean.push_str(&content[from..]);
+                break;
+            }
+        }
+    }
+    (clean, calls)
 }
 
 // ─── OpenAI message normalization ────────────────────────────────────────────
@@ -744,6 +1089,7 @@ async fn ws_connect_and_send(
     authorization: &str,
     cookie_header: &str,
     template_b64: &str,
+    attachment_block: Option<&[u8]>,
 ) -> Result<WsStream, GatewayError> {
     let request_id = new_uuid();
     let ws_url = build_ws_url(authorization, &request_id);
@@ -812,6 +1158,7 @@ async fn ws_connect_and_send(
         &user_message_id,
         submitted_ms,
         unique_message_id,
+        attachment_block,
     )?;
     ws.send(Message::Binary(prompt_frame.into()))
         .await
@@ -868,10 +1215,17 @@ async fn ws_chat(
     authorization: &str,
     cookie_header: &str,
     template_b64: &str,
+    attachment_block: Option<&[u8]>,
 ) -> Result<WsAccumulator, GatewayError> {
-    let mut ws =
-        ws_connect_and_send(prompt, conversation_id, authorization, cookie_header, template_b64)
-            .await?;
+    let mut ws = ws_connect_and_send(
+        prompt,
+        conversation_id,
+        authorization,
+        cookie_header,
+        template_b64,
+        attachment_block,
+    )
+    .await?;
     let mut acc = WsAccumulator::default();
     let deadline = tokio::time::Instant::now() + WS_TIMEOUT;
     loop {
@@ -882,7 +1236,7 @@ async fn ws_chat(
                 ));
             }
             keep_going = ws_read_message(&mut ws, &mut acc) => {
-                if !keep_going? {
+                if !keep_going? || acc.done {
                     break;
                 }
             }
@@ -975,6 +1329,15 @@ impl StreamEmitCtx {
     fn emit_error(&self, error: GatewayError) {
         let _ = self.tx.send(Err(error));
     }
+
+    /// Push a tool call, deduped by id (the same native block is re-emitted
+    /// across many DGW frames and both the content and tool channels can
+    /// surface it).
+    fn push_unique_call(&mut self, call: ToolCall) {
+        if !self.collected_calls.iter().any(|c| c.id == call.id) {
+            self.collected_calls.push(call);
+        }
+    }
 }
 
 /// Run one full DGW turn, emitting content deltas as they arrive.
@@ -984,11 +1347,18 @@ async fn ws_chat_emit(
     authorization: &str,
     cookie_header: &str,
     template_b64: &str,
+    attachment_block: Option<&[u8]>,
     ctx: &mut StreamEmitCtx,
 ) -> Result<(), GatewayError> {
-    let mut ws =
-        ws_connect_and_send(prompt, conversation_id, authorization, cookie_header, template_b64)
-            .await?;
+    let mut ws = ws_connect_and_send(
+        prompt,
+        conversation_id,
+        authorization,
+        cookie_header,
+        template_b64,
+        attachment_block,
+    )
+    .await?;
     let mut acc = WsAccumulator::default();
     let deadline = tokio::time::Instant::now() + WS_TIMEOUT;
     loop {
@@ -1006,6 +1376,15 @@ async fn ws_chat_emit(
                     ctx.emit_delta(delta);
                 }
                 acc.deltas.clear();
+                for block in std::mem::take(&mut acc.tool_blocks) {
+                    let (_, calls) = extract_native_tool_calls(&block);
+                    for call in calls {
+                        ctx.push_unique_call(call);
+                    }
+                }
+                if acc.done {
+                    break;
+                }
             }
         }
     }
@@ -1118,6 +1497,79 @@ impl DirectClient {
         Ok(())
     }
 
+    /// Upload a file to the resumable rupload endpoint, mirroring the web
+    /// client's two-step flow: a GET that announces the upload and returns
+    /// the current offset, then a POST carrying the bytes. Returns the media
+    /// id used by the DGW prompt proto attachment block.
+    async fn upload_file(
+        &self,
+        data: &[u8],
+        filename: &str,
+        mime: &str,
+    ) -> Result<u64, GatewayError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::engine::Engine;
+        use sha2::Digest;
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(data);
+        let digest_b64 = B64.encode(hasher.finalize());
+        let upload_id = new_uuid();
+        let url = format!("{RUPLOAD_URL}/{upload_id}");
+
+        let auth_value = format!("OAuth {}", self.authorization);
+        let entity_len = data.len().to_string();
+        let prepare = self
+            .http
+            .get(&url)
+            .header("Authorization", &auth_value)
+            .header("desired_upload_handler", RUPLOAD_HANDLER)
+            .header("ecto_auth_token", "true")
+            .header("is_abra_user", "true")
+            .header("x-entity-digest", format!("sha256 {digest_b64}"))
+            .header("x-entity-length", &entity_len);
+        let prepare = crate::providers::send_with_retry(prepare).await?;
+        let prepare_status = prepare.status().as_u16();
+        let prepare_text = prepare.text().await.unwrap_or_default();
+        if prepare_status != 200 {
+            return Err(GatewayError::Provider(format!(
+                "Meta AI upload prepare failed: HTTP {prepare_status}: {prepare_text}"
+            )));
+        }
+
+        let upload = self
+            .http
+            .post(&url)
+            .header("Authorization", &auth_value)
+            .header("desired_upload_handler", RUPLOAD_HANDLER)
+            .header("ecto_auth_token", "true")
+            .header("is_abra_user", "true")
+            .header("offset", "0")
+            .header("x-entity-length", &entity_len)
+            .header("x-entity-name", filename)
+            .header("x-entity-type", mime)
+            .body(data.to_vec());
+        let upload = upload.send().await.map_err(|e| {
+            GatewayError::Provider(format!("Meta AI upload failed: {e}"))
+        })?;
+        let status = upload.status().as_u16();
+        let text = upload.text().await.unwrap_or_default();
+        if status != 200 {
+            return Err(GatewayError::Provider(format!(
+                "Meta AI upload failed: HTTP {status}: {text}"
+            )));
+        }
+        let media_id = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|json| json.get("media_id").and_then(|v| v.as_str()).map(str::to_string))
+            .ok_or_else(|| {
+                GatewayError::Provider(format!("Meta AI upload returned no media_id: {text}"))
+            })?;
+        media_id.parse::<u64>().map_err(|_| {
+            GatewayError::Provider(format!("Meta AI upload returned invalid media_id: {media_id}"))
+        })
+    }
+
     fn estimate_cost(&self, prompt_text: &str, completion_text: &str) -> Usage {
         let prompt_tokens = estimate_tokens("metaai", &self.model_id, prompt_text);
         let completion_tokens = estimate_tokens("metaai", &self.model_id, completion_text);
@@ -1165,10 +1617,94 @@ impl DirectClient {
         let tools = request.tools.clone().unwrap_or_default();
         let request_had_tools = !tools.is_empty();
         if request_had_tools {
-            prompt = inject_tool_prompt(&prompt, &tools, request.tool_choice.as_ref());
+            prompt = inject_tool_prompt("metaai", &prompt, &tools, request.tool_choice.as_ref());
         }
 
         Ok((prompt, conversation_id, session_url, !is_continuation, request_had_tools))
+    }
+
+    /// Extract the first image attachment from the request. The latest user
+    /// message with an image wins, matching how the web client attaches the
+    /// current turn's file. Returns `(bytes, mime, filename)`.
+    async fn extract_attachment(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<Option<(Vec<u8>, String, String)>, GatewayError> {
+        for message in request.messages.iter().rev() {
+            let urls = message.content.image_urls();
+            if let Some(url) = urls.first() {
+                return self.resolve_attachment(url).await.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve an image attachment reference to its bytes, mime type, and a
+    /// filename. Accepts `data:` URLs and remote `http(s)://` URLs; remote
+    /// fetches go through the shared SSRF gate.
+    async fn resolve_attachment(
+        &self,
+        url: &str,
+    ) -> Result<(Vec<u8>, String, String), GatewayError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        if let Some((mime, encoded, is_base64)) = parse_data_url(url) {
+            let bytes = if is_base64 {
+                use base64::engine::Engine;
+                B64.decode(&encoded).map_err(|e| {
+                    GatewayError::BadRequest(format!("invalid base64 image data URL: {e}"))
+                })?
+            } else {
+                percent_decode(&encoded)
+            };
+            let filename = attachment_filename(&mime);
+            return Ok((bytes, mime, filename));
+        }
+
+        let parsed = url::Url::parse(url).map_err(|e| {
+            GatewayError::BadRequest(format!("invalid image URL: {e}"))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(GatewayError::BadRequest(format!(
+                "unsupported image URL scheme (expected data: or http(s)://): {url}"
+            )));
+        }
+        crate::providers::gemini::upload::validate_remote_url(&parsed)?;
+
+        let response = self.http.get(url).send().await.map_err(|e| {
+            GatewayError::BadRequest(format!("failed to fetch image URL {url}: {e}"))
+        })?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(GatewayError::BadRequest(format!(
+                "failed to fetch image URL {url}: HTTP {status}"
+            )));
+        }
+        let mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| GatewayError::BadRequest(format!("failed to read image URL {url}: {e}")))?
+            .to_vec();
+        Ok((bytes, mime.clone(), attachment_filename(&mime)))
+    }
+
+    /// Upload any request attachment and build the `.2.3` proto block.
+    /// Returns None when the request carries no image.
+    async fn upload_attachment_block(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<Option<Vec<u8>>, GatewayError> {
+        let Some((bytes, mime, filename)) = self.extract_attachment(request).await? else {
+            return Ok(None);
+        };
+        let media_id = self.upload_file(&bytes, &filename, &mime).await?;
+        Ok(Some(build_attachment_block(media_id, &mime, &filename)))
     }
 
     /// GraphQL warmup + mode switch for a conversation.
@@ -1204,12 +1740,14 @@ impl DirectClient {
 
         self.warmup_and_mode_switch(&conversation_id, request.thinking).await?;
 
+        let attachment_block = self.upload_attachment_block(&request).await?;
         let acc = ws_chat(
             &prompt,
             &conversation_id,
             &self.authorization,
             &self.cookie_header,
             template_b64,
+            attachment_block.as_deref(),
         )
         .await?;
 
@@ -1220,7 +1758,26 @@ impl DirectClient {
             ));
         }
 
-        let (clean_content, tool_calls) = convert_xml_tool_calls(&content, request_had_tools);
+        // Native DGW tool protocol first (`search-results://` blocks). The
+        // tool results arrive as bare `{"text": ...}` events separate from the
+        // section stream, so collect calls from those blocks as well as from
+        // any block that leaked into the visible content. Then fall back to
+        // XML markers for prompt-injected tool definitions.
+        let (clean_content, mut native_calls) = extract_native_tool_calls(&content);
+        for block in &acc.tool_blocks {
+            let (_, calls) = extract_native_tool_calls(block);
+            for call in calls {
+                if !native_calls.iter().any(|c| c.id == call.id) {
+                    native_calls.push(call);
+                }
+            }
+        }
+        let (clean_content, xml_calls) = convert_xml_tool_calls(&clean_content, request_had_tools);
+        let tool_calls = if !native_calls.is_empty() {
+            Some(native_calls)
+        } else {
+            xml_calls
+        };
         let finish_reason = if tool_calls.is_some() {
             "tool_calls"
         } else {
@@ -1260,6 +1817,8 @@ impl DirectClient {
 
         self.warmup_and_mode_switch(&conversation_id, request.thinking).await?;
 
+        let attachment_block = self.upload_attachment_block(&request).await?;
+
         let (tx, rx) = mpsc::unbounded_channel();
         let rx_stream = UnboundedReceiverStream::new(rx);
 
@@ -1285,6 +1844,7 @@ impl DirectClient {
                 &authorization,
                 &cookie_header,
                 template_b64,
+                attachment_block.as_deref(),
                 &mut ctx,
             )
             .await
@@ -1444,6 +2004,7 @@ mod tests {
             &user_message_id,
             submitted_ms,
             unique_message_id,
+            None,
         )
         .unwrap();
 
@@ -1465,7 +2026,7 @@ mod tests {
             .expect("payload is base64");
         let fields = parse_proto_fields(&raw).expect("payload is protobuf");
 
-        // [1,1,5] conversation id
+        // [1,1,5,5,1] conversation id
         let field_1 = fields.iter().find(|f| f.number == 1).unwrap();
         let ProtoValue::Bytes(field_1_bytes) = &field_1.value else {
             panic!("field 1 is not length-delimited");
@@ -1480,7 +2041,17 @@ mod tests {
         let ProtoValue::Bytes(field_5_bytes) = &field_5.value else {
             panic!("field [1,1,5] is not length-delimited");
         };
-        assert_eq!(String::from_utf8_lossy(field_5_bytes), conversation_id);
+        let nested_115 = parse_proto_fields(field_5_bytes).unwrap();
+        let field_115_5 = nested_115.iter().find(|f| f.number == 5).unwrap();
+        let ProtoValue::Bytes(field_115_5_bytes) = &field_115_5.value else {
+            panic!("field [1,1,5,5] is not length-delimited");
+        };
+        let nested_1155 = parse_proto_fields(field_115_5_bytes).unwrap();
+        let field_1155_1 = nested_1155.iter().find(|f| f.number == 1).unwrap();
+        let ProtoValue::Bytes(conv_bytes) = &field_1155_1.value else {
+            panic!("field [1,1,5,5,1] is not length-delimited");
+        };
+        assert_eq!(String::from_utf8_lossy(conv_bytes), conversation_id);
 
         // [1,6] request id
         let field_6 = nested_1.iter().find(|f| f.number == 6).unwrap();
@@ -1561,7 +2132,7 @@ mod tests {
         assert!(url.contains("x-dgw-authtype=15%3A0") || url.contains("x-dgw-authtype=15:0"));
         assert!(url.contains("Authorization=ecto1%3Aabc123") || url.contains("Authorization=ecto1:abc123"));
         assert!(url.contains("x-dgw-app-clippy-request-id=req-123"));
-        assert!(url.contains("x-dgw-app-clippy-async=true"));
+        assert!(!url.contains("clippy-async"));
     }
 
     // ─── event parsing ──────────────────────────────────────────────────────
@@ -1575,6 +2146,30 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "full");
         assert_eq!(events[1].event_type, "patch");
+    }
+
+    #[test]
+    fn accumulator_sets_done_on_terminal_response_id_frame() {
+        // Streaming frames: partial text and in-progress thinking.
+        let mut acc = WsAccumulator::default();
+        acc.apply(
+            r#"{"seq":0,"type":"full","response":{"response_id":"abc","sections":[
+                {"view_model":{"primitive":{"__typename":"GenAIBotThinkingStatusPrimitive","is_in_progress":true}}},
+                {"view_model":{"primitive":{"__typename":"GenAIMarkdownTextUXPrimitive","text":"yo, what's up"}}}
+            ]}}"#,
+        );
+        assert!(!acc.done, "streaming in-progress frame must not complete the turn");
+        assert_eq!(acc.content, "yo, what's up");
+
+        // Terminal frame: top-level response_id, no type, is_in_progress:false.
+        acc.apply(
+            r#"{"response_id":"abc","sections":[
+                {"view_model":{"primitive":{"__typename":"GenAIBotThinkingStatusPrimitive","is_in_progress":false}}},
+                {"view_model":{"primitive":{"__typename":"GenAIMarkdownTextUXPrimitive","text":"yo, what's up? I'm here"}}}
+            ]}"#,
+        );
+        assert!(acc.done, "terminal frame must mark the turn done");
+        assert_eq!(acc.content, "yo, what's up? I'm here");
     }
 
     #[test]
@@ -1616,6 +2211,98 @@ mod tests {
         );
         assert!(acc.content.is_empty());
         assert!(acc.deltas.is_empty());
+    }
+
+    // ─── native tool-call extraction ────────────────────────────────────────
+
+    /// Real `search-results://` invocation block captured from a live DGW turn
+    /// (`tool_capture/tool3/ws_1786706680778.json`, frame 8). The model emits
+    /// the invocation header plus the fetched line dump as a bare
+    /// `{"text": ...}` event, separate from the visible section stream.
+    const CAPTURED_TOOL_BLOCK: &str = concat!(
+        "[2252765915471961672] current weather Paris right now ",
+        "(search-results://query?query=current weather Paris right now)\n",
+        "**viewing lines [0 - 89] of 89**\n",
+        "\n",
+        "L0: # Search Results\n",
+        "L1: \n",
+        "L2: \n",
+        "L3:   * \u{3010}0\u{2020}Paris Live Weather & Forecast\u{2020}weather.com\u{3011}\n",
+        "L4: \n",
+        "L5:   Today's Date: Friday, August 14, 2026 GMT\n",
+        "L6:   \n",
+        "L7:   In Paris, Ile-de-France, it is currently Sunny. Temperature is 39 C.\n",
+        "L8:   Aug 14, Friday: High 40\u{00b0}, Low 22\u{00b0}.\n",
+        "L89:   of 11, Visibility, 8.05 km, Moon Phase, Waning Crescent",
+    );
+
+    #[test]
+    fn extract_native_tool_calls_parses_captured_block() {
+        let content = format!(
+            "{CAPTURED_TOOL_BLOCK}\nRight now in **Paris, France** it's extremely hot and sunny"
+        );
+        let (clean, calls) = extract_native_tool_calls(&content);
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.id, "call_2252765915471961672");
+        assert_eq!(call.r#type, "function");
+        assert_eq!(call.function.name, "web_search");
+        let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
+        assert_eq!(args["query"], "current weather Paris right now");
+        // The block (header + viewing-lines + dump) is tool machinery, so the
+        // visible content keeps only the answer text.
+        assert_eq!(
+            clean,
+            "Right now in **Paris, France** it's extremely hot and sunny"
+        );
+    }
+
+    #[test]
+    fn parse_native_tool_block_consumes_dump_without_trailing_newline() {
+        let (call, end) = parse_native_tool_block(CAPTURED_TOOL_BLOCK, 0).unwrap();
+        assert_eq!(call.query, "current weather Paris right now");
+        assert_eq!(end, CAPTURED_TOOL_BLOCK.len());
+    }
+
+    #[test]
+    fn accumulator_collects_native_tool_blocks_deduped() {
+        let mut acc = WsAccumulator::default();
+        let event =
+            serde_json::to_string(&serde_json::json!({ "text": CAPTURED_TOOL_BLOCK })).unwrap();
+        acc.apply(&event);
+        acc.apply(&event);
+        assert_eq!(acc.tool_blocks.len(), 1, "duplicate blocks must be deduped");
+        assert!(acc.content.is_empty(), "tool blocks must not touch visible content");
+        assert!(!acc.done);
+    }
+
+    #[test]
+    fn accumulator_separates_tool_blocks_from_answer_deltas() {
+        let mut acc = WsAccumulator::default();
+        acc.apply(
+            r#"{"type":"full","response":{"sections":[{"view_model":{"primitive":{"text":"Right now in **Paris** it's hot"}}}]}}"#,
+        );
+        let tool =
+            serde_json::to_string(&serde_json::json!({ "text": CAPTURED_TOOL_BLOCK })).unwrap();
+        acc.apply(&tool);
+        assert_eq!(acc.content, "Right now in **Paris** it's hot");
+        assert_eq!(acc.deltas, vec!["Right now in **Paris** it's hot"]);
+        assert_eq!(acc.tool_blocks.len(), 1);
+        let (_, calls) = extract_native_tool_calls(&acc.tool_blocks[0]);
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn accumulator_ignores_non_invocation_text_events() {
+        let mut acc = WsAccumulator::default();
+        // The weather citation block carries a real URL, not a
+        // `search-results://` invocation; it must not become a tool call.
+        let weather = serde_json::to_string(&serde_json::json!({
+            "text": "[6262884135635057517] Paris Live Weather & Forecast (https://weather.com/city/paris/today)\n**viewing lines [0 - 66] of 66**\nL0: Today's Date: Friday, August 14, 2026 GMT"
+        }))
+        .unwrap();
+        acc.apply(&weather);
+        assert!(acc.tool_blocks.is_empty());
     }
 
     // ─── message folding ────────────────────────────────────────────────────
@@ -1697,8 +2384,88 @@ mod tests {
             "user",
             1,
             2,
+            None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn attachment_block_matches_captured_wire_format() {
+        // Ground truth from the image-attach capture (imgcap3): media_id
+        // 1655280158904939, mime image/png, filename test.png.
+        let block = build_attachment_block(1655280158904939, "image/png", "test.png");
+        let fields = parse_proto_fields(&block).unwrap();
+        let mut id_field = None;
+        let mut flag = None;
+        let mut empty = None;
+        let mut n5 = None;
+        let mut mime = None;
+        let mut name = None;
+        for f in &fields {
+            match (f.number, &f.value) {
+                (1, ProtoValue::Bytes(inner)) => id_field = Some(inner.clone()),
+                (2, ProtoValue::Varint(v)) => flag = Some(*v),
+                (3, ProtoValue::Bytes(inner)) => empty = Some(inner.clone()),
+                (5, ProtoValue::Varint(v)) => n5 = Some(*v),
+                (6, ProtoValue::Bytes(inner)) => mime = Some(inner.clone()),
+                (7, ProtoValue::Bytes(inner)) => name = Some(inner.clone()),
+                _ => {}
+            }
+        }
+        let id_inner = parse_proto_fields(id_field.as_ref().unwrap()).unwrap();
+        assert_eq!(id_inner.len(), 1);
+        assert!(matches!(
+            (&id_inner[0].number, &id_inner[0].value),
+            (1, ProtoValue::Varint(1655280158904939))
+        ));
+        assert_eq!(flag, Some(1));
+        assert_eq!(empty, Some(vec![]));
+        assert_eq!(n5, Some(0));
+        assert_eq!(mime, Some(b"image/png".to_vec()));
+        assert_eq!(name, Some(b"test.png".to_vec()));
+    }
+
+    #[test]
+    fn prompt_frame_injects_attachment_at_2_3() {
+        let block = build_attachment_block(1655280158904939, "image/png", "test.png");
+        let frame = build_ws_prompt_frame(
+            "describe this image",
+            "c.test123",
+            HOME_TEMPLATE_B64,
+            "req-123",
+            "user-123",
+            1_700_000_000_123,
+            42,
+            Some(&block),
+        )
+        .unwrap();
+        let body_len = (frame[3] as usize)
+            | ((frame[4] as usize) << 8)
+            | ((frame[5] as usize) << 16);
+        let body = &frame[6..6 + body_len];
+        assert_eq!(body[0], 0);
+        assert_eq!(body[1], WS_PROMPT_FRAME_FLAG);
+        let outer: serde_json::Value = serde_json::from_slice(&body[2..]).unwrap();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(outer["payload"].as_str().unwrap())
+            .unwrap();
+        let root = parse_proto_fields(&payload).unwrap();
+        let field2 = root.iter().find(|f| f.number == 2).unwrap();
+        let ProtoValue::Bytes(msg2) = &field2.value else {
+            panic!("field 2 not bytes");
+        };
+        let fields2 = parse_proto_fields(msg2).unwrap();
+        let numbers: Vec<u32> = fields2.iter().map(|f| f.number).collect();
+        assert_eq!(
+            numbers,
+            vec![1, 2, 3, 4],
+            "attachment must slot between text and branch"
+        );
+        let attachment = fields2.iter().find(|f| f.number == 3).unwrap();
+        let ProtoValue::Bytes(injected) = &attachment.value else {
+            panic!("field 3 not bytes");
+        };
+        assert_eq!(injected.as_slice(), block.as_slice());
     }
 }
 

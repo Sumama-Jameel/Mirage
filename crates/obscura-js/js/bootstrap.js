@@ -6686,6 +6686,24 @@ if (typeof TransformStream === 'undefined') {
     }
   };
 }
+if (typeof TextEncoderStream === 'undefined') {
+  globalThis.TextEncoderStream = class TextEncoderStream {
+    constructor() {
+      this.encoding = 'utf-8';
+      this.readable = new ReadableStream();
+      this.writable = new WritableStream();
+    }
+  };
+}
+if (typeof TextDecoderStream === 'undefined') {
+  globalThis.TextDecoderStream = class TextDecoderStream {
+    constructor(encoding = 'utf-8') {
+      this.encoding = encoding;
+      this.readable = new ReadableStream();
+      this.writable = new WritableStream();
+    }
+  };
+}
 
 if (!globalThis.crypto) globalThis.crypto = {};
 if (!globalThis.crypto.subtle) {

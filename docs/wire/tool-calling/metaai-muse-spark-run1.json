@@ -1,0 +1,62 @@
+{
+  "request_body": {
+    "model": "muse-spark",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a file called hello.txt with the content Hello, world!"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "write_file",
+          "description": "Write content to a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The filename"
+              },
+              "content": {
+                "type": "string",
+                "description": "The file content"
+              }
+            },
+            "required": [
+              "name",
+              "content"
+            ]
+          }
+        }
+      }
+    ],
+    "stream": false
+  },
+  "http_status": 200,
+  "elapsed_s": 21.0,
+  "response": {
+    "id": "chatcmpl-meta-79531710-9c9",
+    "object": "chat.completion",
+    "created": 1787305003,
+    "model": "muse-spark",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "\ud83d\udcce [hello.txt](https://1340723959119875.a.metaaiusercontent.com/document?artifact_uuid=09656d3c-2fae-4ec1-9c48-5d4a2dcfc382&ext=1795080998&hash=Q5fpDAG8qqWtSM8V4yjHtBOF11Xg)"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 15,
+      "completion_tokens": 43,
+      "total_tokens": 58
+    },
+    "session_url": "https://www.meta.ai/c/c.0B9aqC7V41oR1HoFqpn"
+  }
+}

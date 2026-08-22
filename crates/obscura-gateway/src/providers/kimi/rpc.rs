@@ -234,9 +234,19 @@ pub struct NewSseEvent {
     #[serde(default)]
     pub turn_id: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub msg_id: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub timestamp: Option<i64>,
+    /// Some K3 responses put the completed assistant message below a
+    /// `message` object instead of putting its fields on the event itself.
+    #[serde(default)]
+    pub message: Option<serde_json::Value>,
+    #[serde(default)]
+    pub reasoning_content: Option<serde_json::Value>,
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
 }
 
 /// Parse a single SSE line from the new Kimi message API (K3+).
@@ -301,7 +311,29 @@ pub fn parse_new_sse_line(
                 "K3 SSE complete_message (raw): {}",
                 body.chars().take(500).collect::<String>()
             );
-            Some((event.content, None, event.turn_id, true, false, None))
+            let (content, thinking, turn_id) = event
+                .message
+                .as_ref()
+                .map(|message| {
+                    (
+                        event.content.clone().or_else(|| text_field(message, "content")),
+                        text_field(message, "reasoning_content")
+                            .or_else(|| text_field(message, "thinking"))
+                            .or_else(|| event.reasoning_content.as_ref().and_then(|v| text_value(v)))
+                            .or_else(|| event.thinking.as_ref().and_then(|v| text_value(v))),
+                        event.turn_id.clone().or_else(|| text_field(message, "turn_id")),
+                    )
+                })
+                .unwrap_or((
+                    event.content,
+                    event
+                        .reasoning_content
+                        .as_ref()
+                        .and_then(|v| text_value(v))
+                        .or_else(|| event.thinking.as_ref().and_then(|v| text_value(v))),
+                    event.turn_id,
+                ));
+            Some((content, thinking, turn_id, true, false, None))
         }
         "heartbeat" => {
             tracing::trace!("K3 SSE heartbeat");
@@ -318,6 +350,83 @@ pub fn parse_new_sse_line(
     }
 }
 
+fn text_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    let field = value.get(key)?;
+    text_value(field)
+}
+
+fn text_value(field: &serde_json::Value) -> Option<String> {
+    if let Some(text) = field.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(parts) = field.as_array() {
+        let text = parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str().map(str::to_string).or_else(|| {
+                    part.get("text").and_then(|v| v.as_str()).map(str::to_string)
+                })
+            })
+            .collect::<String>();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Extract native tool calls from a K3 message-api event.
+///
+/// The message endpoint has used more than one envelope for the same
+/// structured result (`tool_calls` on the event, `tool_call` for a single
+/// event, and nested fields on `complete_message`). Keep this extraction
+/// envelope-independent so a wire wrapper change does not force XML parsing.
+pub fn extract_new_sse_tool_calls(line: &str) -> Option<Vec<ToolCall>> {
+    let body = line.trim().strip_prefix("data: ")?.trim();
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mut found = Vec::new();
+    collect_tool_calls(&value, &mut found);
+    let mut unique = Vec::with_capacity(found.len());
+    for call in found {
+        if !unique.iter().any(|existing: &ToolCall| existing.id == call.id) {
+            unique.push(call);
+        }
+    }
+    if unique.is_empty() { None } else { Some(unique) }
+}
+
+fn collect_tool_calls(value: &serde_json::Value, found: &mut Vec<ToolCall>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["tool_calls", "toolCalls"] {
+                if let Some(calls) = map.get(key) {
+                    collect_tool_call_value(calls, found);
+                }
+            }
+            if let Some(call) = map.get("tool_call").or_else(|| map.get("toolCall")) {
+                collect_tool_call_value(call, found);
+            }
+            for child in map.values() {
+                collect_tool_calls(child, found);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_tool_calls(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_tool_call_value(value: &serde_json::Value, found: &mut Vec<ToolCall>) {
+    if let Ok(calls) = serde_json::from_value::<Vec<ToolCall>>(value.clone()) {
+        found.extend(calls);
+    } else if let Ok(call) = serde_json::from_value::<ToolCall>(value.clone()) {
+        found.push(call);
+    }
+}
+
 /// Collect full text and thinking from a non-streaming SSE body for the NEW API format.
 /// Returns `(content_text, thinking_text, turn_id)`.
 pub fn collect_text_from_new_sse(body: &[u8]) -> (String, Option<String>, Option<String>) {
@@ -328,10 +437,10 @@ pub fn collect_text_from_new_sse(body: &[u8]) -> (String, Option<String>, Option
     for line in text.lines() {
         if let Some((delta, think, turn, is_done, is_error, _)) = parse_new_sse_line(line) {
             if let Some(t) = delta {
-                content.push_str(&t);
+                append_delta_or_snapshot(&mut content, &t);
             }
             if let Some(t) = think {
-                thinking.push_str(&t);
+                append_delta_or_snapshot(&mut thinking, &t);
             }
             if let Some(id) = turn {
                 turn_id = Some(id);
@@ -343,6 +452,22 @@ pub fn collect_text_from_new_sse(body: &[u8]) -> (String, Option<String>, Option
     }
     let thinking = if thinking.is_empty() { None } else { Some(thinking) };
     (content, thinking, turn_id)
+}
+
+/// Merge a streamed delta or a later full-message snapshot without duplicating
+/// content. K3 has emitted both forms in the same response: `delta` events
+/// carry increments while `complete_message` can carry the complete text.
+fn append_delta_or_snapshot(current: &mut String, next: &str) {
+    if next.is_empty() {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(next);
+    } else if next.starts_with(current.as_str()) {
+        *current = next.to_string();
+    } else if !current.starts_with(next) {
+        current.push_str(next);
+    }
 }
 
 /// Collect full text and thinking from a non-streaming SSE body.
@@ -459,6 +584,52 @@ mod tests {
     }
 
     #[test]
+    fn extract_new_native_tool_calls_from_event() {
+        let line = r#"data: {"type":"tool_call","tool_call":{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}}"#;
+        let calls = extract_new_sse_tool_calls(line).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn extract_new_native_tool_calls_from_complete_message() {
+        let line = r#"data: {"type":"complete_message","message":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}"#;
+        let calls = extract_new_sse_tool_calls(line).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_2");
+    }
+
+    #[test]
+    fn extract_new_native_tool_calls_deduplicates_nested_envelopes() {
+        let line = r#"data: {"type":"complete_message","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}],"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}"#;
+        let calls = extract_new_sse_tool_calls(line).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+    }
+
+    #[test]
+    fn parse_new_complete_message_extracts_nested_content_and_reasoning() {
+        let line = r#"data: {"type":"complete_message","message":{"content":"answer","reasoning_content":"thought","turn_id":"turn_nested"}}"#;
+        let (delta, thinking, turn_id, done, error, _) = parse_new_sse_line(line).unwrap();
+        assert_eq!(delta, Some("answer".to_string()));
+        assert_eq!(thinking, Some("thought".to_string()));
+        assert_eq!(turn_id, Some("turn_nested".to_string()));
+        assert!(done);
+        assert!(!error);
+    }
+
+    #[test]
+    fn parse_new_complete_message_extracts_top_level_reasoning() {
+        let line = r#"data: {"type":"complete_message","content":"answer","reasoning_content":"thought","turn_id":"turn_top"}"#;
+        let (delta, thinking, turn_id, done, error, _) = parse_new_sse_line(line).unwrap();
+        assert_eq!(delta, Some("answer".to_string()));
+        assert_eq!(thinking, Some("thought".to_string()));
+        assert_eq!(turn_id, Some("turn_top".to_string()));
+        assert!(done);
+        assert!(!error);
+    }
+
+    #[test]
     fn collect_text_from_new_sse_basic() {
         let sse = concat!(
             "data: {\"type\": \"delta\", \"content\": \"Hello\"}\n",
@@ -483,6 +654,18 @@ mod tests {
         assert_eq!(text, "answer");
         assert_eq!(thinking, Some("thinking step".to_string()));
         assert_eq!(turn_id, Some("turn_xyz".to_string()));
+    }
+
+    #[test]
+    fn collect_text_from_new_sse_does_not_duplicate_complete_snapshot() {
+        let sse = concat!(
+            "data: {\"type\":\"delta\",\"content\":\"Hello\"}\n",
+            "data: {\"type\":\"delta\",\"content\":\" world\"}\n",
+            "data: {\"type\":\"complete_message\",\"message\":{\"content\":\"Hello world\",\"reasoning_content\":\"thought\"}}\n",
+        );
+        let (text, thinking, _) = collect_text_from_new_sse(sse.as_bytes());
+        assert_eq!(text, "Hello world");
+        assert_eq!(thinking.as_deref(), Some("thought"));
     }
 
     #[test]

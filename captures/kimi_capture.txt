@@ -1,0 +1,30 @@
+=== KIMI CAPTURE 2026-08-21 (partial — manual Network tab) ===
+
+ENDPOINT: POST https://www.kimi.ai/apiv2/kimi.gateway.chat.v1.ChatService/Chat
+
+REQUEST BODY: BINARY PROTOBUF (Firefox shows \u0001-style escapes).
+Raw bytes NOT yet captured. gRPC-web style API.
+Related: streaming updates via WSS notilo.kimi.ai/im/v1/subscribe/ws?encoding=proto&ticket=...
+Ticket from: POST https://notilo.kimi.ai/ws/tickets
+
+COOKIE SEEN ON CHAT REQUEST:
+__cf_bm domain=.kimi.ai httpOnly secure samesite=None
+value=G__pBRh7GAw.zzTTTw4saHcAwIYIDM.PcFbIqZMs4vI-1787335064-1.0.1.1-i8MKN.C7AcEmh4cCGSRgEWTzLeirBAUhXnVRXQSxfXEPv45CEv8wVyq_yMssFpHwkguxXYlknPMZJoi43czkU17Y_.wupxH_QXAkeXRrBes
+
+--- AUX RESPONSES (from Network tab) ---
+
+GetConfig response:
+{"message":"success","data":{"alipay_first":{"val":"1","vid":"447980"},"android_has_kimiclaw":{"val":"1","vid":"20227473"},"has_claw_group":{"val":"1","vid":"444202"},"has_kimiskill":{"val":"1","vid":"448285"},"has_oneclick_login":{"val":0,"vid":"430777"},"max_upload_size":{"val":100,"vid":"467676"},"mykimi_0712":{"val":"1","vid":"474813"},"n2s_memory_client":{"val":0,"vid":"20224378"},"pc_browser_extension":{"val":"1","vid":"447576"},"project_function_0709":{"val":"1","vid":"472947"},"sidebar_collapse":{"val":"1","vid":"477940"},"task_center_0622":{"val":"1","vid":"467081"},"web_android_claw":{"val":1,"vid":"439495"}}}
+
+ListFeeds response (chat list; note chat ids + messageContent + cite format):
+{"items":[{"type":"FEED_TYPE_CHAT","chat":{"id":"1a02578b-b0c2-8288-8000-09c4b52c85c2","name":"Netanyahu Today Update",...,"messageContent":"...cite🛠web_search:1#6:~:text=..."}}, ...]}
+NOTE: messageContent contains citation markers like "cite🛠web_search:N#M:~:text=..."
+NOTE: file upload objects have blob.signUrl/previewUrl under apiv2-files/sign-obj/
+NOTE: chat ids look like ULIDs (e.g. 1a02578b-b0c2-8288-8000-09c4b52c85c2)
+
+CHAT RESPONSE BODY: NOT YET CAPTURED (protobuf or streamed via WS).
+
+=== OPEN GAPS ===
+1. Raw request body bytes of ChatService/Chat (protobuf decode needed)
+2. ChatService/Chat response body
+3. Whether reply text streams over the notilo WS or the HTTP response

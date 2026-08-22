@@ -8,7 +8,7 @@ use futures::StreamExt;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
@@ -66,9 +66,6 @@ impl Provider for ClaudeProvider {
         true
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn chat(
         &self,
@@ -144,21 +141,9 @@ impl Provider for ClaudeProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["div[contenteditable='true']", "textarea"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[aria-label*='send' i]", "button[type='submit']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        "[data-message-author-role='assistant']"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        Some("[class*='thinking' i]")
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // Claude web API support for JSON mode is unverified.
@@ -216,9 +201,6 @@ impl Provider for ClaudeProvider {
         Ok(())
     }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(2000))
-    }
 }
 
 #[cfg(test)]
@@ -231,7 +213,7 @@ mod tests {
         assert_eq!(p.name(), "claude");
         assert_eq!(p.url(), "https://claude.ai");
         assert!(p.models().iter().any(|m| m.id == "claude-sonnet-5"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+
     }
 
     #[test]
@@ -241,6 +223,7 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"claude-sonnet-5"));
         assert!(ids.contains(&"claude-fable-5"));
+        assert!(ids.contains(&"claude-opus-5"));
         assert!(ids.contains(&"claude-opus-4-8"));
         assert!(ids.contains(&"claude-haiku-4-5"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
@@ -248,6 +231,6 @@ mod tests {
         assert!(ids.contains(&"claude-sonnet-4-5"));
         assert!(ids.contains(&"claude-sonnet-4-5-20250929"));
         assert!(ids.contains(&"claude-3-opus-20240229"));
-        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.len(), 11);
     }
 }

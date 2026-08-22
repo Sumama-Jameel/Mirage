@@ -8,15 +8,58 @@
 use crate::models::{FunctionCall, Tool, ToolCall, ToolChoice};
 
 const TOOL_CALL_FORMAT_INSTRUCTION: &str =
-    "When you need to call a function, output one or more JSON objects of \
-     the form {\"name\":\"function_name\",\"arguments\":{...}} wrapped in \
-     <tool_call> tags, and nothing else.";
+    "IMPORTANT: To call a function, you MUST output EXACTLY this format — \
+     nothing else, no explanations, no markdown, no Action/Action Input, no plain JSON: \
+     <tool_call>{\"name\":\"function_name\",\"arguments\":{...}}</tool_call> \
+     Example: <tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call> \
+     Multiple calls are allowed. Do NOT output anything else.";
+
+/// True when `OBSCURA_NATIVE_TOOLS_ONLY=1`: the XML tool-injection fallback
+/// is disabled so only native provider tool channels are exercised (used by
+/// capability data collection; a provider without native support then simply
+/// sees no tools at all).
+pub fn native_tools_only() -> bool {
+    std::env::var("OBSCURA_NATIVE_TOOLS_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Append the exact LLM-facing input to `$OBSCURA_DUMP_DIR/prompts.jsonl`
+/// when that env var is set. Used by data-collection runs to record what
+/// actually went to the model. Never logs anything otherwise.
+pub fn debug_dump_llm_input(provider: &str, input: serde_json::Value) {
+    let Ok(dir) = std::env::var("OBSCURA_DUMP_DIR") else {
+        return;
+    };
+    let record = serde_json::json!({
+        "ts_utc": chrono::Utc::now().timestamp_millis(),
+        "provider": provider,
+        "input": input,
+    });
+    let path = std::path::Path::new(&dir).join("prompts.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{record}");
+    }
+}
 
 /// Format tool definitions and inject them into the user prompt.
 ///
 /// Prepends a system-style instruction block describing each available
 /// function, respecting the `tool_choice` policy.
-pub fn inject_tool_prompt(prompt: &str, tools: &[Tool], tool_choice: Option<&ToolChoice>) -> String {
+///
+/// `provider` labels the dump record and selects nothing else. When
+/// [`native_tools_only`] is set, the prompt passes through untouched.
+pub fn inject_tool_prompt(
+    provider: &str,
+    prompt: &str,
+    tools: &[Tool],
+    tool_choice: Option<&ToolChoice>,
+) -> String {
+    if native_tools_only() {
+        debug_dump_llm_input(provider, serde_json::json!({ "user_prompt": prompt }));
+        return prompt.to_string();
+    }
     let mut instructions = String::new();
     instructions.push_str(
         "You have access to the following functions. Use them if they help answer the user.\n\n",
@@ -50,7 +93,9 @@ pub fn inject_tool_prompt(prompt: &str, tools: &[Tool], tool_choice: Option<&Too
         }
     }
 
-    format!("{instructions}User request:\n{prompt}")
+    let full = format!("{instructions}User request:\n{prompt}");
+    debug_dump_llm_input(provider, serde_json::json!({ "user_prompt": full }));
+    full
 }
 
 /// Gemini-specific tool-use instruction injected into the prompt.
@@ -64,7 +109,19 @@ pub fn inject_tool_prompt(prompt: &str, tools: &[Tool], tool_choice: Option<&Too
 ///
 /// The function list is also passed to `request[9]` for the native path; the
 /// instruction makes emission reliable.
-pub fn gemini_tool_use_prompt(prompt: &str, tools: &[Tool], tool_choice: Option<&ToolChoice>) -> String {
+///
+/// Like [`inject_tool_prompt`], this is a no-op pass-through when
+/// [`native_tools_only`] is set.
+pub fn gemini_tool_use_prompt(
+    provider: &str,
+    prompt: &str,
+    tools: &[Tool],
+    tool_choice: Option<&ToolChoice>,
+) -> String {
+    if native_tools_only() {
+        debug_dump_llm_input(provider, serde_json::json!({ "user_prompt": prompt }));
+        return prompt.to_string();
+    }
     let mut instructions = String::new();
     instructions.push_str(
         "You can call functions to answer the user. Available functions:\n",
@@ -108,7 +165,9 @@ pub fn gemini_tool_use_prompt(prompt: &str, tools: &[Tool], tool_choice: Option<
         None => {}
     }
 
-    format!("{instructions}\n\nUser request:\n{prompt}")
+    let full = format!("{instructions}\n\nUser request:\n{prompt}");
+    debug_dump_llm_input(provider, serde_json::json!({ "user_prompt": full }));
+    full
 }
 
 /// Parse `<tool_call>`…`</tool_call>` markers from response text.
@@ -143,27 +202,143 @@ pub fn strip_tool_call_markers(content: &str) -> String {
     }
 }
 
-/// Convert XML `<tool_call>` markers in response text into native `tool_calls`.
+/// Parse standalone JSON tool calls like `{"name":"read","arguments":{"filePath":"..."}}`.
+/// These appear when the model outputs raw JSON without any wrapper.
+pub fn parse_standalone_json_tool_call(text: &str) -> Option<Vec<ToolCall>> {
+    let trimmed = text.trim();
+    // Must start with { and end with } to be a JSON object.
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = value.as_object()?;
+    // Must have "name" or "function" key to be a tool call.
+    let name = obj.get("name").and_then(|v| v.as_str())
+        .or_else(|| obj.get("function").and_then(|f| f.as_object()?.get("name"))?.as_str())?;
+    let arguments = obj.get("arguments")
+        .or_else(|| obj.get("args"))
+        .or_else(|| obj.get("input"))
+        .or_else(|| obj.get("function").and_then(|f| f.as_object()?.get("arguments")))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let arguments_str = if let Some(s) = arguments.as_str() {
+        s.to_string()
+    } else {
+        serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string())
+    };
+    Some(vec![ToolCall {
+        id: stable_call_id(name, &arguments_str),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: arguments_str,
+        },
+    }])
+}
+
+/// Parse the `Action: <name>\nAction Input: {json}` format.
 ///
-/// When `request_had_tools` is true and the text contains `<tool_call>` markers,
-/// this parses them into structured `ToolCall` objects and strips the markers
-/// from the text. Returns `(cleaned_text, Some(calls))` if markers were found,
-/// or `(text, None)` if the text has no markers.
+/// Some models (DeepSeek, ReAct-style agents) emit:
+/// ```
+/// Action: read
+/// Action Input: {"filePath": "/etc/hosts"}
+/// ```
 ///
-/// When `request_had_tools` is false, the text is returned unchanged — this
-/// prevents mangling model responses that merely describe XML syntax.
+/// Returns (cleaned_text, calls) if found, None if the text doesn't match.
+pub fn parse_action_input_format(text: &str) -> Option<(String, Vec<ToolCall>)> {
+    let action_re = regex::Regex::new(r"(?i)^\s*Action:\s*(\S+)\s*$").ok()?;
+    let input_re = regex::Regex::new(r"(?i)^\s*Action Input:\s*(.*)\s*$").ok()?;
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut calls = Vec::new();
+    let mut consumed_lines = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if let Some(caps) = action_re.captures(lines[i]) {
+            let name = caps.get(1)?.as_str().to_string();
+            consumed_lines.push(i);
+            i += 1;
+
+            // Look for Action Input on the next line.
+            if i < lines.len() {
+                if let Some(icaps) = input_re.captures(lines[i]) {
+                    let raw_input = icaps.get(1)?.as_str().trim();
+                    consumed_lines.push(i);
+                    i += 1;
+
+                    // Try to parse as JSON.
+                    let arguments = serde_json::from_str::<serde_json::Value>(raw_input)
+                        .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()))
+                        .unwrap_or_else(|_| format!("{{\"input\":\"{}\"}}", raw_input));
+
+                    calls.push(ToolCall {
+                        id: stable_call_id(&name, &arguments),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name,
+                            arguments,
+                        },
+                    });
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    if calls.is_empty() {
+        return None;
+    }
+
+    // Rebuild text without consumed lines.
+    let cleaned: String = lines
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !consumed_lines.contains(idx))
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+
+    Some((cleaned, calls))
+}
+
+/// Convert tool call markers in response text into native `tool_calls`.
+///
+/// Tries multiple formats that models actually emit:
+/// 1. `<tool_call>{...}</tool_call>` XML markers (the instructed format)
+/// 2. `Action: <name>\nAction Input: {...}` (ReAct/LangChain style)
+/// 3. Raw JSON `{"name":...,"arguments":...}` at the start of the text
+///
+/// When `request_had_tools` is false, the text is returned unchanged.
 pub fn convert_xml_tool_calls(text: &str, request_had_tools: bool) -> (String, Option<Vec<ToolCall>>) {
     if !request_had_tools {
         return (text.to_string(), None);
     }
-    let Some(calls) = parse_tool_calls_from_content(text) else {
-        return (text.to_string(), None);
-    };
-    if calls.is_empty() {
-        return (text.to_string(), None);
+
+    // Try XML markers first.
+    if let Some(calls) = parse_tool_calls_from_content(text) {
+        if !calls.is_empty() {
+            let cleaned = strip_tool_call_markers(text);
+            return (cleaned, Some(calls));
+        }
     }
-    let cleaned = strip_tool_call_markers(text);
-    (cleaned, Some(calls))
+
+    // Try Action/Action Input format (DeepSeek, ReAct-style).
+    if let Some((cleaned, calls)) = parse_action_input_format(text) {
+        if !calls.is_empty() {
+            return (cleaned, Some(calls));
+        }
+    }
+
+    // Try standalone JSON: {"name":...,"arguments":...} on its own.
+    if let Some(calls) = parse_standalone_json_tool_call(text) {
+        return (String::new(), Some(calls));
+    }
+
+    (text.to_string(), None)
 }
 
 /// Parse a single raw `<tool_call>` payload into a `ToolCall`.
@@ -202,7 +377,7 @@ pub fn parse_manual_tool_call(raw: &str) -> Option<ToolCall> {
 /// the same call repeatedly must yield the same id or dedup (by id) would
 /// emit duplicate tool_calls. Streaming frame texts that differ only in a
 /// partial-vs-complete argument set produce distinct ids, which is correct.
-fn stable_call_id(name: &str, arguments: &str) -> String {
+pub(crate) fn stable_call_id(name: &str, arguments: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in format!("{name}\u{0}{arguments}").bytes() {
         h ^= b as u64;
@@ -768,11 +943,13 @@ impl XmlToolCallStripper {
     /// True when a `<tool_call>` block is open at the end of the last
     /// processed delta. Callers should flush `finish_pending()` after the
     /// stream ends to recover a tool call whose closing tag was truncated.
+    #[allow(dead_code)]
     pub fn in_tool_call(&self) -> bool {
         self.in_tool_call
     }
 
     /// The partial payload of an in-flight tool call. Empty when idle.
+    #[allow(dead_code)]
     pub fn pending_buffer(&self) -> &str {
         &self.tool_call_buffer
     }
@@ -808,7 +985,7 @@ mod tests {
                 strict: None,
             },
         }];
-        let result = inject_tool_prompt("Read main.py", &tools, None);
+        let result = inject_tool_prompt("test", "Read main.py", &tools, None);
         assert!(result.contains("read_file"));
         assert!(result.contains("Read main.py"));
         assert!(result.contains("<tool_call>"));
@@ -825,7 +1002,7 @@ mod tests {
                 strict: None,
             },
         }];
-        let result = inject_tool_prompt("Hi", &tools, Some(&ToolChoice::Mode("none".to_string())));
+        let result = inject_tool_prompt("test", "Hi", &tools, Some(&ToolChoice::Mode("none".to_string())));
         assert!(result.contains("Do not call any functions"));
         assert!(result.contains("Hi"));
     }
@@ -977,7 +1154,7 @@ Here is the result."#;
         assert!(clean1.is_empty());
         assert!(s.in_tool_call());
 
-        let (clean2, tc2) = s.process(r#"weather","arguments":{"city":"Tok"#);
+        let (_clean2, tc2) = s.process(r#"weather","arguments":{"city":"Tok"#);
         assert!(tc2.is_none());
         assert!(s.in_tool_call());
 

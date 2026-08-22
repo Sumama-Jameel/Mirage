@@ -42,9 +42,6 @@ fn default_thinking(_public_model: &str) -> bool {
     true
 }
 
-fn new_uuid() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
 
 fn current_timestamp() -> i64 {
     SystemTime::now()
@@ -83,7 +80,6 @@ fn build_reqwest_client() -> Result<reqwest::Client, GatewayError> {
 }
 
 pub struct DirectClient {
-    session: SessionHandle,
     model_id: String,
     cookie_header: String,
     ph: String,
@@ -118,7 +114,6 @@ impl DirectClient {
             .to_string();
 
         Ok(Self {
-            session,
             model_id: model_id.to_string(),
             cookie_header,
             ph,
@@ -361,7 +356,7 @@ impl DirectClient {
         // text and parse <tool_call> markers out of the reply, matching the
         // DeepSeek/Gemini XML fallback.
         if let Some(tools) = &request.tools {
-            crate::providers::tool_call::inject_tool_prompt(&joined, tools, request.tool_choice.as_ref())
+            crate::providers::tool_call::inject_tool_prompt("mimo", &joined, tools, request.tool_choice.as_ref())
         } else {
             joined
         }
@@ -399,7 +394,7 @@ impl DirectClient {
         let mut full_thinking = String::new();
         let mut tool_calls: Vec<crate::models::ToolCall> = Vec::new();
         let mut finish_reason = "stop".to_string();
-        let mut usage: Option<Usage> = None;
+        let usage: Option<Usage> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -729,7 +724,6 @@ impl DirectClient {
             async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
                 let mut http_chunks = resp.bytes_stream();
-                let mut current_event = String::new();
                 let mut in_think = false;
                 let mut usage: Option<Usage> = None;
 
@@ -771,14 +765,13 @@ impl DirectClient {
                             continue;
                         }
 
-                        // Track the event name across multi-line SSE frames.
-                        if event_type == "message" || event_type.is_empty() {
-                            current_event = "message".to_string();
+                        let current_event = if event_type == "message" || event_type.is_empty() {
+                            "message"
                         } else {
-                            current_event = event_type.to_string();
-                        }
+                            event_type
+                        };
 
-                        match current_event.as_str() {
+                        match current_event {
                             "error" => {
                                 let msg = serde_json::from_str::<serde_json::Value>(raw)
                                     .ok()

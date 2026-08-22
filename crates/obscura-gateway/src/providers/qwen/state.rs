@@ -14,6 +14,12 @@ pub struct QwenSessionState {
     pub model: String,
     #[serde(default)]
     pub tool_calls: HashMap<String, crate::models::ToolCall>,
+    /// The id of the last assistant message, from the `response.created`
+    /// SSE event. The next turn links its new user message to this id via
+    /// `parent_id`, which is how the server reconstructs conversation
+    /// context (without it the new message is a detached root).
+    #[serde(default)]
+    pub last_message_id: Option<String>,
 }
 
 /// Per-conversation store of Qwen chat sessions keyed by gateway session id.
@@ -124,6 +130,17 @@ impl QwenSessionStore {
         self.ensure_loaded().await;
         let store = self.inner.lock().await;
         store.get(gateway_session_id)?.tool_calls.get(call_id).cloned()
+    }
+
+    /// Record the id of the last assistant message for the given session.
+    pub async fn store_last_message_id(&self, gateway_session_id: &str, message_id: &str) {
+        self.ensure_loaded().await;
+        let mut store = self.inner.lock().await;
+        if let Some(state) = store.get_mut(gateway_session_id) {
+            state.last_message_id = Some(message_id.to_string());
+        }
+        drop(store);
+        self.save_to_disk().await;
     }
 }
 

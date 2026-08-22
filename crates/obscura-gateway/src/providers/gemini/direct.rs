@@ -102,7 +102,7 @@ impl GeminiDirectClient {
         let headers = build_request_headers(
             &cookie_header,
             &session.user_agent,
-            Some(model.model_header),
+            model.model_header,
         )?;
 
         let http = reqwest::Client::builder()
@@ -429,7 +429,7 @@ impl GeminiDirectClient {
         // passed to build_request_payload for request[9].
         if let Some(tools) = &request.tools {
             (
-                gemini_tool_use_prompt(&base_prompt, tools, request.tool_choice.as_ref()),
+                gemini_tool_use_prompt("gemini", &base_prompt, tools, request.tool_choice.as_ref()),
                 Some(tools.clone()),
             )
         } else {
@@ -624,7 +624,7 @@ impl GeminiDirectClient {
             let mut stream = resp.bytes_stream();
             let mut buffer = Vec::new();
             let mut emitted_role = false;
-            let mut previous_text = String::new();
+            let previous_text = String::new();
             let mut last_conversation: Option<ConversationState> = None;
             let mut collected_tool_calls: Vec<ToolCall> = Vec::new();
             let mut session_url: Option<String> = None;
@@ -681,7 +681,7 @@ impl GeminiDirectClient {
                                     None
                                 };
 
-                                previous_text = full_text;
+                                let _ = full_text;
 
                                 if !build_streaming_chunk(
                                     &tx, &counter, &id_prefix, &model_id,
@@ -723,7 +723,7 @@ impl GeminiDirectClient {
                 }
                 match parse_streaming_chunk(&line, &previous_text) {
                     Ok(Some((delta, thinking, tool_calls, citations, full_text))) => {
-                        previous_text = full_text;
+                        let _ = full_text;
                         build_streaming_chunk(
                             &tx, &counter, &id_prefix, &model_id,
                             delta, thinking, tool_calls, citations,

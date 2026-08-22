@@ -12,6 +12,7 @@ use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionRe
 use crate::session::SessionManager;
 use crate::state::AppState;
 
+pub mod authcheck;
 pub mod chatgpt;
 pub mod claude;
 pub mod deepseek;
@@ -19,11 +20,15 @@ pub mod file_upload;
 pub mod gemini;
 pub mod glm;
 pub mod grok;
+pub mod health;
 pub mod kimi;
+pub mod manifest;
 pub mod metaai;
 pub mod minimax;
 pub mod mimo;
 pub mod mistral;
+pub mod mtp;
+pub mod profile;
 pub mod qwen;
 pub mod session_guard;
 pub mod session_store;
@@ -68,6 +73,30 @@ fn backoff(attempt: u32) -> Duration {
 /// Returns true if the HTTP status code is worth retrying.
 fn is_retryable_status(code: u16) -> bool {
     code == 429 || code >= 500
+}
+
+/// Parse a `Retry-After` header value: either a bare number of seconds
+/// (per RFC 9110 the common form) or an HTTP-date. The date form is not
+/// implemented; `Some` is only produced for plain seconds, matching what
+/// the providers this gateway talks to actually send.
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Extract `Retry-After` from a `HashMap`-shaped header map (stealth
+/// client responses carry headers this way, keys lowercased).
+pub fn retry_after_from_map(headers: &HashMap<String, String>) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|v| parse_retry_after(v))
+}
+
+/// Extract `Retry-After` from a reqwest response header map.
+pub fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after)
 }
 
 /// Send an HTTP request with automatic retries on transient failures.
@@ -123,42 +152,6 @@ pub async fn send_with_retry(
     Err(GatewayError::Internal(detail))
 }
 
-/// Signal that the response stream has finished.
-///
-/// Providers describe how `chat::run_chat` decides a generation is complete.
-/// Each variant maps to a different observable signal on the page.
-#[derive(Debug, Clone, Copy)]
-pub enum DoneSignal {
-    /// Done when the response container's visible text has been stable
-    /// (no growth) for the given duration.
-    ///
-    /// Best for chat UIs that stop appending text when generation finishes.
-    /// Pair with a duration comfortably larger than one render frame
-    /// (e.g. 1.0–2.0 s) so a slow token doesn't prematurely terminate.
-    TextStable(Duration),
-
-    /// Done when the given CSS selector no longer matches any visible
-    /// element.
-    ///
-    /// Best for chat UIs that show a "Stop generating" / "Regenerate"
-    /// affordance that disappears or appears when the stream ends.
-    #[allow(dead_code)]
-    SelectorDisappears(&'static str),
-}
-
-/// How a provider satisfies a chat completion request.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum ChatMode {
-    /// Drive the provider's web UI: fill input, click submit, poll the DOM.
-    Ui,
-
-    /// Bypass the UI and call provider backend APIs directly from Rust,
-    /// using the warmed browser only for authenticated state and any
-    /// in-page computation (e.g. WASM PoW solving).
-    Direct,
-}
-
 /// A web-AI provider adapter.
 ///
 /// Implementations describe **how to find and read** the AI's response on
@@ -182,11 +175,6 @@ pub trait Provider: Send + Sync {
 
     /// Models this provider exposes via the OpenAI `/v1/models` endpoint.
     fn models(&self) -> Vec<Model>;
-
-    /// How this provider satisfies chat completions.
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Ui
-    }
 
     /// Non-streaming chat completion.
     fn chat(
@@ -212,37 +200,6 @@ pub trait Provider: Send + Sync {
                 > + Send,
         >,
     >;
-
-    /// CSS selectors for the chat input. Tried in order; first match wins.
-    fn input_selectors(&self) -> &'static [&'static str];
-
-    /// CSS selectors for the submit button. Tried in order; first match wins.
-    fn submit_selectors(&self) -> &'static [&'static str];
-
-    /// Selector for the assistant's last response container.
-    ///
-    /// The gateway extracts visible text from this subtree on every poll.
-    fn response_selector(&self) -> &'static str;
-
-    /// Optional selector for the reasoning / chain-of-thought panel.
-    ///
-    /// Returned text is routed to the `reasoning_content` delta in OpenAI
-    /// streaming responses. Return `None` for providers without a visible
-    /// reasoning panel.
-    fn thinking_selector(&self) -> Option<&'static str>;
-
-    /// How the gateway decides a generation has finished.
-    fn done_signal(&self) -> DoneSignal;
-
-    /// Optional synchronous JS expression to run on the warmed page
-    /// immediately before the prompt is filled in. Used for "New Chat",
-    /// model-picker clicks, etc.
-    ///
-    /// Must be fully synchronous — no Promises, no `setTimeout`. Returns
-    /// ignored; surface errors via `throw new Error(...)`.
-    fn pre_prompt_js(&self) -> Option<&'static str> {
-        None
-    }
 
     /// Whether this adapter can safely accept OpenAI image/file URL content
     /// parts. UI-backed providers must opt in only after their upload flow is
@@ -335,6 +292,50 @@ mod tests {
     use super::*;
     use crate::models::ResponseFormat;
 
+    #[test]
+    fn parse_retry_after_seconds() {
+        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+        assert_eq!(parse_retry_after("Fri, 31 Dec 1999 23:59:59 GMT"), None);
+        assert_eq!(parse_retry_after("abc"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn retry_after_from_map_and_headers() {
+        let mut map = HashMap::new();
+        assert_eq!(retry_after_from_map(&map), None);
+        map.insert("retry-after".to_string(), "45".to_string());
+        assert_eq!(retry_after_from_map(&map), Some(Duration::from_secs(45)));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_from_headers(&headers), None);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("12"),
+        );
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn rate_limit_error_carries_retry_after_header() {
+        let err = GatewayError::ProviderRateLimited {
+            message: "slow down".to_string(),
+            retry_after: Some(Duration::from_secs(30)),
+        };
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn plain_errors_have_no_retry_after() {
+        let err = GatewayError::Provider("boom".to_string());
+        assert_eq!(err.retry_after(), None);
+    }
+
     #[derive(Clone)]
     struct DummyProvider;
 
@@ -358,20 +359,22 @@ mod tests {
 
         fn chat(
             &self,
-            sessions: &SessionManager,
+            _sessions: &SessionManager,
             _state: &AppState,
-            request: ChatCompletionRequest,
+            _request: ChatCompletionRequest,
         ) -> Pin<Box<dyn Future<Output = Result<ChatCompletionResponse, GatewayError>> + Send>> {
-            let sessions = sessions.clone();
-            let provider = self.clone();
-            Box::pin(async move { crate::chat::chat(&sessions, &provider, request).await })
+            Box::pin(async {
+                Err(GatewayError::Internal(
+                    "DummyProvider does not support chat".to_string(),
+                ))
+            })
         }
 
         fn chat_stream(
             &self,
-            sessions: &SessionManager,
+            _sessions: &SessionManager,
             _state: &AppState,
-            request: ChatCompletionRequest,
+            _request: ChatCompletionRequest,
         ) -> Pin<
             Box<
                 dyn Future<
@@ -382,31 +385,11 @@ mod tests {
                     > + Send,
             >,
         > {
-            let sessions = sessions.clone();
-            let provider = self.clone();
-            Box::pin(async move {
-                crate::chat::chat_stream(&sessions, Arc::new(provider), request).await
+            Box::pin(async {
+                Err(GatewayError::Internal(
+                    "DummyProvider does not support streaming".to_string(),
+                ))
             })
-        }
-
-        fn input_selectors(&self) -> &'static [&'static str] {
-            &["textarea"]
-        }
-
-        fn submit_selectors(&self) -> &'static [&'static str] {
-            &["button[type='submit']"]
-        }
-
-        fn response_selector(&self) -> &'static str {
-            ".response"
-        }
-
-        fn thinking_selector(&self) -> Option<&'static str> {
-            None
-        }
-
-        fn done_signal(&self) -> DoneSignal {
-            DoneSignal::TextStable(Duration::from_millis(500))
         }
     }
 
@@ -431,14 +414,7 @@ mod tests {
         let p = DummyProvider;
         assert_eq!(p.name(), "dummy");
         assert_eq!(p.url(), "https://example.com");
-        assert_eq!(p.input_selectors(), &["textarea"]);
-        assert_eq!(p.submit_selectors(), &["button[type='submit']"]);
-        assert_eq!(p.response_selector(), ".response");
-        assert!(p.thinking_selector().is_none());
-        assert!(matches!(
-            p.done_signal(),
-            DoneSignal::TextStable(_) | DoneSignal::SelectorDisappears(_)
-        ));
+        assert!(p.supports_attachments());
     }
 
     #[test]

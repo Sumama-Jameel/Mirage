@@ -7,7 +7,7 @@ use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::error::GatewayError;
@@ -111,15 +111,49 @@ impl ChatGptDirectClient {
                 }
             }
             None => {
-                // Navigation required: page may have been navigated away by another provider
-                // or cookies may be stale. Navigate to chatgpt.com and re-extract token.
+                // The startup cookie snapshot may be stale: NextAuth rotates the
+                // chatgpt.com session cookie on every refresh, and the gateway
+                // only imported it once at boot. Re-snapshot from the live
+                // profile (WAL-aware) so the user's current session is picked
+                // up, then retry the fast path before paying for navigation.
                 info!(
                     session_id = %session.id,
                     model = %model_id,
-                    "ChatGPT token extraction requires browser navigation (cookies stale/missing)"
+                    "ChatGPT cookies stale/missing; re-snapshotting live profile and retrying"
                 );
-                navigate_to_chatgpt(sessions, &session.id).await?;
-                extract_bearer_token(sessions, &session.id, &session.cookie_jar).await?
+                let refreshed = match sessions.refresh_auth().await {
+                    Ok(()) => {
+                        extract_bearer_token_direct(sessions, &session.id, &session.cookie_jar)
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    Err(e) => {
+                        warn!(session_id = %session.id, error = %e, "chatgpt refresh_auth failed; continuing with navigation fallback");
+                        None
+                    }
+                };
+                if let Some(token) = refreshed {
+                    info!(
+                        session_id = %session.id,
+                        model = %model_id,
+                        "ChatGPT token extracted after live profile re-snapshot"
+                    );
+                    AuthData {
+                        access_token: token,
+                        user_agent: session.user_agent.clone(),
+                    }
+                } else {
+                    // Navigation required: page may have been navigated away by another provider
+                    // or cookies may be stale. Navigate to chatgpt.com and re-extract token.
+                    info!(
+                        session_id = %session.id,
+                        model = %model_id,
+                        "ChatGPT token extraction requires browser navigation (cookies stale/missing)"
+                    );
+                    navigate_to_chatgpt(sessions, &session.id).await?;
+                    extract_bearer_token(sessions, &session.id, &session.cookie_jar).await?
+                }
             }
         };
 
@@ -219,7 +253,7 @@ impl ChatGptDirectClient {
         images: Option<&serde_json::Value>,
         messages: &[ChatMessage],
         parent_message_id: &str,
-        for_stream: bool,
+        _for_stream: bool,
         search: Option<bool>,
         request: &ChatCompletionRequest,
     ) -> Result<reqwest::Response, GatewayError> {
@@ -418,6 +452,7 @@ impl ChatGptDirectClient {
     /// Unlike the conversation endpoint, this supports native tool calling
     /// with proper `/message/tool_calls`-style events. Uses the same bearer
     /// token auth as other ChatGPT endpoints.
+    #[allow(dead_code)]
     async fn send_codex_request(
         &self,
         payload: &serde_json::Value,
@@ -486,6 +521,7 @@ impl ChatGptDirectClient {
     ///
     /// Handles both JSON format (non-streaming) and SSE format (streaming).
     /// Returns `(body, conversation_id, message_id, text, thinking, tool_calls)`.
+    #[allow(dead_code)]
     fn parse_codex_response(
         body: &[u8],
     ) -> (
@@ -725,6 +761,7 @@ impl ChatGptDirectClient {
 
     /// Resolve a single image URL to (bytes, filename, mime_type).
     /// Handles both data: URIs and regular HTTP(S) URLs.
+    #[allow(dead_code)]
     async fn resolve_image_url(&self, url: &str) -> Result<(Vec<u8>, String, String), GatewayError> {
         if let Some((bytes, mime)) = decode_data_uri(url) {
             let ext = match mime.as_str() {
@@ -877,7 +914,7 @@ impl ChatGptDirectClient {
         let model_slug = self.internal_model_id.clone();
         self.set_thinking_effort(&model_slug, request.thinking == Some(true)).await;
 
-        let (body, conversation_id, message_id, clean_text, thinking, parsed_tool_calls) =
+        let (_body, conversation_id, message_id, clean_text, thinking, parsed_tool_calls) =
             {
                 let resp = self
                     .send_conversation_request(

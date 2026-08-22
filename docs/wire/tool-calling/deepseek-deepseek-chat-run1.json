@@ -1,0 +1,62 @@
+{
+  "request_body": {
+    "model": "deepseek-chat",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a file called hello.txt with the content Hello, world!"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "write_file",
+          "description": "Write content to a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The filename"
+              },
+              "content": {
+                "type": "string",
+                "description": "The file content"
+              }
+            },
+            "required": [
+              "name",
+              "content"
+            ]
+          }
+        }
+      }
+    ],
+    "stream": false
+  },
+  "http_status": 200,
+  "elapsed_s": 6.8,
+  "response": {
+    "id": "chatcmpl-6bb9b88f-289b-40cb-89c3-f185bd221162",
+    "object": "chat.completion",
+    "created": 1787304581,
+    "model": "deepseek-chat",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "I cannot directly write files to your system, but I can give you the command to create the file.\n\n**On Linux/macOS (terminal):**\n```bash\necho \"Hello, world!\" > hello.txt\n```\n\n**On Windows (Command Prompt):**\n```cmd\necho Hello, world! > hello.txt\n```\n\n**On Windows (PowerShell):**\n```powershell\n\"Hello, world!\" | Out-File hello.txt\n```\n\n**Or if you just need the content to copy manually:**\n```\nHello, world!\n```\n\nLet me know if you need help with a specific operating system or if you meant something else!"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 13,
+      "completion_tokens": 129,
+      "total_tokens": 142
+    },
+    "session_url": "https://chat.deepseek.com/a/chat/s/deepseek_92c23bbe53e349f7911f16b01de992f6"
+  }
+}

@@ -1,23 +1,21 @@
 //! GLM provider for the free `chat.z.ai` web UI.
 //!
-//! The provider prefers Z.AI's internal HTTP API (like DeepSeek/Gemini/ChatGPT)
-//! and falls back to driving the authenticated browser UI only when the direct
-//! path cannot be used: missing token, signature failure, captcha challenge, or
-//! attachment upload failure.
+//! The provider calls Z.AI's internal HTTP API directly from Rust, using the
+//! warmed browser session only for authenticated cookies/localStorage. The
+//! upstream surface is the captured wire protocol documented in
+//! `docs/wire/glm-v2.md` (SSE `chat:completion` events, `/api/v1/files/`
+//! uploads, `/api/v1/chats/new` creation).
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Duration;
 
 use futures::stream::BoxStream;
-use futures::StreamExt;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
-use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
@@ -26,21 +24,17 @@ use self::models::{resolve_model, GlmModelDef};
 use self::state::SessionStore;
 
 mod auth;
-mod captcha;
 mod direct;
-mod humanize;
 mod models;
-mod response;
 mod rpc;
 mod signature;
 mod state;
-mod ui;
 mod upload;
 
 pub use models::to_public_models;
 
-// Re-export UI constants used by the direct path and tests.
-pub(crate) use ui::{CHAT_Z_AI_URL, RESPONSE_SELECTOR, THINKING_SELECTOR};
+// Re-export the web-app URL used by the direct path and tests.
+pub(crate) use self::direct::CHAT_Z_AI_URL;
 
 /// Validate that a remote URL does not point to a private or loopback
 /// network. Shared by the direct upload and UI attachment paths to prevent
@@ -98,9 +92,10 @@ impl GlmProvider {
         }
     }
 
-    /// Try the direct internal-API path. On a recoverable failure, fall back
-    /// to the UI-automation path.
-    async fn run_with_fallback(
+    /// Run a chat completion through the direct internal-API path. Recoverable
+    /// failures surface as directed `DirectError`s; nothing falls back to a
+    /// UI flow (removed in the UI-automation deletion).
+    async fn run_direct(
         &self,
         sessions: &SessionManager,
         state: &AppState,
@@ -108,41 +103,37 @@ impl GlmProvider {
         model: &GlmModelDef,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError> {
-        if !state.config.glm.force_ui {
-            let client = GlmDirectClient::new(
-                sessions,
-                session,
-                self.store.clone(),
-                model,
-                &state.config.glm.sign_secret,
-                &state.config.glm.upstream_url,
-            )
-            .await;
+        let client = GlmDirectClient::new(
+            sessions,
+            session,
+            self.store.clone(),
+            model,
+            &state.config.glm.sign_secret,
+            &state.config.glm.upstream_url,
+            state.config.browser.profile_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
 
-            match client {
-                Ok(client) => match client.chat(request.clone()).await {
-                    Ok(response) => {
-                        info!(model = %model.id, "GLM direct path succeeded");
-                        return Ok(response);
-                    }
-                    Err(DirectError::Fallback(reason)) => {
-                        warn!(reason = %reason, "GLM direct path failed; falling back to UI");
-                    }
-                    Err(DirectError::Fatal(e)) => return Err(e),
-                },
-                Err(DirectError::Fallback(reason)) => {
-                    warn!(reason = %reason, "GLM direct client unavailable; falling back to UI");
+        match client {
+            Ok(client) => match client.chat(request.clone()).await {
+                Ok(response) => {
+                    info!(model = %model.id, "GLM direct path succeeded");
+                    Ok(response)
                 }
-                Err(DirectError::Fatal(e)) => return Err(e),
+                Err(DirectError::Fallback(reason)) => {
+                    Err(GatewayError::Provider(format!("GLM direct path failed: {reason}")))
+                }
+                Err(DirectError::Fatal(e)) => Err(e),
+            },
+            Err(DirectError::Fallback(reason)) => {
+                Err(GatewayError::Provider(format!("GLM direct client unavailable: {reason}")))
             }
+            Err(DirectError::Fatal(e)) => Err(e),
         }
-
-        ui::run_glm_chat(sessions, session, &self.store, model, request).await
     }
 
-    /// Try the direct internal-API streaming path. On a recoverable failure,
-    /// fall back to the UI-automation stream.
-    async fn run_stream_with_fallback(
+    /// Run a streaming completion through the direct internal-API path.
+    async fn run_stream_direct(
         &self,
         sessions: &SessionManager,
         state: &AppState,
@@ -150,39 +141,33 @@ impl GlmProvider {
         model: &GlmModelDef,
         request: ChatCompletionRequest,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, GatewayError>>, GatewayError> {
-        if !state.config.glm.force_ui {
-            let client = GlmDirectClient::new(
-                sessions,
-                session,
-                self.store.clone(),
-                model,
-                &state.config.glm.sign_secret,
-                &state.config.glm.upstream_url,
-            )
-            .await;
+        let client = GlmDirectClient::new(
+            sessions,
+            session,
+            self.store.clone(),
+            model,
+            &state.config.glm.sign_secret,
+            &state.config.glm.upstream_url,
+            state.config.browser.profile_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
 
-            match client {
-                Ok(client) => match client.chat_stream(request.clone()).await {
-                    Ok(stream) => {
-                        info!(model = %model.id, "GLM direct streaming path succeeded");
-                        return Ok(stream);
-                    }
-                    Err(DirectError::Fallback(reason)) => {
-                        warn!(reason = %reason, "GLM direct stream failed; falling back to UI");
-                    }
-                    Err(DirectError::Fatal(e)) => return Err(e),
-                },
-                Err(DirectError::Fallback(reason)) => {
-                    warn!(reason = %reason, "GLM direct client unavailable; falling back to UI");
+        match client {
+            Ok(client) => match client.chat_stream(request.clone()).await {
+                Ok(stream) => {
+                    info!(model = %model.id, "GLM direct streaming path succeeded");
+                    Ok(stream)
                 }
-                Err(DirectError::Fatal(e)) => return Err(e),
-            }
+                Err(DirectError::Fallback(reason)) => Err(GatewayError::Provider(format!(
+                    "GLM direct stream failed: {reason}"
+                ))),
+                Err(DirectError::Fatal(e)) => Err(e),
+            },
+            Err(DirectError::Fallback(reason)) => Err(GatewayError::Provider(format!(
+                "GLM direct client unavailable: {reason}"
+            ))),
+            Err(DirectError::Fatal(e)) => Err(e),
         }
-
-        let sessions_for_stream = sessions.clone();
-        let session_id = session.id.clone();
-        let stream = ui::run_glm_chat_stream(sessions, session, &self.store, model, request).await?;
-        Ok(SessionGuardStream::new(stream, sessions_for_stream, session_id).boxed())
     }
 }
 
@@ -205,9 +190,6 @@ impl Provider for GlmProvider {
         to_public_models()
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn chat(
         &self,
@@ -226,7 +208,7 @@ impl Provider for GlmProvider {
             let session = sessions.acquire().await?;
             let session_clone = session.clone();
 
-            let result = provider.run_with_fallback(&sessions, &state, &session, &model, request).await;
+            let result = provider.run_direct(&sessions, &state, &session, &model, request).await;
             let _ = sessions.release(session_clone.id, false).await;
             result
         })
@@ -260,7 +242,7 @@ impl Provider for GlmProvider {
             let sessions_for_release = sessions.clone();
 
             let result = provider
-                .run_stream_with_fallback(&sessions, &state, &session, &model, request)
+                .run_stream_direct(&sessions, &state, &session, &model, request)
                 .await;
 
             match result {
@@ -273,34 +255,10 @@ impl Provider for GlmProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &[
-            "textarea[placeholder*='Ask' i]",
-            "textarea[placeholder*='Message' i]",
-            "textarea[placeholder*='message' i]",
-            "[contenteditable='true'][role='textbox']",
-            "textarea",
-        ]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &[
-            "button[aria-label*='send' i]",
-            "button[type='submit']",
-        ]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        RESPONSE_SELECTOR
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        Some(THINKING_SELECTOR)
-    }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(Duration::from_millis(2000))
-    }
 
     fn supports_attachments(&self) -> bool {
         true
@@ -366,7 +324,7 @@ mod tests {
         assert_eq!(p.name(), "glm");
         assert_eq!(p.url(), "https://chat.z.ai");
         assert!(p.models().iter().any(|m| m.id == "glm-5.2"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+
     }
 
     #[test]

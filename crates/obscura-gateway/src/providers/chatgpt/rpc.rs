@@ -364,6 +364,7 @@ fn extract_citations_from_sse(
 /// This endpoint supports native tool calling (unlike the conversation
 /// endpoint which only handles server-side tools). Uses OpenAI's
 /// Responses API format internally.
+#[allow(dead_code)]
 pub fn build_codex_responses_payload(
     messages: &[ChatMessage],
     model_id: &str,
@@ -417,6 +418,7 @@ pub fn build_codex_responses_payload(
 /// - `response.completed` → response finished
 ///
 /// Returns `(text_delta, thinking_delta, tool_calls_json)`.
+#[allow(dead_code)]
 pub fn parse_codex_sse_line(
     line: &str,
 ) -> Option<(
@@ -829,7 +831,7 @@ mod tests {
         let line = r#"data: {"p": "/message/tool_calls", "v": []}"#;
         let result = parse_sse_line(line, "");
         assert!(result.is_some());
-        let (content, citations, _conv_id, _msg_id, _thinking, tool_calls) = result.unwrap();
+        let (content, _citations, _conv_id, _msg_id, _thinking, tool_calls) = result.unwrap();
         assert!(content.is_none());
         assert!(tool_calls.is_none());
     }

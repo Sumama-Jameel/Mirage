@@ -30,10 +30,18 @@ not from memory.
 | metaai      | meta.ai cookies + ecto1 token           | `Auth` (401)                  | yes      |
 | minimax     | localStorage `_token` JWT / env         | `Auth` (401)                  | yes      |
 | mimo        | xiaomimimo.com cookies (`serviceToken`, `userId`, `xiaomichatbot_ph`) | `Auth` (401) | yes      |
+| mistral     | chat.mistral.ai / mistral.ai cookies (`mistral-chat-session`/`anonymous-id`) | `Auth` (401) | yes |
 | qwen        | localStorage `token` JWT                | `Auth` (401)                  | yes      |
 
-Status: all 11 providers fail closed with 401 on missing credentials. None has
+Status: all 12 providers fail closed with 401 on missing credentials. None has
 an anonymous/guest path.
+
+The exact probe tables (cookie names, domains, localStorage origins, and the
+`MINIMAX_JWT` env fallback) are codified in
+`providers/authcheck.rs` (`AuthProbe::probes`) and are enforced at request
+time by the pre-flight check in `api/mod.rs::chat_completions` (step 3 of the
+guard pipeline; see `docs/InitialPlan-infra.md`). Providers without a probe
+are not gated.
 
 ## Native feature matrix
 
@@ -52,6 +60,7 @@ Legend: Y = native in the background API, N = not supported (fails closed in
 | metaai    | Y (in-stream XML tool-call stripping) | Y | N (fail closed) | Y | Y | Y                                |
 | minimax   | Y                   | Y         | Y (platform API key) | Y        | Y                     | Y                                    |
 | mimo      | Y (XML fallback; web endpoint has no native function channel) | Y | Y | Y | Y (webSearchStatus) | Y   |
+| mistral   | Y (native `delta.tool_calls` in Le Chat SSE) | Y | Y | - | - | Y |
 | qwen      | Y                   | Y         | Y           | -               | -                     | Y                                    |
 
 Notes:
@@ -79,8 +88,10 @@ Notes:
 - [ ] Grok: confirm research/deep-research toggle exists in current REST API
       (needs live capture; do not guess).
 - [ ] Qwen: confirm thinking toggle + search native fields (needs live capture).
-- [ ] Mistral web UI provider — WillAddLater. Must use native auth + cookies
-      + session continuation; research its internal API before implementing.
+- [x] Mistral web UI provider now ships; it runs direct (`chat.mistral.ai`
+      Le Chat protocol), uses native cookies + session continuation, and is
+      rate-limited conservatively (rpm 10, concurrency 2, 120 s 429 cooldown)
+      because the upstream throttles burst traffic.
 
 ## Re-verification procedure
 

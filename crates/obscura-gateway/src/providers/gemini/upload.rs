@@ -77,6 +77,7 @@ fn upload_headers() -> Result<HeaderMap, GatewayError> {
 /// The MIME type (e.g. `image/png`) is sent as `X-Goog-Upload-Header-Content-Type`
 /// during the start phase so the storage backend tags the file correctly.
 /// Returns a pair of `(file_url, file_name)`.
+#[allow(dead_code)]
 async fn upload_single_file(
     http: &reqwest::Client,
     data: &[u8],
@@ -299,6 +300,7 @@ pub fn decode_data_uri(uri: &str) -> Option<(Vec<u8>, String)> {
 ///
 /// Validates the URL against private network ranges to prevent SSRF attacks
 /// before making any HTTP request.
+#[allow(dead_code)]
 pub async fn download_file(
     http: &reqwest::Client,
     url: &str,
@@ -347,7 +349,7 @@ pub async fn download_file(
 /// Prevents SSRF attacks by blocking requests to loopback, RFC1918 private
 /// addresses, and link-local addresses. Can be overridden with the
 /// `OBSCURA_ALLOW_PRIVATE_NETWORK` environment variable for local testing.
-fn validate_remote_url(url: &Url) -> Result<(), GatewayError> {
+pub(crate) fn validate_remote_url(url: &Url) -> Result<(), GatewayError> {
     if std::env::var("OBSCURA_ALLOW_PRIVATE_NETWORK").is_ok() {
         return Ok(());
     }

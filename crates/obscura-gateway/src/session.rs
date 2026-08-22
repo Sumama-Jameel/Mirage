@@ -22,23 +22,23 @@ const POOL_SIZE_ENV_VAR: &str = "OBSCURA_POOL_SIZE";
 /// gateway configuration and the user's installed Firefox version.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct BrowserIdentity {
+pub struct BrowserIdentity {
     /// "firefox" or "chrome".
-    identity: String,
+    pub identity: String,
     /// Full User-Agent string.
-    user_agent: String,
+    pub user_agent: String,
     /// `navigator.platform` value.
-    platform: String,
+    pub platform: String,
     /// `navigator.userAgentData.getHighEntropyValues("platform")` value.
-    ua_platform: String,
+    pub ua_platform: String,
     /// `navigator.userAgentData.getHighEntropyValues("platformVersion")` value.
-    ua_platform_version: String,
+    pub ua_platform_version: String,
 }
 
 impl BrowserIdentity {
     /// Build a browser identity from the detected browser source and gateway
     /// configuration.
-    fn from_auth(source: &crate::browser::BrowserSource, config: &Config) -> Self {
+    pub fn from_auth(source: &crate::browser::BrowserSource, config: &Config) -> Self {
         if let Some(ref ua) = config.browser.user_agent_override {
             return Self::from_user_agent(ua);
         }
@@ -150,56 +150,7 @@ enum SessionState {
     Failed,
 }
 
-/// Result of an `extract_texts` command: the visible text of two subtrees.
-#[derive(Debug, Clone, Default)]
-pub struct ExtractedTexts {
-    pub response: String,
-    pub thinking: String,
-}
 
-/// A captured JS response. Used by UI providers to read structured backend
-/// payloads (e.g. chat.z.ai SSE streams) without re-implementing captcha
-/// solvers or request signing.
-#[derive(Debug, Clone)]
-pub struct CapturedResponse {
-    pub url: String,
-    /// HTTP status code. Providers may use this to distinguish success from
-    /// failure.
-    #[allow(dead_code)]
-    pub status: u16,
-    /// Response headers. Providers may use these for content-type checks.
-    #[allow(dead_code)]
-    pub headers: std::collections::HashMap<String, String>,
-    pub body: Vec<u8>,
-}
-
-/// Mutable capture state shared between the provider and the session thread's
-/// `on_response` callback.
-#[derive(Debug, Default)]
-struct ActiveCapture {
-    /// When `Some`, the callback stores responses whose URL contains this
-    /// substring.
-    pattern: Option<String>,
-    /// Responses captured while the pattern is active.
-    responses: Vec<CapturedResponse>,
-}
-
-/// Handle returned by [`SessionManager::start_capture`]. Dropping it does *not*
-/// stop the capture; call [`SessionManager::stop_capture`] explicitly.
-#[derive(Clone, Debug)]
-pub struct CaptureHandle {
-    state: Arc<Mutex<ActiveCapture>>,
-}
-
-impl CaptureHandle {
-    /// Take all responses captured so far, leaving the capture active.
-    pub async fn take_responses(&self) -> Vec<CapturedResponse> {
-        let mut guard = self.state.lock().await;
-        std::mem::take(&mut guard.responses)
-    }
-}
-
-/// Manager for the Obscura browser context pool.
 ///
 /// Each warmed session lives on its own dedicated OS thread with its own V8
 /// isolate. This keeps V8's "one isolate per thread" invariant satisfied even
@@ -209,6 +160,9 @@ impl CaptureHandle {
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, SessionThread>>>,
     auth: Arc<Mutex<Option<(Vec<CookieInfo>, Vec<LocalStorageEntry>, BrowserIdentity)>>>,
+    /// Import options retained so auth can be re-snapshotted from the live
+    /// browser profile on demand (e.g. when a provider session expires).
+    import_options: crate::browser::ImportOptions,
     /// Total number of sessions the pool should hold (warm or on-demand).
     pool_size: usize,
     /// Number of session threads currently alive, including those being
@@ -216,6 +170,11 @@ pub struct SessionManager {
     /// exceeds `pool_size`.
     alive: Arc<AtomicUsize>,
 }
+
+// The imported profile is a DeepSeek one, so every pooled session warms to
+// the DeepSeek chat. Rewarms navigate to the same origin to refresh cookies
+// and anti-bot state.
+const SESSION_HOME_URL: &str = "https://chat.deepseek.com";
 
 impl SessionManager {
     /// Build an empty `SessionManager` with no warmed sessions.
@@ -228,6 +187,7 @@ impl SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             auth: Arc::new(Mutex::new(None)),
+            import_options: crate::browser::ImportOptions::default(),
             pool_size: 0,
             alive: Arc::new(AtomicUsize::new(0)),
         }
@@ -247,7 +207,36 @@ impl SessionManager {
     pub async fn spawn(config: &Config) -> Result<Self, GatewayError> {
         let import_options = config.browser.import_options();
 
-        let auth = browser::import_auth(&import_options)?;
+        // The vault mirrors the imported session state on disk (encrypted).
+        // It is a recovery source, never a reason to fail startup: restore
+        // only when the browser import comes back empty.
+        let vault_dir = config.data_dir.clone().unwrap_or_else(|| {
+            dirs::data_dir()
+                .map(|d| d.join("obscura-gateway"))
+                .unwrap_or_else(|| std::env::temp_dir().join("obscura-gateway"))
+        });
+        let vault = crate::vault::VaultFile::new(vault_dir);
+
+        let mut auth = browser::import_auth(&import_options)?;
+        if auth.cookies.is_empty() && auth.local_storage.is_empty() {
+            match vault.load() {
+                Ok(Some(restored)) => {
+                    info!(
+                        cookies = restored.cookie_jar.len(),
+                        saved_at_utc = restored.saved_at_utc,
+                        "Browser import was empty; restored session state from encrypted vault"
+                    );
+                    auth.cookies = restored.cookie_jar;
+                    auth.local_storage = restored.local_storage;
+                }
+                Ok(None) => {
+                    warn!("Browser import was empty and no vault exists; sessions will be unauthenticated");
+                }
+                Err(e) => {
+                    warn!(error = %e, "Vault restore skipped (corrupt or wrong key)");
+                }
+            }
+        }
         let cookies = auth.cookies;
         let local_storage = auth.local_storage;
         let identity = BrowserIdentity::from_auth(&auth.source, config);
@@ -260,6 +249,24 @@ impl SessionManager {
             profile = %auth.source.profile_path.display(),
             "Imported DeepSeek session state for sessions"
         );
+
+        // Persist the fresh import to the vault in the background; a failed
+        // save must not block startup or poison anything.
+        {
+            let vault = vault;
+            let state = crate::vault::SessionVault::from_import(
+                cookies.clone(),
+                local_storage.clone(),
+                &identity.identity,
+                &identity.user_agent,
+                vec!["vault:v1".to_string()],
+            );
+            tokio::spawn(async move {
+                if let Err(e) = vault.save(&state) {
+                    warn!(error = %e, "Failed to persist session vault (continuing without it)");
+                }
+            });
+        }
 
         let pool_size = std::env::var(POOL_SIZE_ENV_VAR)
             .ok()
@@ -283,6 +290,7 @@ impl SessionManager {
         let manager = Self {
             sessions: sessions.clone(),
             auth: auth.clone(),
+            import_options: import_options.clone(),
             pool_size,
             alive: alive.clone(),
         };
@@ -362,75 +370,89 @@ impl SessionManager {
         Self::background_recovery_loop(sessions_for_recovery).await;
     }
 
-    /// Background task that recovers Dirty sessions by rewarming them.
-    ///
-    /// Runs continuously with the following behavior:
-    /// - Polls every 5 seconds for Dirty sessions
-    /// - Attempts to rewarm each Dirty session (page reload, refresh cookies)
-    /// - Transitions Dirty → Ready on success
-    /// - Logs warnings for persistent failures
-    ///
-    /// This prevents permanent session pool leaks when transient errors
-    /// (network timeout, Cloudflare challenge, etc.) mark sessions as Dirty.
-    async fn background_recovery_loop(sessions: Arc<Mutex<HashMap<String, SessionThread>>>) {
-        let recovery_interval = Duration::from_secs(5);
-        let mut interval = tokio::time::interval(recovery_interval);
+/// Background task that recovers Dirty sessions by rewarming them.
+///
+/// Runs continuously with the following behavior:
+/// - Polls every 5 seconds for Dirty sessions
+/// - Sends each Dirty session a `ReWarm` command (a real navigation back to
+///   the session home page, refreshing cookies and anti-bot state)
+/// - Transitions Dirty → Ready only when the rewarm navigation succeeds
+/// - Logs warnings for persistent failures and retries on the next tick
+///
+/// This prevents permanent session pool leaks when transient errors
+/// (network timeout, Cloudflare challenge, etc.) mark sessions as Dirty.
+async fn background_recovery_loop(sessions: Arc<Mutex<HashMap<String, SessionThread>>>) {
+    let recovery_interval = Duration::from_secs(5);
+    let mut interval = tokio::time::interval(recovery_interval);
 
-        loop {
-            interval.tick().await;
+    loop {
+        interval.tick().await;
 
-            let mut dirty_sessions = Vec::new();
-            {
-                let guard = sessions.lock().await;
-                for (id, session) in guard.iter() {
-                    let state = session.state.lock().await;
-                    if *state == SessionState::Dirty {
-                        dirty_sessions.push(id.clone());
-                    }
+        let mut dirty_sessions = Vec::new();
+        {
+            let guard = sessions.lock().await;
+            for (id, session) in guard.iter() {
+                let state = session.state.lock().await;
+                if *state == SessionState::Dirty {
+                    dirty_sessions.push(id.clone());
                 }
             }
+        }
 
-            // Attempt to recover each Dirty session
-            for session_id in dirty_sessions {
-                let should_rewarm = {
-                    let guard = sessions.lock().await;
-                    if let Some(session) = guard.get(&session_id) {
+        // Drive a real rewarm per Dirty session; hold the session in
+        // Warming while the navigation runs so acquire() skips it.
+        for session_id in dirty_sessions {
+            let cmd_tx = {
+                let guard = sessions.lock().await;
+                match guard.get(&session_id) {
+                    Some(session) => {
                         let mut state = session.state.lock().await;
-
-                        // Only attempt rewarm if still Dirty
-                        if *state == SessionState::Dirty {
-                            *state = SessionState::Warming;
-                            true
-                        } else {
-                            false
+                        if *state != SessionState::Dirty {
+                            continue;
                         }
-                    } else {
-                        false
+                        *state = SessionState::Warming;
+                        session.cmd_tx.clone()
                     }
-                };
+                    None => continue,
+                }
+            };
 
-                if should_rewarm {
-                    // Attempt rewarming (simplified: just reset to Ready)
-                    // In a real implementation, this would navigate the page or refresh cookies
-                    let guard = sessions.lock().await;
-                    if let Some(session) = guard.get(&session_id) {
-                        let mut state = session.state.lock().await;
+            let (tx, rx) = oneshot::channel();
+            let command_sent = cmd_tx.send(SessionCommand::ReWarm { resp: tx }).is_ok();
+            let result = if command_sent {
+                tokio::time::timeout(Duration::from_secs(30), rx)
+                    .await
+                    .map_err(|_| GatewayError::Internal("rewarm timed out".to_string()))
+                    .and_then(|r| {
+                        r.map_err(|_| GatewayError::Internal("session thread dropped".to_string()))
+                    })
+                    .and_then(|r| r)
+            } else {
+                Err(GatewayError::Internal(
+                    "session thread closed during rewarm".to_string(),
+                ))
+            };
+
+            {
+                let guard = sessions.lock().await;
+                let Some(session) = guard.get(&session_id) else {
+                    continue;
+                };
+                let mut state = session.state.lock().await;
+                match result {
+                    Ok(()) => {
                         *state = SessionState::Ready;
-                        info!(session_id = %session_id, "Recovered Dirty session → Ready");
+                        info!(session_id = %session_id, "Recovered Dirty session via rewarm → Ready");
+                    }
+                    Err(e) => {
+                        *state = SessionState::Dirty;
+                        warn!(session_id = %session_id, error = %e, "Rewarm failed; will retry");
                     }
                 }
             }
         }
     }
-
-    /// Attempt to rewarm a session by navigating to a provider URL.
-    /// Returns Ok(()) if successful, Err if rewarming failed.
-    async fn attempt_rewarm(session_handle: &SessionHandle, session_id: &str) -> Result<(), String> {
-        // Send a rewarm command to the session thread
-        // The session thread will navigate to deepseek.com and refresh cookies
-        // This is a best-effort recovery; if it fails, we'll retry on the next interval
-        Ok(())
-    }
+}
 
     /// Acquire a ready browser context.
     ///
@@ -523,6 +545,45 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Re-import auth from the live browser profile and push fresh cookies
+    /// into every live session's cookie jar.
+    ///
+    /// The gateway snapshots the profile once at startup; a provider session
+    /// can expire afterwards (NextAuth rotates chatgpt.com cookies on every
+    /// refresh, and Firefox flushes them to disk lazily). When a provider
+    /// reports an expired/unrefreshable token, callers use this to pick up the
+    /// user's current session instead of failing with the stale startup copy.
+    pub async fn refresh_auth(&self) -> Result<(), GatewayError> {
+        let auth = crate::browser::import_auth(&self.import_options)?;
+        let cookies = auth.cookies;
+        let local_storage = auth.local_storage;
+        // Preserve the identity (UA, platform) from the startup import; only
+        // cookies and localStorage rotate at runtime.
+        let identity = {
+            let guard = self.auth.lock().await;
+            guard
+                .as_ref()
+                .map(|(_, _, i)| i.clone())
+                .unwrap_or_else(|| BrowserIdentity::from_auth(&auth.source, &crate::config::Config::default()))
+        };
+        {
+            let mut guard = self.auth.lock().await;
+            *guard = Some((cookies.clone(), local_storage.clone(), identity));
+        }
+        // Push fresh cookies into live sessions' jars so direct API calls use
+        // the current session, not the startup snapshot.
+        let sessions = self.sessions.lock().await;
+        let mut pushed = 0usize;
+        for session in sessions.values() {
+            let jar = session.cookie_jar.clone();
+            jar.clear();
+            jar.set_cookies_from_cdp(cookies.clone());
+            pushed += 1;
+        }
+        info!(cookies = cookies.len(), sessions = pushed, "Re-imported auth from live browser profile");
+        Ok(())
+    }
+
     /// Re-warm a single context to refresh cookies and anti-bot state.
     #[allow(dead_code)]
     pub async fn rewarm(&self, session_id: String) -> Result<(), GatewayError> {
@@ -560,61 +621,23 @@ impl SessionManager {
         .await
     }
 
-    /// Extract the visible text of the response and (optionally) thinking
-    /// subtrees in a single round-trip to the session thread.
-    ///
-    /// Hidden subtrees are skipped, and skippable roles (buttons, images,
-    /// form controls, decorative elements) are filtered out. Used by
-    /// [`crate::chat`] to poll for streaming text growth.
-    pub async fn extract_texts(
-        &self,
-        session_id: &str,
-        response_selector: &str,
-        thinking_selector: Option<&str>,
-    ) -> Result<ExtractedTexts, GatewayError> {
-        self.send_command(session_id, |resp| SessionCommand::ExtractTexts {
-            response_selector: response_selector.to_string(),
-            thinking_selector: thinking_selector.map(|s| s.to_string()),
-            resp,
+    /// Clone of the imported profile snapshot (cookies + localStorage) used
+    /// by the auth pre-flight check. `None` when no profile was imported.
+    pub async fn imported_snapshot(&self) -> Option<crate::providers::authcheck::ImportedSnapshot> {
+        let guard = self.auth.lock().await;
+        guard.as_ref().map(|(cookies, local_storage, _identity)| {
+            crate::providers::authcheck::ImportedSnapshot {
+                cookie_jar: {
+                    let jar = obscura_net::CookieJar::new();
+                    jar.set_cookies_from_cdp(cookies.clone());
+                    jar
+                },
+                local_storage: local_storage.clone(),
+            }
         })
-        .await
     }
 
-    /// Returns `true` if `selector` matches a visible element on the page.
-    ///
-    /// Used to drive [`crate::providers::DoneSignal::SelectorDisappears`]:
-    /// poll this each tick; when it transitions from true to false the
-    /// stream is considered complete.
-    #[allow(dead_code)]
-    pub async fn is_visible(&self, session_id: &str, selector: &str) -> Result<bool, GatewayError> {
-        self.send_command(session_id, |resp| SessionCommand::IsVisible {
-            selector: selector.to_string(),
-            resp,
-        })
-        .await
-    }
 
-    /// Remove all preload scripts from the page.
-    pub async fn clear_preload_scripts(&self, session_id: &str) -> Result<(), GatewayError> {
-        self.send_command(session_id, |resp| SessionCommand::ClearPreloadScripts { resp })
-            .await
-    }
-
-    /// Add a script that runs before any page scripts on the next navigation.
-    /// Takes effect only on the subsequent [`SessionManager::navigate`] call.
-    pub async fn add_preload_script(
-        &self,
-        session_id: &str,
-        script: &str,
-    ) -> Result<(), GatewayError> {
-        self.send_command(session_id, |resp| SessionCommand::AddPreloadScript {
-            script: script.to_string(),
-            resp,
-        })
-        .await
-    }
-
-    /// Navigate the session's page to a new URL.
     ///
     /// Used by providers (e.g. Gemini) that need the warm page to be at a
     /// specific URL to extract CSRF tokens and other auth state.
@@ -643,41 +666,8 @@ impl SessionManager {
         .await
     }
 
-    /// Start capturing JS responses whose URL contains `url_pattern`.
-    ///
-    /// Returns a handle that can be polled with [`CaptureHandle::take_responses`].
-    /// Captures are per-session and replace any previous active capture.
-    pub async fn start_capture(
-        &self,
-        session_id: &str,
-        url_pattern: &str,
-    ) -> Result<CaptureHandle, GatewayError> {
-        self.send_command(session_id, |resp| SessionCommand::StartCapture {
-            url_pattern: url_pattern.to_string(),
-            resp,
-        })
-        .await
-    }
 
-    /// Stop capturing and return all responses collected since start.
-    pub async fn stop_capture(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<CapturedResponse>, GatewayError> {
-        self.send_command(session_id, |resp| SessionCommand::StopCapture { resp }).await
-    }
-
-    /// Read the captcha-open response body captured by the `on_response`
-    /// callback. Returns `None` if no captcha response has been captured yet.
-    /// The body is consumed on read (take).
-    pub async fn get_captcha_response_body(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<Vec<u8>>, GatewayError> {
-        self.send_command(session_id, |resp| SessionCommand::GetCaptchaResponseBody { resp }).await
-    }
-
-    /// Pump the Deno event loop so pending async ops (in-page fetch) complete.
+    #[allow(dead_code)]
     pub async fn pump_event_loop(
         &self,
         session_id: &str,
@@ -693,6 +683,7 @@ impl SessionManager {
         Self {
             sessions,
             auth: Arc::new(Mutex::new(None)),
+            import_options: crate::browser::ImportOptions::default(),
             pool_size: 0,
             alive: Arc::new(AtomicUsize::new(0)),
         }
@@ -738,48 +729,18 @@ enum SessionCommand {
         expression: String,
         resp: oneshot::Sender<Result<serde_json::Value, GatewayError>>,
     },
-    AddPreloadScript {
-        script: String,
-        resp: oneshot::Sender<Result<(), GatewayError>>,
-    },
-    /// Remove all preload scripts from the page.
-    ClearPreloadScripts {
-        resp: oneshot::Sender<Result<(), GatewayError>>,
-    },
     #[allow(dead_code)]
     ExecuteJsAsync {
         expression: String,
         resp: oneshot::Sender<Result<serde_json::Value, GatewayError>>,
     },
-    /// Extract the visible text of two subtrees (response + thinking) in
-    /// one round-trip to the session thread.
-    ExtractTexts {
-        response_selector: String,
-        thinking_selector: Option<String>,
-        resp: oneshot::Sender<Result<ExtractedTexts, GatewayError>>,
-    },
-    /// Returns true when the selector matches a visible element on the page.
-    /// Used by [`crate::chat`] to drive [`crate::providers::DoneSignal::SelectorDisappears`].
-    IsVisible {
-        selector: String,
-        resp: oneshot::Sender<Result<bool, GatewayError>>,
-    },
     Navigate {
         url: String,
         resp: oneshot::Sender<Result<(), GatewayError>>,
     },
-    StartCapture {
-        url_pattern: String,
-        resp: oneshot::Sender<Result<CaptureHandle, GatewayError>>,
-    },
-    StopCapture {
-        resp: oneshot::Sender<Result<Vec<CapturedResponse>, GatewayError>>,
-    },
-    GetCaptchaResponseBody {
-        resp: oneshot::Sender<Result<Option<Vec<u8>>, GatewayError>>,
-    },
     /// Pump the Deno event loop for `duration_ms` so pending async ops
     /// (in-page fetch/XHR) can complete.
+    #[allow(dead_code)]
     PumpEventLoop {
         duration_ms: u64,
         resp: oneshot::Sender<Result<(), GatewayError>>,
@@ -805,16 +766,6 @@ struct SessionThread {
     cookie_jar: Arc<CookieJar>,
     local_storage: Vec<LocalStorageEntry>,
     user_agent: String,
-    /// Shared capture state. Stored here so the session can expose it via
-    /// commands; the command loop reaches it through the captured closure
-    /// in `spawn`, not through `self`.
-    #[allow(dead_code)]
-    capture: Arc<Mutex<ActiveCapture>>,
-    /// Lock-free storage for captcha-open response body, populated by the
-    /// `on_response` callback and read by providers. Uses std::sync::Mutex
-    /// so the sync callback never misses writes.
-    #[allow(dead_code)]
-    captcha_response_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
 impl SessionThread {
@@ -829,10 +780,6 @@ impl SessionThread {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
         let state = Arc::new(Mutex::new(SessionState::Warming));
         let state_for_thread = state.clone();
-        let capture = Arc::new(Mutex::new(ActiveCapture::default()));
-        let capture_for_thread = capture.clone();
-        let captcha_response_body: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Default::default();
-        let captcha_body_for_thread = captcha_response_body.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
         let id_for_thread = id.clone();
         let identity_for_thread = identity.clone();
@@ -849,7 +796,7 @@ impl SessionThread {
                     // Each session owns its Page on its own thread. Build it here
                     // so the !Send ObscuraJsRuntime never crosses thread boundaries.
                     let warm_result =
-                        Self::warm(&id_for_thread, cookies, &local_storage, &identity_for_thread, capture_for_thread.clone(), captcha_body_for_thread.clone())
+                        Self::warm(&id_for_thread, cookies, &local_storage, &identity_for_thread)
                             .await;
 
                     match warm_result {
@@ -866,7 +813,7 @@ impl SessionThread {
                                 .run_until(async {
                                     while let Some(cmd) = cmd_rx.recv().await {
                                         let result =
-                                            Self::handle_command(cmd, &mut page, &state_for_thread, &capture_for_thread, &captcha_body_for_thread)
+                                            Self::handle_command(cmd, &mut page, &state_for_thread)
                                                 .await;
                                         if result == ControlFlow::Break {
                                             break;
@@ -896,8 +843,6 @@ impl SessionThread {
             cookie_jar,
             local_storage,
             user_agent,
-            capture,
-            captcha_response_body,
         })
     }
 
@@ -908,8 +853,6 @@ impl SessionThread {
         cookies: Vec<CookieInfo>,
         local_storage: &[LocalStorageEntry],
         identity: &BrowserIdentity,
-        capture: Arc<Mutex<ActiveCapture>>,
-        captcha_response_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     ) -> Result<(Page, Arc<CookieJar>), GatewayError> {
         let temp_dir = tempfile::tempdir().map_err(|e| {
             GatewayError::Internal(format!("failed to create temp profile: {e}"))
@@ -939,36 +882,8 @@ impl SessionThread {
                 info!(url = %req.url, method = %req.method, "JS request");
             }
         }));
-        let captcha_body = captcha_response_body.clone();
-        page.on_response(Arc::new(move |req: &RequestInfo, resp: &Response| {
+        page.on_response(Arc::new(|req: &RequestInfo, resp: &Response| {
             info!(url = %req.url, status = %resp.status, "JS response");
-            // Store matching responses for provider capture. The callback is
-            // synchronous, so use try_lock to avoid blocking the network thread.
-            if let Ok(mut guard) = capture.try_lock() {
-                if let Some(ref pattern) = guard.pattern {
-                    if req.url.as_str().contains(pattern) {
-                        guard.responses.push(CapturedResponse {
-                            url: req.url.to_string(),
-                            status: resp.status,
-                            headers: resp
-                                .headers
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect(),
-                            body: resp.body.clone(),
-                        });
-                    }
-                }
-            }
-            // Always capture captcha-open and chat API response bodies
-            // (lock-free store, populated by op_fetch_url's Rust callback).
-            if req.url.as_str().contains("captcha-open.aliyuncs.com")
-                || req.url.as_str().contains("/api/v2/chat/completions")
-            {
-                if let Ok(mut guard) = captcha_body.try_lock() {
-                    guard.replace(resp.body.clone());
-                }
-            }
         }));
 
         // Inject localStorage as a preload script so DeepSeek's auth check sees
@@ -976,7 +891,7 @@ impl SessionThread {
         // is too late: the page may already have redirected to /sign_in.
         page.add_preload_script(&local_storage_preload_script(local_storage));
 
-        page.navigate("https://chat.deepseek.com")
+        page.navigate(SESSION_HOME_URL)
             .await
             .map_err(|e| GatewayError::Provider(format!("failed to warm DeepSeek page: {e}")))?;
 
@@ -994,8 +909,6 @@ impl SessionThread {
         cmd: SessionCommand,
         page: &mut Page,
         state: &Arc<Mutex<SessionState>>,
-        capture: &Arc<Mutex<ActiveCapture>>,
-        captcha_body: &Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     ) -> ControlFlow {
         match cmd {
             SessionCommand::ExecuteJs { expression, resp } => {
@@ -1011,26 +924,6 @@ impl SessionThread {
                 ));
                 let _ = resp.send(result);
             }
-            SessionCommand::ExtractTexts {
-                response_selector,
-                thinking_selector,
-                resp,
-            } => {
-                let result = extract_texts(page, &response_selector, thinking_selector.as_deref());
-                let _ = resp.send(result);
-            }
-            SessionCommand::IsVisible { selector, resp } => {
-                let result = is_visible(page, &selector);
-                let _ = resp.send(result);
-            }
-            SessionCommand::AddPreloadScript { script, resp } => {
-                page.add_preload_script(&script);
-                let _ = resp.send(Ok(()));
-            }
-            SessionCommand::ClearPreloadScripts { resp } => {
-                page.set_preload_scripts(Vec::new());
-                let _ = resp.send(Ok(()));
-            }
             SessionCommand::Navigate { url, resp } => {
                 tracing::info!(url = %url, "Navigating session");
                 let result = page
@@ -1039,25 +932,10 @@ impl SessionThread {
                     .map_err(|e| GatewayError::Provider(format!("navigation to {url} failed: {e}")));
                 let _ = resp.send(result);
             }
-            SessionCommand::StartCapture { url_pattern, resp } => {
-                let mut guard = capture.lock().await;
-                guard.pattern = Some(url_pattern);
-                guard.responses.clear();
-                let handle = CaptureHandle {
-                    state: capture.clone(),
-                };
-                let _ = resp.send(Ok(handle));
-            }
-            SessionCommand::StopCapture { resp } => {
-                let mut guard = capture.lock().await;
-                let responses = std::mem::take(&mut guard.responses);
-                guard.pattern = None;
-                let _ = resp.send(Ok(responses));
-            }
             SessionCommand::ReWarm { resp } => {
                 *state.lock().await = SessionState::Warming;
                 let result = page
-                    .navigate("https://chat.deepseek.com")
+                    .navigate(SESSION_HOME_URL)
                     .await
                     .map_err(|e| GatewayError::Provider(format!("failed to re-warm session: {e}")));
                 *state.lock().await = if result.is_ok() {
@@ -1066,10 +944,6 @@ impl SessionThread {
                     SessionState::Dirty
                 };
                 let _ = resp.send(result);
-            }
-            SessionCommand::GetCaptchaResponseBody { resp } => {
-                let body = captcha_body.try_lock().ok().and_then(|mut g| g.take());
-                let _ = resp.send(Ok(body));
             }
             SessionCommand::PumpEventLoop { duration_ms, resp } => {
                 page.settle(duration_ms).await;
@@ -1081,45 +955,7 @@ impl SessionThread {
     }
 }
 
-/// Extract the visible text of the response + (optional) thinking
-/// subtrees of a session's current page.
-///
-/// Pure DOM walk — no JS execution. Hidden subtrees are skipped;
-/// skippable roles (buttons, images, form controls, decorative
-/// elements) are filtered out. Returns empty strings when the
-/// selectors don't match any visible element.
-fn extract_texts(
-    page: &mut Page,
-    response_selector: &str,
-    thinking_selector: Option<&str>,
-) -> Result<ExtractedTexts, GatewayError> {
-    let response = page
-        .query_visible(response_selector)
-        .map_err(|e| GatewayError::Provider(format!("invalid response selector: {e}")))?
-        .map(|nid| page.visible_text(nid))
-        .unwrap_or_default();
 
-    let thinking = match thinking_selector {
-        Some(sel) => page
-            .query_visible(sel)
-            .map_err(|e| GatewayError::Provider(format!("invalid thinking selector: {e}")))?
-            .map(|nid| page.visible_text(nid))
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-
-    Ok(ExtractedTexts { response, thinking })
-}
-
-/// Returns `true` when the selector matches a visible element.
-fn is_visible(page: &mut Page, selector: &str) -> Result<bool, GatewayError> {
-    match page.query_visible(selector) {
-        Ok(opt) => Ok(opt.is_some()),
-        Err(e) => Err(GatewayError::Provider(format!("invalid selector: {e}"))),
-    }
-}
-
-/// Build a preload script that restores browser localStorage only at its
 /// original origin. A pooled page may navigate across providers, so replaying
 /// every entry on every page would leak session state between providers.
 fn local_storage_preload_script(entries: &[LocalStorageEntry]) -> String {

@@ -1,16 +1,14 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::error::GatewayError;
-use crate::providers::send_with_retry;
 
-use super::auth::build_cookie_header;
-use super::statsig::generate_statsig_id;
+use super::statsig::browser_statsig_id;
 
 const GROK_BASE_URL: &str = "https://grok.com";
 const UPLOAD_PATH: &str = "/rest/app-chat/upload-file";
@@ -59,34 +57,14 @@ impl UploadCache {
     }
 }
 
-fn build_http_client() -> Result<reqwest::Client, GatewayError> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "User-Agent",
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-        ),
-    );
-    headers.insert("Accept", HeaderValue::from_static("*/*"));
-    headers.insert("Origin", HeaderValue::from_static("https://grok.com"));
-    headers.insert("Referer", HeaderValue::from_static("https://grok.com/"));
-
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .map_err(|e| GatewayError::Internal(format!("failed to build HTTP client: {e}")))
-}
-
-fn build_upload_headers(cookies: &[obscura_net::CookieInfo], challenge_config: &super::statsig::ChallengeConfig) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    let cookie_value = build_cookie_header(cookies);
-    headers.insert(COOKIE, HeaderValue::from_str(&cookie_value).unwrap());
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-    let statsig_id = generate_statsig_id(challenge_config, "POST", UPLOAD_PATH);
-    headers.insert("x-statsig-id", HeaderValue::from_str(&statsig_id).unwrap());
-    headers.insert("x-xai-request-id", HeaderValue::from_str(&new_uuid()).unwrap());
+fn build_upload_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("Accept".to_string(), "*/*".to_string());
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+    headers.insert("Origin".to_string(), GROK_BASE_URL.to_string());
+    headers.insert("Referer".to_string(), format!("{GROK_BASE_URL}/"));
+    headers.insert("x-statsig-id".to_string(), browser_statsig_id());
+    headers.insert("x-xai-request-id".to_string(), new_uuid());
     headers
 }
 
@@ -94,8 +72,7 @@ pub async fn upload_file(
     data: Vec<u8>,
     filename: &str,
     mime_type: &str,
-    cookies: &[obscura_net::CookieInfo],
-    challenge_config: &super::statsig::ChallengeConfig,
+    stealth: &obscura_net::StealthHttpClient,
     cache: &UploadCache,
 ) -> Result<String, GatewayError> {
     validate_size(data.len() as u64)?;
@@ -114,29 +91,33 @@ pub async fn upload_file(
         "mimeType": mime_type,
     });
 
-    let http = build_http_client()?;
-    let headers = build_upload_headers(cookies, challenge_config);
-    let url = format!("{}{}", GROK_BASE_URL, UPLOAD_PATH);
+    let url = format!("{GROK_BASE_URL}{UPLOAD_PATH}");
+    let body = serde_json::to_string(&payload)
+        .map_err(|e| GatewayError::Internal(format!("JSON serialization failed: {e}")))?;
+    let headers = build_upload_headers();
+    let parsed_url = url::Url::parse(&url)
+        .map_err(|e| GatewayError::Internal(format!("invalid upload URL {url}: {e}")))?;
 
-    let builder = http
-        .post(&url)
-        .headers(headers)
-        .json(&payload);
+    // Same stealth client as the chat path: the upload endpoint sits behind
+    // the same Cloudflare Enterprise gate, so it must carry the Chrome TLS
+    // fingerprint and a fresh browser-error x-statsig-id marker.
+    let response = stealth
+        .send_single("POST", &parsed_url, &headers, &body)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("Grok upload request failed: {e}")))?;
 
-    let response = send_with_retry(builder).await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&response.status) {
+        let preview = String::from_utf8_lossy(&response.body)
+            .chars()
+            .take(2000)
+            .collect::<String>();
         return Err(GatewayError::Provider(format!(
             "Grok file upload failed ({}): {}",
-            status, body
+            response.status, preview
         )));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
+    let result: serde_json::Value = serde_json::from_slice(&response.body)
         .map_err(|e| GatewayError::Internal(format!("upload response parse failed: {e}")))?;
 
     let file_url = result

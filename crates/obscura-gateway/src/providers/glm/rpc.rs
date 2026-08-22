@@ -12,7 +12,7 @@ use super::models::GlmModelDef;
 // The Z.AI backend checks this header and rejects outdated clients with
 // "请刷新页面以更新应用后重试".  Bump this when the SPA is redeployed.
 // In the long run this should be extracted from the initial HTML.
-pub const X_FE_VERSION: &str = "prod-fe-1.1.76";
+pub const X_FE_VERSION: &str = "prod-fe-1.1.84";
 
 /// Capabilities toggles for the hidden MCP feature list.
 #[derive(Debug, Clone)]
@@ -85,7 +85,7 @@ pub fn build_completion_body(
             "image_generation": false,
             "web_search": web_search,
             "auto_web_search": web_search,
-            "preview_mode": true,
+            "preview_mode": false,
             "flags": [],
             "features": [
                 { "type": "mcp", "server": "vibe-coding", "status": "hidden" },

@@ -26,10 +26,6 @@ pub struct UploadedFile {
 }
 
 impl UploadedFile {
-    fn is_image(&self) -> bool {
-        self.mime_type.starts_with("image/")
-    }
-
     /// Serialize to the `image_asset_pointer` format used in conversation parts.
     pub fn to_asset_pointer(&self) -> serde_json::Value {
         let mut obj = serde_json::json!({

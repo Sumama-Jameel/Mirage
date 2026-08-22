@@ -1,0 +1,62 @@
+{
+  "request_body": {
+    "model": "mistral-medium-latest",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a file called hello.txt with the content Hello, world!"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "write_file",
+          "description": "Write content to a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The filename"
+              },
+              "content": {
+                "type": "string",
+                "description": "The file content"
+              }
+            },
+            "required": [
+              "name",
+              "content"
+            ]
+          }
+        }
+      }
+    ],
+    "stream": false
+  },
+  "http_status": 200,
+  "elapsed_s": 4.4,
+  "response": {
+    "id": "chatcmpl-914fa677",
+    "object": "chat.completion",
+    "created": 1787304978,
+    "model": "mistral-medium-latest",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Here\u2019s the content for your `hello.txt` file:\n\n```\nHello, world!\n```\n\nTo create the file:\n1. Open a text editor (e.g., Notepad, VS Code, etc.).\n2. Copy and paste the line above.\n3. Save the file as `hello.txt` in your desired directory.\n\nWould you like help with anything else?"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 15,
+      "completion_tokens": 69,
+      "total_tokens": 84
+    },
+    "session_url": "mistral://session/mistral_6f0b02c6fff24100a4b640e40b80d438?chat_id=c45a4203-f590-4be6-b9fb-2defb4e15631"
+  }
+}

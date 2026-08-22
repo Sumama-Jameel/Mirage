@@ -86,12 +86,14 @@ impl MinimaxSessionStore {
         prev
     }
 
+    #[allow(dead_code)]
     pub async fn get(&self, gateway_session_id: &str) -> Option<MinimaxSessionState> {
         self.ensure_loaded().await;
         let store = self.inner.lock().await;
         store.get(gateway_session_id).cloned()
     }
 
+    #[allow(dead_code)]
     pub async fn remove(&self, gateway_session_id: &str) -> Option<MinimaxSessionState> {
         self.ensure_loaded().await;
         let mut store = self.inner.lock().await;

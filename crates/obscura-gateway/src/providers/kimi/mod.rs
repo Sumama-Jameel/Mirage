@@ -8,7 +8,7 @@ use futures::StreamExt;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
@@ -66,9 +66,6 @@ impl Provider for KimiProvider {
         true
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn chat(
         &self,
@@ -144,25 +141,10 @@ impl Provider for KimiProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["textarea[placeholder*='message' i]", "textarea"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[aria-label*='send' i]", "button[type='submit']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        "[data-message-author-role='assistant']"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        Some("[data-testid*='thinking' i]")
-    }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(1800))
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // Kimi web API support for JSON mode is unverified.
@@ -232,7 +214,7 @@ mod tests {
         assert_eq!(p.name(), "kimi");
         assert_eq!(p.url(), "https://kimi.moonshot.cn");
         assert!(p.models().iter().any(|m| m.id == "kimi-k2.7-code"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+
     }
 
     #[test]
@@ -241,12 +223,14 @@ mod tests {
         let models = p.models();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"kimi-k3"));
+        assert!(ids.contains(&"kimi-k3-instant"));
+        assert!(ids.contains(&"kimi-k3-swarm"));
         assert!(ids.contains(&"kimi-k2.7-code"));
         assert!(ids.contains(&"kimi-k2.7-code-highspeed"));
         assert!(ids.contains(&"kimi-k2.6"));
         assert!(ids.contains(&"kimi-k2.5"));
         assert!(ids.contains(&"kimi-search"));
         assert!(ids.contains(&"kimi-research"));
-        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.len(), 9);
     }
 }

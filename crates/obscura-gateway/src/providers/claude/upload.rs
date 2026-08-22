@@ -49,36 +49,6 @@ impl UploadCache {
 }
 
 /// Validate that a remote URL does not point to a private network.
-pub fn validate_remote_url(url: &str) -> Result<(), GatewayError> {
-    let parsed = url::Url::parse(url).map_err(|_| {
-        GatewayError::BadRequest(format!("invalid URL: {url}"))
-    })?;
-
-    let host = parsed.host().ok_or_else(|| {
-        GatewayError::BadRequest(format!("no host in URL: {url}"))
-    })?;
-
-    match host {
-        url::Host::Domain(domain) => {
-            if domain == "localhost" || domain == "127.0.0.1" {
-                return Err(GatewayError::BadRequest("local addresses are blocked".to_string()));
-            }
-            Ok(())
-        }
-        url::Host::Ipv4(ip) => {
-            if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
-                return Err(GatewayError::BadRequest("private IPv4 addresses are blocked".to_string()));
-            }
-            Ok(())
-        }
-        url::Host::Ipv6(ip) => {
-            if ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local() {
-                return Err(GatewayError::BadRequest("private IPv6 addresses are blocked".to_string()));
-            }
-            Ok(())
-        }
-    }
-}
 
 /// Upload files to Claude via `POST /api/oauth/file_upload` multipart endpoint.
 /// Returns file IDs that can be placed in the `attachments` or `files` array.
@@ -183,33 +153,6 @@ pub async fn upload_files(
 }
 
 /// Download a remote file with SSRF validation.
-pub async fn download_remote(http: &Client, url: &str) -> Result<(Vec<u8>, String), GatewayError> {
-    validate_remote_url(url)?;
-    let resp = http
-        .get(url)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| GatewayError::Internal(format!("download failed for {url}: {e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(GatewayError::Internal(format!(
-            "download returned {status} for {url}"
-        )));
-    }
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| GatewayError::Internal(format!("download read failed for {url}: {e}")))?
-        .to_vec();
-    Ok((bytes, content_type))
-}
 
 /// Derive a filename from a URL or MIME type.
 pub fn derive_filename(url: &str, mime: &str) -> String {
@@ -245,6 +188,36 @@ pub fn decode_data_uri(uri: &str) -> Option<(Vec<u8>, String)> {
         .decode(padded.as_bytes())
         .ok()?;
     Some((bytes, mime))
+}
+
+/// Validate that a remote URL does not point to a private network.
+#[cfg(test)]
+pub fn validate_remote_url(url: &str) -> Result<(), GatewayError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| GatewayError::BadRequest(format!("invalid URL: {url}")))?;
+    let host = parsed
+        .host()
+        .ok_or_else(|| GatewayError::BadRequest(format!("no host in URL: {url}")))?;
+    match host {
+        url::Host::Domain(domain) => {
+            if domain == "localhost" || domain == "127.0.0.1" {
+                return Err(GatewayError::BadRequest("local addresses are blocked".to_string()));
+            }
+            Ok(())
+        }
+        url::Host::Ipv4(ip) => {
+            if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
+                return Err(GatewayError::BadRequest("private IPv4 addresses are blocked".to_string()));
+            }
+            Ok(())
+        }
+        url::Host::Ipv6(ip) => {
+            if ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local() {
+                return Err(GatewayError::BadRequest("private IPv6 addresses are blocked".to_string()));
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -8,18 +8,15 @@ use futures::StreamExt;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
-use challenge::ChallengeStore;
 use direct::DirectClient;
 use state::GrokSessionStore;
 
 mod auth;
-mod challenge;
 mod direct;
-mod extract;
 mod state;
 mod statsig;
 mod upload;
@@ -27,22 +24,19 @@ mod upload;
 #[derive(Clone)]
 pub struct GrokProvider {
     store: GrokSessionStore,
-    challenge_store: ChallengeStore,
 }
 
 impl GrokProvider {
     pub fn new() -> Self {
         Self {
             store: GrokSessionStore::new(),
-            challenge_store: ChallengeStore::new(),
         }
     }
 
-    /// Create a provider with optional disk-persisted sessions and challenge config.
+    /// Create a provider with optional disk-persisted sessions.
     pub fn with_data_dir(data_dir: Option<PathBuf>) -> Self {
         Self {
-            store: GrokSessionStore::with_data_dir(data_dir.clone()),
-            challenge_store: ChallengeStore::with_data_dir(data_dir),
+            store: GrokSessionStore::with_data_dir(data_dir),
         }
     }
 }
@@ -103,9 +97,6 @@ impl Provider for GrokProvider {
         ]
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn supports_attachments(&self) -> bool {
         true
@@ -121,14 +112,8 @@ impl Provider for GrokProvider {
         let sessions = sessions.clone();
         Box::pin(async move {
             let session = sessions.acquire().await?;
-            let client = match DirectClient::new(
-                session.clone(),
-                &sessions,
-                &request.model,
-                this.store.clone(),
-                this.challenge_store.clone(),
-            )
-            .await
+            let client = match DirectClient::new(session.clone(), &request.model, this.store.clone())
+                .await
             {
                 Ok(c) => c,
                 Err(e) => {
@@ -161,14 +146,8 @@ impl Provider for GrokProvider {
         let sessions = sessions.clone();
         Box::pin(async move {
             let session = sessions.acquire().await?;
-            let client = match DirectClient::new(
-                session.clone(),
-                &sessions,
-                &request.model,
-                this.store.clone(),
-                this.challenge_store.clone(),
-            )
-            .await
+            let client = match DirectClient::new(session.clone(), &request.model, this.store.clone())
+                .await
             {
                 Ok(c) => c,
                 Err(e) => {
@@ -184,25 +163,10 @@ impl Provider for GrokProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["textarea", "[contenteditable='true']"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[type='submit']", "[data-testid='send-button']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        "[data-testid='assistant-message']"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        None
-    }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(1500))
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // Grok web API support for JSON mode is unverified.
@@ -245,37 +209,6 @@ impl Provider for GrokProvider {
 
 }
 
-impl GrokProvider {
-    /// Manually trigger challenge constant extraction from a browser session.
-    /// Returns the extracted constants as a JSON object.
-    pub async fn extract_challenge_constants(
-        &self,
-        sessions: &SessionManager,
-    ) -> Result<serde_json::Value, GatewayError> {
-        let session = sessions.acquire().await?;
-        let result = extract::extract_challenge(sessions, &session.id).await;
-        let _ = sessions.release(session.id, false).await;
-
-        match result {
-            Ok(extracted) => {
-                let config = extracted.into_config()?;
-                Ok(serde_json::json!({
-                    "status": "ok",
-                    "header_hex": config.header().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-                    "suffix": config.suffix(),
-                    "trailer": config.trailer(),
-                    "env_vars": {
-                        "GROK_CHALLENGE_HEADER_HEX": config.header().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-                        "GROK_CHALLENGE_SUFFIX": config.suffix().to_string(),
-                        "GROK_CHALLENGE_TRAILER": config.trailer().to_string(),
-                    }
-                }))
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +225,6 @@ mod tests {
         assert!(p.models().iter().any(|m| m.id == "grok-heavy"));
         assert!(p.models().iter().any(|m| m.id == "grok-4.5"));
         assert!(p.models().iter().any(|m| m.id == "grok-4.3"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+
     }
 }

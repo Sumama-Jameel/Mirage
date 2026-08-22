@@ -1,5 +1,7 @@
+use base64::Engine;
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
+use serde::Deserialize;
 use tracing::info;
 
 use crate::auth_state::{find_cookie_value, find_local_storage};
@@ -10,6 +12,31 @@ use crate::session::SessionManager;
 pub struct AuthData {
     pub access_token: String,
     pub device_id: String,
+}
+
+#[derive(Deserialize)]
+struct JwtClaims {
+    exp: Option<u64>,
+}
+
+/// Reject an imported access token after its JWT expiry.
+/// Non-JWT values are retained for compatibility with older Kimi sessions;
+/// the server remains the authority for those token formats.
+fn access_token_is_usable(token: &str) -> bool {
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    if parts.len() != 3 {
+        return !token.trim().is_empty();
+    }
+    let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]))
+    else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<JwtClaims>(&payload) else {
+        return false;
+    };
+    claims.exp.map(|exp| exp > chrono::Utc::now().timestamp() as u64).unwrap_or(true)
 }
 
 /// Web app URL (cookies and localStorage live here, not on kimi.moonshot.cn).
@@ -32,16 +59,23 @@ pub fn extract_from_import(
         if let Some(cookie_value) = find_cookie_value(jar, "www.kimi.com", "kimi-auth")
             .or_else(|| find_cookie_value(jar, ".www.kimi.com", "kimi-auth"))
         {
-            let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
-            info!("Kimi auth extracted from kimi-auth cookie");
-            return Some(AuthData { access_token: cookie_value, device_id });
+            if !access_token_is_usable(&cookie_value) {
+                info!("Ignoring expired Kimi auth cookie; refreshing from the live page");
+            } else {
+                let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
+                info!("Kimi auth extracted from kimi-auth cookie");
+                return Some(AuthData { access_token: cookie_value, device_id });
+            }
         }
     }
 
-    // Fallback: access_token or refresh_token from imported localStorage
+    // Fallback: only an access token is valid in the API Authorization header.
     if let Some(token) = find_local_storage(local_storage, "https://www.kimi.com", "access_token")
-        .or_else(|| find_local_storage(local_storage, "https://www.kimi.com", "refresh_token"))
     {
+        if !access_token_is_usable(&token) {
+            info!("Ignoring expired Kimi local-storage access token; refreshing from the live page");
+            return None;
+        }
         let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
         info!("Kimi auth extracted from imported localStorage");
         return Some(AuthData { access_token: token, device_id });
@@ -58,34 +92,91 @@ pub async fn navigate_to_kimi(sessions: &SessionManager, session_id: &str) -> Re
     Ok(())
 }
 
-/// Extract the refresh_token from www.kimi.com localStorage (live, after navigation).
+/// Extract or refresh Kimi auth from www.kimi.com (live, after navigation).
 pub async fn extract_refresh_token(
     sessions: &SessionManager,
     session_id: &str,
+    cookie_jar: Option<&obscura_net::CookieJar>,
 ) -> Result<AuthData, GatewayError> {
     let js = r#"
         (async function() {
             try {
                 const at = localStorage.getItem('access_token');
-                if (at) return { refreshToken: at };
                 const rt = localStorage.getItem('refresh_token');
-                if (rt) return { refreshToken: rt };
-                return { refreshToken: null };
+                // This is the same Connect endpoint and field spelling used by
+                // the current Kimi web client. Never send the refresh token as
+                // an API bearer token.
+                let accessExpired = false;
+                if (at) {
+                    try {
+                        const payload = at.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                        const claims = JSON.parse(atob(payload + '='.repeat((4 - payload.length % 4) % 4)));
+                        accessExpired = Number.isFinite(claims.exp) && claims.exp <= Date.now() / 1000;
+                    } catch (_) {}
+                }
+                if ((accessExpired || !at) && rt) {
+                    const response = await fetch(
+                        'https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken',
+                        {
+                            method: 'POST',
+                            headers: {
+                                'content-type': 'application/json',
+                                'x-msh-platform': 'web',
+                                'x-language': 'en-US'
+                            },
+                            body: JSON.stringify({ refreshToken: rt })
+                        }
+                    );
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.accessToken && data.refreshToken) {
+                            localStorage.setItem('access_token', data.accessToken);
+                            localStorage.setItem('refresh_token', data.refreshToken);
+                            return { accessToken: data.accessToken };
+                        }
+                    }
+                }
+                if (at) return { accessToken: at };
+                return { accessToken: null };
             } catch (e) {
-                return { refreshToken: null, error: e.message };
+                return { accessToken: null, error: e.message };
             }
         })()
     "#;
+
+    // Run the page refresh path before consulting the imported cookie. The
+    // imported cookie can have a future JWT exp while the server has already
+    // invalidated that browser snapshot.
     let value = sessions.execute_js(session_id, js).await?;
     if let serde_json::Value::Object(map) = &value {
-        let token = map.get("refreshToken").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let token = map.get("accessToken").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         if let Some(token) = token {
+            if !access_token_is_usable(token) {
+                return Err(GatewayError::Auth(
+                    "Kimi page returned an expired access token; log in again at https://www.kimi.com".to_string(),
+                ));
+            }
             info!(session_id = %session_id, "Kimi auth extracted from live page");
             let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
             return Ok(AuthData {
                 access_token: token.to_string(),
                 device_id,
             });
+        }
+    }
+
+    // The page may keep auth in an HttpOnly cookie, so JavaScript cannot read
+    // it. Use the cookie only after localStorage refresh has had a chance to
+    // rotate the credentials.
+    if let Some(jar) = cookie_jar {
+        if let Some(cookie_value) = find_cookie_value(jar, "www.kimi.com", "kimi-auth")
+            .or_else(|| find_cookie_value(jar, ".www.kimi.com", "kimi-auth"))
+        {
+            if access_token_is_usable(&cookie_value) {
+                info!(session_id = %session_id, "Kimi auth found in refreshed session cookie");
+                let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
+                return Ok(AuthData { access_token: cookie_value, device_id });
+            }
         }
     }
 
@@ -179,15 +270,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_from_import_falls_back_to_refresh_token() {
+    fn extract_from_import_does_not_use_refresh_token_as_access_token() {
         let ls = vec![LocalStorageEntry {
             origin: "https://www.kimi.com".to_string(),
             key: "refresh_token".to_string(),
             value: "test-refresh-jwt".to_string(),
         }];
         let result = extract_from_import(&ls, None);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().access_token, "test-refresh-jwt");
+        assert!(result.is_none());
     }
 
     #[test]

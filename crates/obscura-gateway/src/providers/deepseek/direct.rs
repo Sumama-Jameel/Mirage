@@ -21,14 +21,17 @@ fn citation_marker_regex() -> &'static regex::Regex {
 use crate::error::GatewayError;
 use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    ChatMessageDelta, ChunkChoice, Citation, ToolCall, Usage,
+    ChatMessageDelta, ChunkChoice, Citation, Tool, ToolCall, Usage,
 };
+use crate::providers::retry_after_from_headers;
 use crate::providers::tokenizer::estimate_tokens;
 use crate::session::SessionHandle;
 
+use crate::providers::mtp;
 use crate::providers::solver::{PoWHeader, SolverChain, SolverRegistry};
 use crate::providers::tool_call::{
-    convert_xml_tool_calls, inject_tool_prompt, parse_manual_tool_call,
+    convert_xml_tool_calls, inject_tool_prompt,
+    XmlToolCallStripper,
 };
 #[cfg(test)]
 use crate::providers::tool_call::parse_tool_calls_from_content;
@@ -43,13 +46,27 @@ const APP_VERSION: &str = "2.2.0";
 const CLIENT_VERSION: &str = "2.2.0";
 
 /// Maps public model IDs to DeepSeek's internal `model_type` wire value.
+/// The V4/R1 aliases follow the API model roster in docs/LatestAImodels:
+/// V4-Pro and R1 are the flagship reasoning models (expert wire type),
+/// V4-Flash and V3.2 are the fast/cheaper chat models (default wire type).
 fn model_type(model_id: &str) -> Option<&'static str> {
     match model_id {
-        "deepseek-chat" | "deepseek-instant" => Some("default"),
-        "deepseek-reasoner" | "deepseek-expert" => Some("expert"),
+        "deepseek-chat" | "deepseek-instant" | "deepseek-v4-flash" | "deepseek-v3.2" => {
+            Some("default")
+        }
+        "deepseek-reasoner" | "deepseek-expert" | "deepseek-v4-pro" | "deepseek-r1" => {
+            Some("expert")
+        }
         "deepseek-vision" => Some("vision"),
         _ => None,
     }
+}
+
+/// Whether a model reasons by default. Reasoner models always emit THINK
+/// fragments in the web app and the official API, so default thinking on
+/// unless the request explicitly disables it.
+fn default_thinking(model_id: &str) -> bool {
+    model_type(model_id) == Some("expert")
 }
 
 /// Effective internal model type, considering image auto-detection.
@@ -267,7 +284,7 @@ impl DirectClient {
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, GatewayError>>, GatewayError> {
         let model = request.model.clone();
         let requested_session_url = request.session_url.clone();
-        let thinking_enabled = request.thinking.unwrap_or(false);
+        let thinking_enabled = request.thinking.unwrap_or(default_thinking(&request.model));
         let search_enabled = request.search.unwrap_or(false);
         let tools_enabled = request.tools.is_some();
 
@@ -323,11 +340,40 @@ impl DirectClient {
             .await?;
 
         // The internal DeepSeek endpoint does not natively support function
-        // calling. When tools are requested, inject a system-style instruction
-        // into the prompt and later parse the model's structured output.
+        // calling. When tools are requested, inject the MTP/1 system prompt
+        // into the prompt and later parse the model's MTP tool blocks.
+        //
+        // On tool-result follow-ups (last message is role "tool"), the prompt
+        // already contains the formatted tool output. Re-injecting tool
+        // definitions confuses the model with a redundant header. Only inject
+        // on fresh user turns.
+        let last_is_tool = request.messages.last().map_or(false, |m| m.role == "tool");
         let prompt = if let Some(ref tools) = request.tools {
-            inject_tool_prompt(&prompt, tools, request.tool_choice.as_ref())
+            if last_is_tool {
+                // Follow-up: include the user's original question for context,
+                // then the tool results. Skip re-injecting tool definitions.
+                let user_question = request.messages.iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.as_text())
+                    .unwrap_or_default();
+                let p = if user_question.is_empty() {
+                    prompt
+                } else {
+                    format!("User request:\n{user_question}\n\n{prompt}")
+                };
+                tracing::info!(prompt_len = p.len(), tools_count = tools.len(), last_is_tool, "DeepSeek prompt (follow-up, no re-inject)");
+                tracing::debug!(prompt = %p, "Full DeepSeek follow-up prompt sent to upstream");
+                p
+            } else {
+                let mtp_prompt = mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false);
+                let p = format!("{mtp_prompt}\n\nUser request:\n{prompt}");
+                tracing::info!(prompt_len = p.len(), tools_count = tools.len(), "DeepSeek prompt after MTP injection");
+                tracing::debug!(prompt = %p, "Full DeepSeek prompt sent to upstream");
+                p
+            }
         } else {
+            tracing::info!(prompt_len = prompt.len(), "DeepSeek prompt (no tools)");
             prompt
         };
 
@@ -340,7 +386,10 @@ impl DirectClient {
             &file_ids,
             &request,
         );
-        tracing::debug!(body = %serde_json::to_string(&body).unwrap_or_default(), "completion request body");
+        // Dump full body to file so we can inspect the exact prompt sent to upstream
+    if let Ok(json) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write("/tmp/deepseek_upstream_body.json", &json);
+    }
 
         let id_prefix = format!("chatcmpl-{}", uuid::Uuid::new_v4());
         let model_for_store = self.model_id.clone();
@@ -373,6 +422,7 @@ impl DirectClient {
                 }
             };
 
+            let tools_for_stream = request.tools.clone().unwrap_or_default();
             let (assistant_id, saw_tool_calls, tool_calls) = match handle_completion_stream(
                 resp,
                 &model,
@@ -380,6 +430,7 @@ impl DirectClient {
                 session_url.clone(),
                 search_enabled,
                 tools_enabled,
+                &tools_for_stream,
                 tx.clone(),
             )
             .await
@@ -505,7 +556,7 @@ impl DirectClient {
             "parent_message_id": parent_message_id,
             "prompt": prompt,
             "ref_file_ids": file_ids,
-            "thinking_enabled": request.thinking.unwrap_or(false),
+            "thinking_enabled": request.thinking.unwrap_or(default_thinking(&request.model)),
             "search_enabled": request.search.unwrap_or(false),
             "action": serde_json::Value::Null,
             "preempt": false,
@@ -519,15 +570,10 @@ impl DirectClient {
             }
         }
 
-        // Forward tool definitions if provided. DeepSeek's internal endpoint may
-        // or may not honor them; if it doesn't, the client will see no tool_calls
-        // and we can fall back to the official API.
-        if let Some(ref tools) = request.tools {
-            body["tools"] = serde_json::to_value(tools).unwrap_or(serde_json::Value::Null);
-        }
-        if let Some(ref tool_choice) = request.tool_choice {
-            body["tool_choice"] = serde_json::to_value(tool_choice).unwrap_or(serde_json::Value::Null);
-        }
+        // NOTE: Do NOT forward tools/tool_choice in the body. DeepSeek's
+        // internal web endpoint does not support native tool calling; the
+        // fields are silently ignored. Including them adds noise to the
+        // request and can confuse the model.
 
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
@@ -596,9 +642,11 @@ async fn handle_completion_stream(
     session_url: Option<String>,
     search_enabled: bool,
     tools_enabled: bool,
+    tools: &[Tool],
     tx: mpsc::UnboundedSender<Result<ChatCompletionChunk, GatewayError>>,
 ) -> Result<(Option<i64>, bool, Vec<ToolCall>), GatewayError> {
     let status = resp.status();
+    let headers = resp.headers().clone();
     let content_type = resp
         .headers()
         .get("content-type")
@@ -641,13 +689,19 @@ async fn handle_completion_stream(
             .text()
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status));
+        if status.as_u16() == 429 {
+            return Err(GatewayError::ProviderRateLimited {
+                message: format!("completion rate limited (429): {text}"),
+                retry_after: retry_after_from_headers(&headers),
+            });
+        }
         return Err(GatewayError::Provider(format!(
             "completion returned error {status}: {text}"
         )));
     }
 
     let mut counter: u32 = 0;
-    let mut state = StreamState::default();
+    let mut state = StreamState::new(tools);
     let mut assistant_message_id: Option<i64> = None;
     let tools_enabled = tools_enabled;
 
@@ -712,16 +766,12 @@ async fn handle_completion_stream(
         }
     }
 
-    // If we are still inside an unclosed <tool_call> marker, try to parse the
-    // buffered JSON as a final tool call.
-    if state.in_tool_call {
-        let buf = state.tool_call_buffer.clone();
-        if let Some(tc) = parse_manual_tool_call(&buf) {
-            state.collected_tool_calls.push(tc);
-            state.saw_tool_calls = true;
-        }
-        state.in_tool_call = false;
-        state.tool_call_buffer.clear();
+    // Flush any pending partial MTP tool block when the stream ends.
+    state.mtp_state.finish(&state.tools);
+    if state.mtp_state.saw_tool_calls {
+        state.saw_tool_calls = true;
+        state.collected_tool_calls.extend(state.mtp_state.collected_tool_calls.clone());
+        state.mtp_state.collected_tool_calls.clear();
     }
 
     // Emit any tool calls collected during the stream as a single chunk.
@@ -746,7 +796,6 @@ async fn handle_completion_stream(
     Ok((assistant_message_id, state.saw_tool_calls, state.collected_tool_calls))
 }
 
-#[derive(Default)]
 struct StreamState {
     /// Last active append path, used for bare append frames.
     active_path: Option<String>,
@@ -759,51 +808,41 @@ struct StreamState {
     fragment_count: usize,
     /// Whether the stream contained tool calls.
     saw_tool_calls: bool,
-    /// True while the model is inside a <tool_call>...</tool_call> region so
-    /// that tool-call JSON can be suppressed from the streamed text.
-    in_tool_call: bool,
-    /// Accumulates the JSON payload of the current unclosed <tool_call>.
-    tool_call_buffer: String,
+    /// MTP/1 streaming state (parses `[MIRAGE_TOOL_CALL_V1]` blocks).
+    mtp_state: mtp::MtpStreamState,
     /// Tool calls collected from the stream, emitted as a single chunk at the end.
     collected_tool_calls: Vec<ToolCall>,
+    /// The tool definitions for this request (used to validate MTP blocks).
+    tools: Vec<Tool>,
 }
 
-/// Process a content string and update the stream state, returning the plain
-/// text that should be emitted to the client. Text inside `<tool_call>` markers
-/// is absorbed into `state.collected_tool_calls` instead of being returned.
-fn process_content_text(content: &str, state: &mut StreamState) -> String {
-    const START: &str = "<tool_call>";
-    const END: &str = "</tool_call>";
-
-    let mut output = String::new();
-    let mut rest = content;
-
-    while !rest.is_empty() {
-        if state.in_tool_call {
-            if let Some(end) = rest.find(END) {
-                state.tool_call_buffer.push_str(&rest[..end]);
-                if let Some(tc) = parse_manual_tool_call(&state.tool_call_buffer) {
-                    state.collected_tool_calls.push(tc);
-                    state.saw_tool_calls = true;
-                }
-                state.in_tool_call = false;
-                state.tool_call_buffer.clear();
-                rest = &rest[end + END.len()..];
-            } else {
-                state.tool_call_buffer.push_str(rest);
-                break;
-            }
-        } else if let Some(start) = rest.find(START) {
-            output.push_str(&rest[..start]);
-            rest = &rest[start + START.len()..];
-            state.in_tool_call = true;
-        } else {
-            output.push_str(rest);
-            break;
+impl StreamState {
+    fn new(tools: &[Tool]) -> Self {
+        Self {
+            active_path: None,
+            path_kinds: HashMap::new(),
+            emitted_role: false,
+            fragment_count: 0,
+            saw_tool_calls: false,
+            mtp_state: mtp::MtpStreamState::new(),
+            collected_tool_calls: Vec::new(),
+            tools: tools.to_vec(),
         }
     }
+}
 
-    output
+/// Process a content delta through the MTP tool block parser, returning
+/// the plain text that should be emitted to the client. Text inside
+/// `[MIRAGE_TOOL_CALL_V1]` markers is absorbed and converted to structured
+/// tool calls.
+fn process_content_text(content: &str, state: &mut StreamState) -> String {
+    let clean = state.mtp_state.process_delta(content, &state.tools);
+    if state.mtp_state.saw_tool_calls {
+        state.saw_tool_calls = true;
+        state.collected_tool_calls.extend(state.mtp_state.collected_tool_calls.clone());
+        state.mtp_state.collected_tool_calls.clear();
+    }
+    clean
 }
 
 /// Emit a content fragment through the tool-call state machine. Returns any
@@ -1419,10 +1458,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_thinking_tracks_model_family() {
+        assert!(default_thinking("deepseek-reasoner"));
+        assert!(default_thinking("deepseek-expert"));
+        assert!(!default_thinking("deepseek-chat"));
+        assert!(!default_thinking("deepseek-instant"));
+        assert!(!default_thinking("deepseek-vision"));
+        assert!(!default_thinking("unknown-model"));
+    }
+
+    #[test]
     fn snapshot_routes_think_to_reasoning_and_response_to_content() {
         let line = br#"data: {"v":{"response":{"message_id":123,"fragments":[{"type":"THINK","content":"think text"},{"type":"RESPONSE","content":"final"}]}}}"#;
         let mut counter = 0;
-        let mut state = StreamState::default();
+        let mut state = StreamState::new(&[]);
         let (chunks, msg_id) = parse_sse_line(
             line,
             "deepseek-chat",
@@ -1453,7 +1502,7 @@ mod tests {
     fn path_appends_use_snapshot_kind_map() {
         let snapshot = br#"data: {"v":{"response":{"fragments":[{"type":"THINK","content":"t"},{"type":"RESPONSE","content":"c"}]}}}"#;
         let mut counter = 0;
-        let mut state = StreamState::default();
+        let mut state = StreamState::new(&[]);
         let _ = parse_sse_line(snapshot, "m", "p", &None, false, false, &mut counter, &mut state).unwrap();
 
         // -2 maps to THINK, -1 maps to RESPONSE.
@@ -1474,7 +1523,7 @@ mod tests {
     fn message_id_path_append_is_captured() {
         let line = br#"data: {"p":"response/fragments/-1/message_id","o":"APPEND","v":999}"#;
         let mut counter = 0;
-        let mut state = StreamState::default();
+        let mut state = StreamState::new(&[]);
         let (chunks, msg_id) = parse_sse_line(line, "m", "p", &None, false, false, &mut counter, &mut state).unwrap();
         assert!(chunks.is_empty());
         assert_eq!(msg_id, Some(999));
@@ -1542,7 +1591,7 @@ mod tests {
 
     #[test]
     fn process_content_text_streams_text_and_collects_tool_call() {
-        let mut state = StreamState::default();
+        let mut state = StreamState::new(&[]);
         let text = process_content_text(
             "Hello <tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}</tool_call> world",
             &mut state,
@@ -1554,17 +1603,18 @@ mod tests {
 
     #[test]
     fn process_content_text_handles_split_tool_call() {
-        let mut state = StreamState::default();
+        let mut state = StreamState::new(&[]);
         let t1 = process_content_text("Hello <tool_call>{\"name\":\"read_", &mut state);
         assert_eq!(t1, "Hello ");
-        assert!(state.in_tool_call);
+        // The tool call is not closed yet, so no call has been collected.
+        assert!(!state.saw_tool_calls);
 
         let t2 = process_content_text(
             "file\",\"arguments\":{\"path\":\"a\"}}</tool_call> done",
             &mut state,
         );
         assert_eq!(t2, " done");
-        assert!(!state.in_tool_call);
+        assert!(state.saw_tool_calls);
         assert_eq!(state.collected_tool_calls.len(), 1);
         assert_eq!(state.collected_tool_calls[0].function.name, "read_file");
     }
@@ -1573,7 +1623,7 @@ mod tests {
     fn snapshot_streams_text_and_collects_tool_call() {
         let line = br#"data: {"v":{"response":{"message_id":123,"fragments":[{"type":"RESPONSE","content":"I will read <tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"main.py\"}}</tool_call> for you"}]}}}"#;
         let mut counter = 0;
-        let mut state = StreamState::default();
+        let mut state = StreamState::new(&[]);
         let (chunks, msg_id) = parse_sse_line(
             line,
             "deepseek-chat",

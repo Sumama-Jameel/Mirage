@@ -37,6 +37,7 @@ const MAX_CONCURRENT_UPLOADS: usize = 4;
 
 /// Cached upload result for one session.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct CachedUpload {
     file_id: String,
     inserted: Instant,
@@ -44,6 +45,7 @@ struct CachedUpload {
 
 /// Per-session file upload cache.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct UploadCache {
     inner: Arc<Mutex<HashMap<String, CachedUpload>>>,
     ttl: Duration,
@@ -247,6 +249,7 @@ impl FileUploadService {
     }
 
     /// Resolve a single file URL and upload it, using the cache when possible.
+    #[allow(dead_code)]
     async fn upload_file_url(
         &self,
         url: &str,

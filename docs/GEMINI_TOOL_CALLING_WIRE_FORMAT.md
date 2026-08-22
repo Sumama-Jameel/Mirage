@@ -1,5 +1,10 @@
 # Gemini Web tool-calling wire format (live-verified 2026-08-07)
 
+Re-verified against `crates/obscura-gateway/src/providers/gemini/rpc.rs` and
+`direct.rs` on 2026-08-20: `card_content` handling, `candidate[22][0]`
+render-text fallback, and the `candidate[28]` no-op fallback are all still
+implemented exactly as described below.
+
 ## Root finding
 
 Gemini Web's `StreamGenerate` API has **NO native structured tool-call field**.

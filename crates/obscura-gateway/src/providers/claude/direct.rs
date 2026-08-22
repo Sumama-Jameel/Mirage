@@ -404,7 +404,7 @@ impl ClaudeDirectClient {
         }
 
         let tool_prompt = match request.tools.as_ref() {
-            Some(tools) => inject_tool_prompt(&prompt, tools, request.tool_choice.as_ref()),
+            Some(tools) => inject_tool_prompt("claude", &prompt, tools, request.tool_choice.as_ref()),
             None => String::new(),
         };
 
@@ -534,7 +534,7 @@ impl ClaudeDirectClient {
             // No per-session lock held - allow concurrent requests.
 
             let tool_prompt = match request.tools.as_ref() {
-                Some(tools) => inject_tool_prompt(&prompt, tools, request.tool_choice.as_ref()),
+                Some(tools) => inject_tool_prompt("claude", &prompt, tools, request.tool_choice.as_ref()),
                 None => String::new(),
             };
 

@@ -6,15 +6,15 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod api;
 mod auth_state;
-#[allow(dead_code)]
-mod chat;
+mod browser;
+mod capture;
 mod config;
 mod error;
-mod browser;
 mod models;
 mod providers;
 mod session;
 mod state;
+mod vault;
 
 use crate::config::Config;
 use crate::error::GatewayError;
@@ -40,6 +40,15 @@ use crate::state::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+
+    // Parse CLI args: --capture <provider> runs capture mode, otherwise start server.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--capture" {
+        let provider = &args[2];
+        let config = Config::load()?;
+        capture::run_capture(provider, &config).await?;
+        return Ok(());
+    }
 
     let config = Config::load()?;
     info!(

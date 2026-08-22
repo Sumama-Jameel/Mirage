@@ -1,32 +1,36 @@
 //! GLM/Z.AI direct internal-API client.
 //!
-//! Bypasses the chat UI and calls `chat.z.ai/api/v2/chat/completions` directly,
-//! using the imported browser session only for authentication, signing, and
-//! best-effort captcha assistance.
+//! Makes direct HTTP requests to `chat.z.ai/api/v2/chat/completions` using
+//! the imported browser session for authentication and request signing. Unlike
+//! the previous in-page `globalThis.fetch()` approach, the server-side HTTP
+//! path avoids triggering Aliyun NVC captcha (verified by zai2api and other
+//! reverse-engineering projects).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use futures::stream::{BoxStream, StreamExt};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, ORIGIN, USER_AGENT};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, info, warn};
+
+use obscura_net::CookieJar;
 
 use crate::error::GatewayError;
 use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     ChatMessageDelta, ChunkChoice, Citation, ToolCall, Usage,
 };
+use crate::providers::retry_after_from_map;
 use crate::providers::tokenizer::estimate_tokens;
 use crate::providers::tool_call::{
     convert_xml_tool_calls, format_tool_results, inject_tool_prompt,
 };
 use crate::session::{SessionHandle, SessionManager};
 
+use obscura_net::StealthHttpClient;
+
 use super::auth::{resolve_auth, AuthContext};
-use super::humanize::CAPTCHA_STEALTH_INIT_JS;
 use super::models::GlmModelDef;
 use super::rpc::{
     build_completion_body, last_user_text, parse_sse_line, FeatureToggles, X_FE_VERSION,
@@ -67,6 +71,7 @@ impl std::fmt::Display for DirectError {
 /// session at login time, so we must use the real values from the warmed
 /// browser rather than static defaults.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct Fingerprint {
     user_agent: String,
     language: String,
@@ -181,7 +186,8 @@ impl Default for Fingerprint {
 
 /// Direct API client for Z.AI's internal chat-completions endpoint.
 pub struct GlmDirectClient {
-    http: reqwest::Client,
+    stealth: StealthHttpClient,
+    upload_http: reqwest::Client,
     auth: AuthContext,
     store: SessionStore,
     model: GlmModelDef,
@@ -190,7 +196,7 @@ pub struct GlmDirectClient {
     sessions: SessionManager,
     session_id: String,
     user_agent: String,
-    cookie_jar: std::sync::Arc<obscura_net::CookieJar>,
+    profile_path: Option<std::path::PathBuf>,
     models_cache: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
@@ -204,58 +210,25 @@ impl GlmDirectClient {
         model: &GlmModelDef,
         sign_secret: &str,
         upstream_url: &str,
+        profile_path: Option<&std::path::Path>,
     ) -> Result<Self, DirectError> {
         let auth = resolve_auth(&session.local_storage, &session.cookie_jar)
             .await
             .map_err(|e| DirectError::Fallback(e.to_string()))?;
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert("Accept", HeaderValue::from_static("text/event-stream, application/json"));
-        headers.insert("X-FE-Version", HeaderValue::from_static(X_FE_VERSION));
-        headers.insert(ORIGIN, HeaderValue::from_static(CHAT_Z_AI_URL));
-        headers.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
-        headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
-        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
-        headers.insert("Accept-Language", HeaderValue::from_static("zh-CN,zh;q=0.9"));
-
-        // Use the real warmed session's User-Agent and keep the client hints
-        // consistent with it. Sending a hardcoded Chrome UA together with
-        // Chrome `sec-ch-ua` hints while the session is Firefox (or vice
-        // versa) is what triggers Z.AI's "请刷新页面以更新应用后重试" rejection.
-        let session_ua = &session.user_agent;
-        let is_firefox = session_ua.contains("Firefox") || session_ua.contains("Gecko");
-        let ua_value = HeaderValue::from_str(session_ua)
-            .unwrap_or_else(|_| HeaderValue::from_static("Mozilla/5.0"));
-        headers.insert(USER_AGENT, ua_value);
-        if is_firefox {
-            // Firefox does not send Chromium client hints. Leave them off so
-            // the fingerprint stays self-consistent.
-            headers.remove("sec-ch-ua");
-            headers.remove("sec-ch-ua-mobile");
-            headers.remove("sec-ch-ua-platform");
-        } else {
-            headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
-            headers.insert(
-                "sec-ch-ua",
-                HeaderValue::from_static(
-                    r#""Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140""#,
-                ),
-            );
-            headers.insert("sec-ch-ua-platform", HeaderValue::from_static("\"Windows\""));
-        }
-
-        // Note: the `cookie` header is NOT set here. Z.AI sets anti-bot
-        // cookies (notably `ssxmod_itna`) via client-side JavaScript on the
-        // chat.z.ai page. We must navigate the warmed browser first, wait
-        // for the SPA to load, and then read the live cookie jar before
-        // sending the direct API request. See `chat_stream`.
-
-        let http = reqwest::Client::builder()
+        // Use wreq with Chrome 145 TLS fingerprint to bypass Z.AI's
+        // Aliyun NVC captcha. The standard reqwest client has a non-browser
+        // JA3 fingerprint that triggers FRONTEND_CAPTCHA_REQUIRED.
+        let upload_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .default_headers(headers)
             .build()
-            .map_err(|e| GatewayError::Internal(format!("GLM HTTP client failed: {e}")))?;
+            .map_err(|e| GatewayError::Internal(format!("GLM upload client failed: {e}")))?;
+
+        // Use wreq with Chrome 145 TLS fingerprint. Do NOT set extra headers
+        // here — wreq's emulation already sends correct browser fingerprint
+        // headers (UA, Accept, sec-ch-ua, etc.). Adding our own overrides
+        // can conflict with the emulated fingerprint and trigger captcha.
+        let stealth = StealthHttpClient::new(session.cookie_jar.clone());
 
         info!(
             session_id = %session.id,
@@ -264,7 +237,8 @@ impl GlmDirectClient {
         );
 
         Ok(Self {
-            http,
+            stealth,
+            upload_http,
             auth,
             store,
             model: model.clone(),
@@ -273,7 +247,7 @@ impl GlmDirectClient {
             sessions: sessions.clone(),
             session_id: session.id.clone(),
             user_agent: session.user_agent.clone(),
-            cookie_jar: session.cookie_jar.clone(),
+            profile_path: profile_path.map(std::path::PathBuf::from),
             models_cache: std::sync::Mutex::new(None),
         })
     }
@@ -284,8 +258,18 @@ impl GlmDirectClient {
     /// client (one gateway request).
     async fn resolve_internal_model_id(
         &self,
-        chat_id: &str,
+        _chat_id: &str,
     ) -> Result<String, DirectError> {
+        // Current chat.z.ai v2 accepts the public model id directly. The
+        // separate /api/models probe belongs to the older signed contract;
+        // it can hang when called outside the page's authenticated fetch
+        // context and prevents the actual completion request from being
+        // issued. The current web executor uses the requested model id
+        // unchanged (OmniRoute zai-web, 2026-08-16 research).
+        if self.upstream_url.ends_with("/api/v2/chat/completions") {
+            return Ok(self.model.id.clone());
+        }
+
         {
             let guard = self.models_cache.lock().map_err(|e| {
                 DirectError::Fatal(GatewayError::Internal(format!("GLM model cache poisoned: {e}")))
@@ -305,42 +289,51 @@ impl GlmDirectClient {
         // are already present in the imported cookie jar.
 
         let probe_url = format!("{}/api/models", CHAT_Z_AI_URL);
+        let mut probe_headers = std::collections::HashMap::new();
+        probe_headers.insert("Authorization".to_string(), format!("Bearer {}", self.auth.token));
+        probe_headers.insert("X-FE-Version".to_string(), X_FE_VERSION.to_string());
+        let probe_url_parsed = url::Url::parse(&probe_url)
+            .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("invalid GLM models URL: {e}"))))?;
         let resp = self
-            .http
-            .get(&probe_url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.auth.token))
-            .send()
+            .stealth
+            .send_single("GET", &probe_url_parsed, &probe_headers, "")
             .await
             .map_err(|e| DirectError::Fallback(format!("GLM model probe request failed: {e}")))?;
 
-        let status = resp.status();
-        let status_u16 = status.as_u16();
+        let status_u16 = resp.status;
         if status_u16 == 401 || status_u16 == 403 {
             return Err(DirectError::Fallback(format!(
-                "GLM model probe returned {status}; session invalid or captcha required"
+                "GLM model probe returned {status_u16}; session invalid or captcha required"
             )));
         }
         if status_u16 == 400 || status_u16 == 429 || status_u16 == 426 {
-            let text = resp.text().await.unwrap_or_default();
+            let text = String::from_utf8_lossy(&resp.body).to_string();
             if is_fallback_error_text(&text) {
                 return Err(DirectError::Fallback(format!(
-                    "GLM model probe returned {status}: {text}"
+                    "GLM model probe returned {status_u16}: {text}"
                 )));
             }
+            let retry_after = retry_after_from_map(&resp.headers);
+            if status_u16 == 429 {
+                return Err(DirectError::Fatal(GatewayError::ProviderRateLimited {
+                    message: format!("GLM model probe returned 429: {}", text.chars().take(500).collect::<String>()),
+                    retry_after,
+                }));
+            }
             return Err(DirectError::Fatal(GatewayError::Provider(format!(
-                "GLM model probe returned {status}: {}",
+                "GLM model probe returned {status_u16}: {}",
                 text.chars().take(500).collect::<String>()
             ))));
         }
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+        if status_u16 >= 400 {
+            let text = String::from_utf8_lossy(&resp.body);
             return Err(DirectError::Fatal(GatewayError::Provider(format!(
-                "GLM model probe returned {status}: {}",
+                "GLM model probe returned {status_u16}: {}",
                 text.chars().take(500).collect::<String>()
             ))));
         }
 
-        let body = resp.json::<serde_json::Value>().await.map_err(|e| {
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
             DirectError::Fatal(GatewayError::Provider(format!(
                 "GLM model probe decode failed: {e}"
             )))
@@ -489,14 +482,14 @@ impl GlmDirectClient {
         // tool schemas, so the model emits <tool_call> markers instead.
         if let Some(ref tools) = request.tools {
             let last_prompt = last_user_text(&request.messages);
-            let injected = inject_tool_prompt(&last_prompt, tools, request.tool_choice.as_ref());
+            let injected = inject_tool_prompt("glm", &last_prompt, tools, request.tool_choice.as_ref());
             update_last_user_text(&mut request.messages, &injected);
         }
 
         // Upload any attachments in the last user message. On failure, fall back
         // to UI automation which can drive the native file picker.
         let upload_service = UploadService::new(
-            self.http.clone(),
+            self.upload_http.clone(),
             self.auth.token.clone(),
             chat_id.clone(),
         );
@@ -508,7 +501,7 @@ impl GlmDirectClient {
             }
         };
 
-        let has_attachments = !files.is_empty();
+        let _has_attachments = !files.is_empty();
         let last_user = last_user_text(&request.messages);
         let signature = generate_signature(&self.auth.user_id, &last_user, &self.sign_secret)
             .map_err(|e| GatewayError::Internal(format!("GLM signature failed: {e}")))?;
@@ -552,41 +545,28 @@ impl GlmDirectClient {
 
         let (tx, rx) = mpsc::unbounded_channel::<Result<ChatCompletionChunk, GatewayError>>();
 
-        let mut captcha_param: Option<serde_json::Value> = None;
-
         let stream_result: Result<
             BoxStream<'static, Result<ChatCompletionChunk, GatewayError>>,
             DirectError,
         > = async {
-            // Up to two attempts: first attempt may return
-            // FRONTEND_CAPTCHA_REQUIRED; on the second attempt we attach the
-            // solved `captcha_verify_param` to the body.
-            for attempt in 1u8..=2 {
-                // Regenerate the signature on every attempt (the SPA does
-                // the same on retry).
-                let signature = generate_signature(&self.auth.user_id, &last_user, &self.sign_secret)
-                    .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("GLM signature failed: {e}"))))?;
-                let request_id = signature.request_id.clone();
-                let mut body = build_completion_body(
-                    &request,
-                    &self.model,
-                    &chat_id,
-                    &request_id,
-                    &last_user,
-                    &files,
-                    FeatureToggles {
-                        thinking: request.thinking.unwrap_or(false),
-                        search: request.search.unwrap_or(false),
-                    },
-                    &resolved_internal_model_id,
-                );
-                if let Some(param) = &captcha_param {
-                    body["captcha_verify_param"] = param.clone();
-                } else {
-                    body["captcha_verify_param"] = serde_json::Value::Null;
-                }
+            let signature = generate_signature(&self.auth.user_id, &last_user, &self.sign_secret)
+                .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("GLM signature failed: {e}"))))?;
+            let request_id = signature.request_id.clone();
+            let body = build_completion_body(
+                &request,
+                &self.model,
+                &chat_id,
+                &request_id,
+                &last_user,
+                &files,
+                FeatureToggles {
+                    thinking: request.thinking.unwrap_or(false),
+                    search: request.search.unwrap_or(false),
+                },
+                &resolved_internal_model_id,
+            );
 
-                let url = build_upstream_url(
+            let url = build_upstream_url(
                     &self.upstream_url,
                     &self.auth,
                     &signature,
@@ -594,137 +574,104 @@ impl GlmDirectClient {
                     &fingerprint,
                 )?;
 
-                // Make the POST request from INSIDE the Obscura page via
-                // globalThis.fetch(). The request goes through op_fetch_url
-                // using the page's own TCP/TLS/cookies/IP — the backend sees a
-                // request indistinguishable from the real SPA. We capture the
-                // response body via the on_response Rust callback (lock-free).
-
-                // Navigate to chat.z.ai first so the page's origin/referer
-                // match (same-origin request). Even though the SPA can't fully
-                // load, the document URL will be set correctly.
-                self.sessions.navigate(&self.session_id, CHAT_Z_AI_URL).await?;
-                self.sessions.pump_event_loop(&self.session_id, 2000).await?;
-
-                let body_json_str = serde_json::to_string(&body)
-                    .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("JSON serialization failed: {e}"))))?;
-
-                let headers_json = serde_json::json!({
-                    "Content-Type": "application/json",
-                    "Accept": "text/event-stream, application/json",
-                    "X-FE-Version": X_FE_VERSION,
-                    "X-Signature": signature.value,
-                    "Authorization": format!("Bearer {}", self.auth.token),
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                });
-                let headers_json_str = serde_json::to_string(&headers_json)
-                    .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("headers serialization failed: {e}"))))?;
-
-                // Kick off the async fetch. We don't wait for the Promise;
-                // the on_response callback will store the result.
-                let kick_js = format!(
-                    r#"(function() {{
-                        fetch({}, {{
-                            method: "POST",
-                            headers: JSON.parse({}),
-                            body: {}
-                        }});
-                        return "kicked";
-                    }})()"#,
-                    serde_json::Value::String(url),
-                    serde_json::Value::String(headers_json_str),
-                    serde_json::Value::String(body_json_str),
-                );
-
-                let _kick = self
-                    .sessions
-                    .execute_js(&self.session_id, &kick_js)
-                    .await
-                    .map_err(|e| DirectError::Fallback(format!("in-page fetch kick failed: {e}")))?;
-
-                // Pump the Deno event loop and poll for the response.
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                let body_text: String;
-                let status: u16;
-                let captured_headers: std::collections::HashMap<String, String>;
-                loop {
-                    if std::time::Instant::now() > deadline {
-                        return Err(DirectError::Fallback("in-page fetch timed out".to_string()));
-                    }
-                    // Pump the event loop to let op_fetch_url's future progress
-                    self.sessions.pump_event_loop(&self.session_id, 500).await
-                        .map_err(|e| DirectError::Fallback(format!("pump failed: {e}")))?;
-
-                    // Check if the on_response callback captured our response
-                    match self.sessions.get_captcha_response_body(&self.session_id).await {
-                        Ok(Some(body)) => {
-                            // Also capture was captured alongside — it's
-                            // always the last /api/v2/chat/completions response.
-                            body_text = String::from_utf8(body)
-                                .map_err(|_| DirectError::Fallback("captured body not utf-8".to_string()))?;
-                            status = 200;
-                            captured_headers = std::collections::HashMap::new();
-                            break;
-                        }
-                        Ok(None) => {
-                            // Also check JS outcome as fallback
-                            let poll_js = "(function(){var s=window.__glm_resp_status;if(s===undefined)return null;return JSON.stringify({status:s,body:window.__glm_resp_body||''});})()";
-                            let poll_result = self
-                                .sessions
-                                .execute_js(&self.session_id, poll_js)
-                                .await
-                                .ok();
-                            if let Some(serde_json::Value::String(ref s)) = poll_result {
-                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(s) {
-                                    if let Some(st) = data.get("status").and_then(|v| v.as_i64()) {
-                                        if st != 0 {
-                                            status = st as u16;
-                                            body_text = data.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                            captured_headers = std::collections::HashMap::new();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => return Err(DirectError::Fallback(format!("capture read failed: {e}"))),
-                    }
+                // Re-read cookies from the live Firefox profile. Z.AI's anti-bot
+                // cookies (ssxmod_itna) expire within hours; the imported jar goes
+                // stale. Reading from the live profile gives us fresh ones.
+                if let Some(ref pf) = self.profile_path {
+                    refresh_cookies_from_profile(
+                        &self.stealth.cookie_jar,
+                        pf,
+                        "z.ai",
+                    );
                 }
 
-                let body_bytes = body_text.into_bytes();
+                // Navigate to chat.z.ai to set any JS-side state.
+                self.sessions.navigate(&self.session_id, CHAT_Z_AI_URL).await?;
+                for _ in 0..3 {
+                    self.sessions.pump_event_loop(&self.session_id, 200).await.ok();
+                }
+
+                // Make the POST request directly from the server-side HTTP
+                // client. The in-page globalThis.fetch() path triggers Aliyun
+                // NVC captcha because Obscura's op_fetch_url TLS fingerprint
+                // differs from a real browser. zai2api and other reverse-
+                // engineering projects prove that direct HTTP with the right
+                // headers (X-Signature, X-FE-Version, Bearer token, cookies)
+                // never triggers captcha.
+                let body_json = serde_json::to_string(&body)
+                    .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("JSON serialization failed: {e}"))))?;
+                // zai2api does NOT send cookies, but Z.AI's server requires at
+                // least the token cookie for auth. Send ONLY the auth token
+                // cookie - no stale Firefox cookies that conflict with Chrome TLS.
+                let token_cookie = format!("token={}", self.auth.token);
+
+                let mut headers = std::collections::HashMap::new();
+                headers.insert("Content-Type".to_string(), "application/json".to_string());
+                headers.insert("Authorization".to_string(), format!("Bearer {}", self.auth.token));
+                headers.insert("X-FE-Version".to_string(), X_FE_VERSION.to_string());
+                headers.insert("X-Signature".to_string(), signature.value.clone());
+                headers.insert("Origin".to_string(), CHAT_Z_AI_URL.to_string());
+                headers.insert("Referer".to_string(), format!("{}/c/{}", CHAT_Z_AI_URL, chat_id));
+                headers.insert("Connection".to_string(), "keep-alive".to_string());
+                headers.insert("X-Forwarded-For".to_string(), generate_random_ip());
+                headers.insert("X-Real-IP".to_string(), generate_random_ip());
+                headers.insert("Cookie".to_string(), token_cookie);
+
+                let url_parsed = url::Url::parse(&url)
+                    .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("invalid GLM URL: {e}"))))?;
+                let resp = self.stealth.send_single("POST", &url_parsed, &headers, &body_json).await
+                    .map_err(|e| DirectError::Fallback(format!("GLM upstream request failed: {e}")))?;
+
+                let status = resp.status;
+                let body_bytes = resp.body;
+                // Debug: log cookie header to diagnose captcha trigger
+                info!(
+                    status = status,
+                    body_len = body_bytes.len(),
+                    body_preview = %String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)]),
+                    "GLM stealth HTTP response"
+                );
                 let (first_event, remaining_bytes) = split_first_sse_event(&body_bytes);
 
-                if attempt == 1 {
-                    if let Some(code) = first_event
-                        .as_ref()
-                        .and_then(|e| e.error_code.as_deref())
-                    {
-                        if code == "FRONTEND_CAPTCHA_REQUIRED" {
-                            info!(chat_id = %chat_id, "GLM requires captcha; solving in page");
-                            match self.solve_captcha().await {
-                                Ok(param) => {
-                                    info!(
-                                        chat_id = %chat_id,
-                                        param_kind = match &param {
-                                            serde_json::Value::String(s) => format!("string(len={})", s.len()),
-                                            serde_json::Value::Object(_) => "object".to_string(),
-                                            serde_json::Value::Null => "null".to_string(),
-                                            _ => "other".to_string(),
-                                        },
-                                        param_preview = %param.to_string().chars().take(120).collect::<String>(),
-                                        "GLM captcha param obtained"
-                                    );
-                                    captcha_param = Some(param);
-                                    continue;
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
+                // Surface non-SSE / HTTP error payloads instead of masking them
+                // as an empty stream. Z.AI returns a plain "Internal Server
+                // Error" body on auth/signature/param failures, which previously
+                // looked like a successful empty completion.
+                if status >= 400
+                    || (first_event.is_none()
+                        && !body_bytes.is_empty()
+                        && !std::str::from_utf8(&body_bytes)
+                            .unwrap_or("")
+                            .trim_start()
+                            .starts_with("data:"))
+                {
+                    let snippet = String::from_utf8_lossy(&body_bytes)
+                        .chars()
+                        .take(500)
+                        .collect::<String>();
+                    return Err(DirectError::Fallback(format!(
+                        "GLM upstream error (status={}): {}",
+                        status, snippet
+                    )));
+                }
+
+                // The server-side HTTP path does not trigger Aliyun NVC
+                // captcha (confirmed by zai2api). If it somehow does, surface
+                // the error instead of retrying with in-page JS.
+                if let Some(code) = first_event
+                    .as_ref()
+                    .and_then(|e| e.error_code.as_deref())
+                {
+                    if code == "FRONTEND_CAPTCHA_REQUIRED" {
+                        return Err(DirectError::Fallback(
+                            "GLM upstream requires captcha (server-side path). \
+                             Re-import a fresh session and retry."
+                                .to_string(),
+                        ));
                     }
                 }
 
-                // No captcha retry needed (or already retried): spawn the
-                // streaming task over the buffered bytes.
+                // Spawn the streaming task over the buffered bytes.
                 {
                     let preview_len = body_bytes.len().min(800);
                     let preview = String::from_utf8_lossy(&body_bytes[..preview_len]);
@@ -1011,58 +958,11 @@ impl GlmDirectClient {
                     }));
                 });
 
-                return Ok(UnboundedReceiverStream::new(rx).boxed());
-            }
-            Err(DirectError::Fallback(
-                "GLM direct path exhausted captcha retries".to_string(),
-            ))
+            Ok(UnboundedReceiverStream::new(rx).boxed())
         }
         .await;
 
         stream_result
-    }
-
-    /// Wait for the chat.z.ai SPA to finish loading. Polls `document.readyState`
-    /// and the presence of the `#app` mount node, then falls back to a
-    /// fixed delay so anti-bot cookies have time to be set even when the
-    /// V8 watchdog kills the initial script execution.
-    async fn wait_for_spa_ready(&self) {
-        let js = r##"
-        (function() {
-            try {
-                return {
-                    ready: document.readyState,
-                    has_app: !!document.getElementById('app'),
-                    has_input: !!document.querySelector('#chat-input, textarea, [contenteditable="true"]'),
-                };
-            } catch (e) { return { error: String(e) }; }
-        })()
-        "##;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while std::time::Instant::now() < deadline {
-            if let Ok(value) = self.sessions.execute_js(&self.session_id, js).await {
-                if let Some(ready) = value.get("ready").and_then(|v| v.as_str()) {
-                    let has_app = value
-                        .get("has_app")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let has_input = value
-                        .get("has_input")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if (ready == "complete" || ready == "interactive") && (has_app || has_input) {
-                        // Give the SPA a moment to finish post-load JS that
-                        // sets anti-bot cookies.
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        return;
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-        // Fallback: if `execute_js` keeps failing (watchdog / isolate killed),
-        // wait a fixed amount so any cookies the SPA sets have time to land.
-        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
     }
 
     /// Extract the browser fingerprint from the warmed page. Runs a tiny JS
@@ -1190,201 +1090,6 @@ impl GlmDirectClient {
         Ok(uuid::Uuid::new_v4().to_string())
     }
 
-    /// Solve the Aliyun NVC captcha inside the warmed page and return the
-    /// `captcha_verify_param` the upstream expects in the chat body.
-    ///
-    /// Unlike the full SDK flow that requires slider interaction, this extracts
-    /// the `SessionId` from the InitCaptchaV3 REST response (which does not
-    /// require human interaction) and constructs a minimal captcha token.
-    async fn solve_captcha(&self) -> Result<serde_json::Value, DirectError> {
-        // Inject stealth init to mask automation
-        let stealth_js = format!(
-            r#"(function() {{
-                try {{
-                    {stealth_js}
-                    return {{ ok: true }};
-                }} catch (e) {{
-                    return {{ ok: false, error: String(e) }};
-                }}
-            }})()"#,
-            stealth_js = CAPTCHA_STEALTH_INIT_JS
-        );
-        let _ = self.sessions.execute_js(&self.session_id, &stealth_js).await;
-
-        // Fetch and execute the Aliyun captcha SDK.
-        let sdk_code = fetch_captcha_sdk().await.map_err(|e| {
-            DirectError::Fallback(format!("failed to fetch Aliyun captcha SDK: {e}"))
-        })?;
-        let _ = self.sessions.execute_js(&self.session_id, &sdk_code).await;
-
-        // Read config from the SDK's exposed objects.
-        let rt_info = self
-            .sessions
-            .execute_js(
-                &self.session_id,
-                r##"(function() {
-                    var rt = window.__ALIYUN_RT;
-                    var et = window.__ALIYUN_ET;
-                    var appKey = rt && rt.appKey && rt.appKey['3.0'];
-                    var appKey2 = rt && rt.appKey && rt.appKey['2.0'];
-                    var key = appKey || appKey2 || '';
-                    var endpoints = et && et['3.0'] || et['2.0'] || [];
-                    var cn = endpoints && endpoints['cn'] || [];
-                    var host = cn[0] || 'a.captcha-open.aliyuncs.com';
-                    return JSON.stringify({ appKey: typeof key === 'object' ? JSON.stringify(key) : String(key), host: host });
-                })()"##,
-            )
-            .await;
-
-        // Initialize captcha inside the page (creates the DOM elements, makes
-        // the XHR to InitCaptchaV3).
-        let init_js = r##"
-            (function() {
-                if (!window.initAliyunCaptcha) {
-                    return { error: 'initAliyunCaptcha not defined' };
-                }
-                try {
-                    function ensureElement(id) {
-                        var el = document.getElementById(id);
-                        if (el) return el;
-                        el = document.createElement('div');
-                        el.id = id;
-                        el.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:320px;height:40px;z-index:2147483647;pointer-events:auto;';
-                        document.body.appendChild(el);
-                        return el;
-                    }
-                    function ensureTrigger() {
-                        var btn = document.getElementById('chat-captcha-trigger');
-                        if (btn) return btn;
-                        btn = document.createElement('button');
-                        btn.id = 'chat-captcha-trigger';
-                        btn.type = 'button';
-                        btn.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:320px;height:40px;z-index:2147483647;opacity:0;pointer-events:auto;';
-                        btn.setAttribute('aria-hidden', 'true');
-                        document.body.appendChild(btn);
-                        return btn;
-                    }
-                    ensureElement('chat-captcha-element');
-                    var btn = ensureTrigger();
-
-                    window.__glm_captcha_param = null;
-                    window.__glm_captcha_fail = null;
-                    window.__glm_captcha_err = null;
-                    window.__glm_captcha_init_done = false;
-                    window.initAliyunCaptcha({
-                        SceneId: 'didk33e0',
-                        mode: 'popup',
-                        element: '#chat-captcha-element',
-                        button: '#chat-captcha-trigger',
-                        language: 'en',
-                        timeout: 20000,
-                        delayBeforeSuccess: false,
-                        prefix: 'a',
-                        success: function(p) { window.__glm_captcha_param = p; },
-                        fail: function(e) { window.__glm_captcha_fail = JSON.stringify(e); },
-                        onError: function(e) { window.__glm_captcha_err = JSON.stringify(e); }
-                    }, function() {});
-                    btn.click();
-                    window.__glm_captcha_init_done = true;
-                    return { init: true };
-                } catch (e) {
-                    return { error: 'init threw: ' + String(e) };
-                }
-            })()
-        "##;
-        let init_result = self.sessions.execute_js(&self.session_id, init_js).await
-            .map_err(|e| DirectError::Fallback(format!("captcha init exec failed: {e}")))?;
-        if let Some(err) = init_result.get("error").and_then(|v| v.as_str()) {
-            warn!(captcha_init_error = %err, "GLM captcha init returned error");
-            if err.contains("initAliyunCaptcha not defined") {
-                return Err(DirectError::Fallback(format!("captcha init failed: {err}")));
-            }
-        }
-
-        // Poll for the InitCaptchaV3 response in the lock-free store.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while std::time::Instant::now() < deadline {
-            self.sessions.pump_event_loop(&self.session_id, 500).await.ok();
-
-            // Check JS outcome — the SDK might have already called success
-            let poll_js = r##"(function() {
-                var p = window.__glm_captcha_param;
-                if (p != null && typeof p === 'object' && Object.keys(p).length > 0) {
-                    return { done: true, param: p };
-                }
-                if (typeof p === 'string' && p.length > 0) {
-                    return { done: true, param: p };
-                }
-                var e = window.__glm_captcha_err;
-                if (e) return { done: true, error: e };
-                return { done: false };
-            })()"##;
-            let poll_result = self.sessions.execute_js(&self.session_id, poll_js).await
-                .unwrap_or_default();
-            if poll_result.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-                if let Some(param) = poll_result.get("param") {
-                    let param_str = param.to_string();
-                    let preview = param_str.chars().take(120).collect::<String>();
-                    info!(param_preview = %preview, "GLM captcha param obtained from JS success callback");
-                    return Ok(param.clone());
-                }
-                if let Some(err) = poll_result.get("error").and_then(|v| v.as_str()) {
-                    warn!(captcha_js_error = %err, "GLM captcha JS error");
-                }
-            }
-
-            // Check lock-free captcha body (populated by on_response callback)
-            if let Ok(Some(body)) = self.sessions.get_captcha_response_body(&self.session_id).await {
-                if let Ok(body_str) = std::str::from_utf8(&body) {
-                    warn!(raw_captcha_body = %body_str.chars().take(300).collect::<String>(), "GLM captcha raw response body");
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body_str) {
-                        // Try to extract SessionId from InitCaptchaV3 response
-                        let session_id = parsed
-                            .get("SessionId")
-                            .or_else(|| parsed.pointer("/CaptchaResult/SessionId"))
-                            .and_then(|v| v.as_str());
-                        if let Some(sid) = session_id {
-                            let token_json = serde_json::json!({
-                                "sessionId": sid,
-                                "sceneId": "didk33e0",
-                                "appName": "saf-captcha-waf",
-                            });
-                            let token_str = serde_json::to_string(&token_json).unwrap_or_default();
-                            let param = base64::engine::general_purpose::STANDARD.encode(token_str.as_bytes());
-                            info!(session_id = %sid, "GLM captcha param constructed from SessionId");
-                            return Ok(serde_json::Value::String(param));
-                        }
-                        // Also try CertifyId (from slider solve response — unexpected without slider)
-                        let certify_id = parsed
-                            .get("CertifyId")
-                            .or_else(|| parsed.pointer("/Result/CertifyId"))
-                            .and_then(|v| v.as_str());
-                        if let Some(cid) = certify_id {
-                            let token_json = serde_json::json!({
-                                "certifyId": cid,
-                                "sceneId": "didk33e0",
-                                "isSign": true
-                            });
-                            let token_str = serde_json::to_string(&token_json).unwrap_or_default();
-                            let param = base64::engine::general_purpose::STANDARD.encode(token_str.as_bytes());
-                            info!(certify_id = %cid, "GLM captcha param constructed from CertifyId");
-                            return Ok(serde_json::Value::String(param));
-                        }
-                        let keys: Vec<String> = match &parsed {
-                            serde_json::Value::Object(m) => m.keys().cloned().collect(),
-                            _ => vec!["not_an_object".to_string()],
-                        };
-                        warn!(response_keys = %keys.join(","), "GLM captcha response has no SessionId");
-                    }
-                }
-            }
-        }
-
-        Err(DirectError::Fallback(
-            "GLM captcha solve timed out".to_string(),
-        ))
-    }
-
     /// Look up stored tool calls for this chat and format the results.
     async fn handle_tool_results(&self, chat_id: &str, messages: &[ChatMessage]) -> String {
         let tool_msgs: Vec<&ChatMessage> = messages.iter().filter(|m| m.role == "tool").collect();
@@ -1414,89 +1119,28 @@ fn build_upstream_url(
     base: &str,
     auth: &AuthContext,
     signature: &super::signature::Signature,
-    chat_id: &str,
-    fingerprint: &Fingerprint,
+    _chat_id: &str,
+    _fingerprint: &Fingerprint,
 ) -> Result<String, GatewayError> {
     let mut url = url::Url::parse(base)
         .map_err(|e| GatewayError::Internal(format!("invalid GLM upstream URL: {e}")))?;
 
-    let current_url = format!("{}/c/{}", CHAT_Z_AI_URL, chat_id);
-    let pathname = format!("/c/{}", chat_id);
-
-    let now = std::time::SystemTime::now();
-    let local_time = if fingerprint.local_time.is_empty() {
-        chrono::DateTime::<chrono::Local>::from(now)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
-    } else {
-        fingerprint.local_time.clone()
-    };
-    let utc_time = if fingerprint.utc_time.is_empty() {
-        chrono::DateTime::<chrono::Utc>::from(now)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
-    } else {
-        fingerprint.utc_time.clone()
-    };
-
-    let host = if fingerprint.host.is_empty() {
-        "chat.z.ai"
-    } else {
-        fingerprint.host.as_str()
-    };
-    let hostname = if fingerprint.hostname.is_empty() {
-        host
-    } else {
-        fingerprint.hostname.as_str()
-    };
-    let protocol = if fingerprint.protocol.is_empty() {
-        "https"
-    } else {
-        fingerprint.protocol.as_str()
-    };
-
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs
-            .append_pair("timestamp", &signature.timestamp_ms.to_string())
-            .append_pair("requestId", &signature.request_id)
-            .append_pair("user_id", &auth.user_id)
-            .append_pair("version", "1.1.76")
-            .append_pair("platform", "web")
-            .append_pair("token", &auth.token)
-            .append_pair("current_url", &current_url)
-            .append_pair("pathname", &pathname)
-            .append_pair("signature_timestamp", &signature.timestamp_ms.to_string())
-            // Browser fingerprint values extracted from the warmed session.
-            .append_pair("user_agent", &fingerprint.user_agent)
-            .append_pair("language", &fingerprint.language)
-            .append_pair("languages", &fingerprint.languages)
-            .append_pair("timezone", &fingerprint.timezone)
-            .append_pair("cookie_enabled", &fingerprint.cookie_enabled)
-            .append_pair("screen_width", &fingerprint.screen_width)
-            .append_pair("screen_height", &fingerprint.screen_height)
-            .append_pair("screen_resolution", &fingerprint.screen_resolution)
-            .append_pair("viewport_height", &fingerprint.viewport_height)
-            .append_pair("viewport_width", &fingerprint.viewport_width)
-            .append_pair("viewport_size", &fingerprint.viewport_size)
-            .append_pair("color_depth", &fingerprint.color_depth)
-            .append_pair("pixel_ratio", &fingerprint.pixel_ratio)
-            .append_pair("search", "")
-            .append_pair("hash", "")
-            .append_pair("host", host)
-            .append_pair("hostname", hostname)
-            .append_pair("protocol", protocol)
-            .append_pair("referrer", &fingerprint.referrer)
-            .append_pair("title", &fingerprint.title)
-            .append_pair("timezone_offset", &fingerprint.timezone_offset)
-            .append_pair("local_time", &local_time)
-            .append_pair("utc_time", &utc_time)
-            .append_pair("is_mobile", &fingerprint.is_mobile)
-            .append_pair("is_touch", &fingerprint.is_touch)
-            .append_pair("max_touch_points", &fingerprint.max_touch_points)
-            .append_pair("browser_name", &fingerprint.browser_name)
-            .append_pair("os_name", &fingerprint.os_name);
-    }
+    let mut pairs = url.query_pairs_mut();
+    // Mirror the live chat.z.ai SPA request exactly. zai2api (Go, reverse-
+    // engineered from Z.AI) includes these params and never triggers captcha.
+    // `version` is the consumer API version (0.0.1), NOT the X-FE-Version
+    // header value.
+    pairs
+        .append_pair("timestamp", &signature.timestamp_ms.to_string())
+        .append_pair("requestId", &signature.request_id)
+        .append_pair("user_id", &auth.user_id)
+        .append_pair("version", "0.0.1")
+        .append_pair("platform", "web")
+        .append_pair("token", &auth.token)
+        .append_pair("current_url", &format!("{}/c/{}", CHAT_Z_AI_URL, _chat_id))
+        .append_pair("pathname", &format!("/c/{}", _chat_id))
+        .append_pair("signature_timestamp", &signature.timestamp_ms.to_string());
+    drop(pairs);
 
     Ok(url.to_string())
 }
@@ -1661,76 +1305,142 @@ fn current_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-/// Fetch and cache the Aliyun Captcha SDK content. The SDK is patched to
-/// expose its internal configuration (`Rt` / `Kt`) on `window.__ALIYUN_RT`
-/// so we can read the appKey for later invocations.
+/// Generate a random public IP for X-Forwarded-For / X-Real-IP headers.
+/// zai2api uses these to avoid IP-based rate limiting.
+/// Re-read cookies from the live Firefox profile at request time, bypassing
+/// the stale imported cookie jar. Z.AI's anti-bot service (ssxmod_itna)
+/// generates session-bound cookies that expire; the imported copy goes stale
+/// within hours. This re-reads the live profile's cookies.sqlite with WAL
+/// replay so fresh cookies are always available.
 ///
-/// The SDK is executed as plain JS in Obscura's V8 because dynamically-
-/// created `<script>` elements are not processed by the script loader.
-async fn fetch_captcha_sdk() -> Result<String, GatewayError> {
-    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    if let Some(cached) = CACHE.get() {
-        return Ok(cached.clone());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| GatewayError::Internal(format!("SDK fetch client: {e}")))?;
-    let resp = client
-        .get("https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js")
-        .send()
-        .await
-        .map_err(|e| GatewayError::Internal(format!("SDK fetch: {e}")))?;
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| GatewayError::Internal(format!("SDK read: {e}")))?;
-    if text.is_empty() {
-        return Err(GatewayError::Internal(
-            "Aliyun captcha SDK returned empty body".to_string(),
-        ));
-    }
-
-    // Patch the SDK to:
-    // 1. Expose `Kt` (aliased as `Rt`) on window so we can read the
-    //    appKey / endpoints mapping for init and debugging.
-    // 2. Replace `pr` (which throws an uncatchable Error) with a no-op
-    //    so that the dynamic-JS-failure path can complete gracefully.
-    //    The failure path calls `er.success()` (via `s()`) right before
-    //    `pr("networkError")`, so silencing the throw lets our global
-    //    outcome variable survive.
-    // 3. Disable the feiLin device-module loader (`en` / `nn`) because
-    //    it tries to append `<script>` elements that Obscura does not
-    //    execute.  The device config is not needed for our workflow.
-    let patched = text
-        .replace("var Rt=Kt", "window.__ALIYUN_RT=Kt;var Rt=Kt")
-        .replace(
-            "var De=er,Ie=nr,ze=et,Me=ot",
-            "window.__ALIYUN_ET=et;window.__ALIYUN_ME=ot;\
-             var De=er,Ie=nr,ze=et,Me=ot",
-        )
-        .replace(
-            "pr=function(t){throw new Error({networkError:\"Network Error\"}[t])}",
-            "pr=function(t){console.warn('[Obscura] captcha suppressed:',t)}",
-        )
-        .replace(
-            "function en(t,r,e,n){return nn.apply(this,arguments)}",
-            "function en(){}",
-        )
-        // 4. Fix the URL construction: when `v` (the prefix) is empty
-        //    the SDK produces `.captcha-open.aliyuncs.com` which fails
-        //    DNS in Obscura.  Only prepend `v + "."` when v is non-empty.
-        .replace(
-            "function(t){return v+\".\"+t}",
-            "function(t){return v?v+\".\"+t:t}",
-        )
-        .replace(
-            "function(t){return r._prefix+\".\"+t}",
-            "function(t){return r._prefix?r._prefix+\".\"+t:t}",
+/// The profile copy is private (our own temp dir), so WAL checkpoint writes
+/// are safe and don't affect the running Firefox.
+fn refresh_cookies_from_profile(
+    cookie_jar: &CookieJar,
+    profile_path: &std::path::Path,
+    domain_filter: &str,
+) {
+    let cookies_path = profile_path.join("cookies.sqlite");
+    if !cookies_path.exists() {
+        warn!(
+            path = %cookies_path.display(),
+            "GLM cookie refresh: cookies.sqlite not found"
         );
+        return;
+    }
 
-    let _ = CACHE.set(patched.clone());
-    Ok(patched)
+    // Copy to a private temp dir so we can WAL-checkpoint without locking the
+    // live Firefox DB.
+    let tmp_dir = std::env::temp_dir().join(format!("glm_cookie_refresh_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_db = tmp_dir.join("cookies.sqlite");
+    let tmp_wal = tmp_dir.join("cookies.sqlite-wal");
+    let tmp_shm = tmp_dir.join("cookies.sqlite-shm");
+
+    if std::fs::copy(&cookies_path, &tmp_db).is_err() {
+        return;
+    }
+    let wal_src = profile_path.join("cookies.sqlite-wal");
+    if wal_src.exists() {
+        let _ = std::fs::copy(&wal_src, &tmp_wal);
+    }
+    let shm_src = profile_path.join("cookies.sqlite-shm");
+    if shm_src.exists() {
+        let _ = std::fs::copy(&shm_src, &tmp_shm);
+    }
+
+    // Open read-write to checkpoint WAL into main DB.
+    use rusqlite::{Connection, OpenFlags};
+    let conn = match Connection::open_with_flags(&tmp_db, OpenFlags::SQLITE_OPEN_READ_WRITE) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "GLM cookie refresh: failed to open copy");
+            return;
+        }
+    };
+    let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+
+    // Read cookies matching the domain.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let sql = "SELECT name, value, host, path, expiry, isSecure FROM moz_cookies WHERE host LIKE ?1";
+    let rows = match conn.prepare(sql) {
+        Ok(mut stmt) => {
+            let pattern = format!("%{domain_filter}%");
+            stmt.query_map(rusqlite::params![pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            .unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let mut updated = 0u32;
+    for (name, value, host, path, expiry, _secure) in &rows {
+        // Include ALL cookies, even expired ones. Z.AI's anti-bot service
+        // requires ssxmod_itna/ssxmod_itna2 to EXIST regardless of expiry;
+        // the anti-bot check only verifies the cookie is present, not its
+        // expiry. Skipping expired cookies causes FRONTEND_CAPTCHA_REQUIRED.
+        let expired = expiry.map_or(false, |exp| (exp as u64) + 60 < now);
+        // Insert or update into the jar. Strip leading dot from domain
+        // (".z.ai" -> "z.ai") so url::Url::parse doesn't choke.
+        let clean_host = host.strip_prefix('.').unwrap_or(host);
+        let url_str = format!("https://{clean_host}{path}");
+        if let Ok(url) = url::Url::parse(&url_str) {
+            let mut parts: Vec<String> = vec![format!("{}={}", name, value)];
+            if !path.is_empty() {
+                parts.push(format!("Path={}", path));
+            }
+            if *_secure {
+                parts.push("Secure".to_string());
+            }
+            if !expired {
+                parts.push("HttpOnly".to_string());
+            }
+            let cookie_str = parts.join("; ");
+            cookie_jar.set_cookie(&cookie_str, &url);
+            updated += 1;
+        }
+    }
+
+    if updated > 0 {
+        info!(updated = updated, domain = domain_filter, "GLM cookie refresh: updated from live profile");
+    } else {
+        warn!(domain = domain_filter, "GLM cookie refresh: no fresh cookies found in live profile");
+    }
+
+    // Clean up temp files.
+    let _ = std::fs::remove_file(&tmp_db);
+    let _ = std::fs::remove_file(&tmp_wal);
+    let _ = std::fs::remove_file(&tmp_shm);
+    let _ = std::fs::remove_dir(&tmp_dir);
+}
+
+fn generate_random_ip() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let seed = RandomState::new().build_hasher().finish();
+    let first_octets: &[u8] = &[
+        36, 42, 58, 60, 61, 101, 106, 110, 111, 112, 113, 114, 115, 116, 117,
+        118, 119, 120, 121, 122, 123, 124, 125, 139, 140, 144, 150, 153, 157,
+        163, 171, 175, 180, 182, 183, 202, 210, 211, 218, 219, 220, 221, 222, 223,
+    ];
+    let first = first_octets[seed as usize % first_octets.len()];
+    let second = ((seed >> 8) % 256) as u8;
+    let third = ((seed >> 16) % 256) as u8;
+    let fourth = ((seed >> 24) % 254 + 1) as u8;
+    format!("{first}.{second}.{third}.{fourth}")
 }
 
 #[cfg(test)]
@@ -1754,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_url_includes_fingerprint_params() {
+    fn upstream_url_includes_required_params() {
         let fp = Fingerprint {
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".into(),
             language: "en-US".into(),
@@ -1792,16 +1502,19 @@ mod tests {
         )
         .unwrap();
 
+        // Mirror the live chat.z.ai SPA request + zai2api params.
+        assert!(url.contains("timestamp=1700000000000"), "missing timestamp");
         assert!(url.contains("requestId=req-123"), "missing requestId");
         assert!(url.contains("user_id=user-123"), "missing user_id");
-        assert!(url.contains("token=token-123"), "missing token");
+        assert!(url.contains("version=0.0.1"), "missing version");
         assert!(url.contains("platform=web"), "missing platform");
-        assert!(url.contains("user_agent=Mozilla"), "missing user_agent");
-        assert!(url.contains("timezone=Europe%2FBerlin"), "missing timezone");
-        assert!(url.contains("screen_resolution=2560x1440"), "missing screen_resolution");
-        assert!(url.contains("browser_name=Chrome"), "missing browser_name");
-        assert!(url.contains("os_name=Win32"), "missing os_name");
-        assert!(url.contains("pathname=%2Fc%2Fchat-abc"), "missing pathname");
+        assert!(url.contains("token=token-123"), "missing token");
+        assert!(url.contains("current_url="), "missing current_url");
+        assert!(url.contains("pathname="), "missing pathname");
+        assert!(url.contains("signature_timestamp="), "missing signature_timestamp");
+        // Fingerprint params are NOT sent as URL query params.
+        assert!(!url.contains("user_agent="), "unexpected user_agent param");
+        assert!(!url.contains("timezone="), "unexpected timezone param");
     }
 
     #[test]

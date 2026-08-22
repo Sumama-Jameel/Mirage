@@ -52,11 +52,6 @@ pub struct GlmConfig {
     /// endpoint; v1 can be forced here if an account still uses it.
     #[serde(default = "default_glm_upstream_url")]
     pub upstream_url: String,
-
-    /// Force the UI-automation fallback path for every GLM request.
-    /// Useful for debugging or when the direct API is temporarily unstable.
-    #[serde(default)]
-    pub force_ui: bool,
 }
 
 fn default_glm_sign_secret() -> String {
@@ -124,7 +119,6 @@ impl Config {
             .set_default("browser.user_agent_override", None::<String>)?
             .set_default("glm.sign_secret", "junjie")?
             .set_default("glm.upstream_url", "https://chat.z.ai/api/v2/chat/completions")?
-            .set_default("glm.force_ui", false)?
             .set_default("data_dir", None::<String>)?
             .add_source(File::with_name("obscura-gateway").required(false))
             .add_source(config::Environment::with_prefix("OBSCURA_GATEWAY").separator("__"));
@@ -222,7 +216,6 @@ impl Default for GlmConfig {
         Self {
             sign_secret: default_glm_sign_secret(),
             upstream_url: default_glm_upstream_url(),
-            force_ui: false,
         }
     }
 }
@@ -258,7 +251,6 @@ mod tests {
         assert_eq!(cfg.browser.resolved_identity(), "firefox");
         assert_eq!(cfg.glm.sign_secret, "junjie");
         assert_eq!(cfg.glm.upstream_url, "https://chat.z.ai/api/v2/chat/completions");
-        assert!(!cfg.glm.force_ui);
     }
 
     #[test]

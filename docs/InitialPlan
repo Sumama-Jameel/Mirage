@@ -1,0 +1,2025 @@
+Bro, your test result is actually the most important clue.
+
+You proved:
+
+> For these browser/internal provider APIs, sending OpenAI-style `tools` upstream is basically useless.  
+> The models ignore native `tools` unless you inject tool instructions into the prompt.
+
+So the production architecture must be:
+
+> **OpenAI-compatible on the outside, prompted tool-output protocol on the inside.**
+
+Meaning:
+
+```text
+Client / OpenCode / App
+        ↓
+OpenAI-compatible API
+        ↓
+Mirage Gateway
+        ↓
+Tool prompt compiler
+        ↓
+Internal browser API adapter
+        ↓
+Provider web backend
+```
+
+The client sees normal OpenAI tool calling.
+
+But internally Mirage does **not** trust the provider’s native tool-calling pipeline unless a provider is explicitly proven to support it.
+
+---
+
+# 1. Core principle for Mirage
+
+## Public API: OpenAI-native
+
+Your users should be able to call:
+
+```http
+POST /v1/chat/completions
+```
+
+with:
+
+```json
+{
+  "model": "mirage:deepseek-chat",
+  "messages": [...],
+  "tools": [...],
+  "tool_choice": "auto",
+  "stream": true
+}
+```
+
+They should get back OpenAI-style:
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "tool_calls": [...]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}
+```
+
+So from the outside, Mirage looks like OpenAI.
+
+---
+
+## Internal upstream: do not rely on native tools
+
+For the actual provider/browser API, your test shows that this:
+
+```json
+{
+  "tools": [...]
+}
+```
+
+is often ignored.
+
+So Mirage should do:
+
+```text
+If provider profile.nativeTools === true:
+  send native tools upstream
+Else:
+  strip tools upstream
+  convert tools into Mirage tool prompt
+  parse tool output from text
+```
+
+For almost all your tested browser providers, the mode should be:
+
+```ts
+nativeTools: false
+promptTools: true
+stripUpstreamTools: true
+```
+
+---
+
+# 2. Do not make XML the permanent core
+
+Your data says XML injection is currently what makes tool calling work.
+
+That is useful, but I would not make XML the permanent long-term protocol.
+
+Why?
+
+- XML is verbose
+- weak models can break tags
+- JSON inside XML is annoying
+- streaming XML parsing is more fragile
+- provider product prompts may interfere
+- it feels like a hack layer
+
+Instead, use a custom Mirage protocol.
+
+But do not over-invent.
+
+Use:
+
+> **Custom envelope + JSON payload**
+
+The envelope is Mirage-specific. The payload remains JSON because LLMs are relatively good at JSON and validators are easy.
+
+So the format is not “pure XML”, and not “pure JSON response”. It is a Mirage block.
+
+---
+
+# 3. Mirage Tool Protocol v1 — MTP/1
+
+Use this as the internal tool-output format.
+
+## Tool call block
+
+```text
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_001",
+  "name": "write_file",
+  "arguments": {
+    "name": "hello.txt",
+    "content": "Hello, world!"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+This is simple.
+
+It is not XML.
+
+It is not just JSON.
+
+It is a custom Mirage block containing JSON.
+
+---
+
+## Tool result block
+
+When returning tool results to the model, use:
+
+```text
+[MIRAGE_TOOL_RESULT_V1]
+{
+  "id": "call_001",
+  "output": {
+    "status": "success"
+  },
+  "error": null
+}
+[/MIRAGE_TOOL_RESULT_V1]
+```
+
+Then ask the model to continue.
+
+---
+
+## Multiple tool calls
+
+For now, prefer one tool call per turn.
+
+If you later allow parallel calls, use repeated blocks:
+
+```text
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_001",
+  "name": "read_file",
+  "arguments": {
+    "path": "a.txt"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_002",
+  "name": "read_file",
+  "arguments": {
+    "path": "b.txt"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+But for weak/free models, default to:
+
+```text
+one tool call only
+```
+
+That will be much more robust.
+
+---
+
+# 4. The base prompt you should use
+
+This is the important part.
+
+You said the base prompt must include that native tool calling from the gateway will break the pipeline, so the model should output tool calls instead of calling them natively.
+
+Use something like this.
+
+---
+
+## Mirage tool system prompt
+
+```text
+You are running inside Mirage, an OpenAI-compatible gateway.
+
+CRITICAL TOOL POLICY:
+- Native tool calling is disabled in this pipeline.
+- Do not attempt to call tools natively.
+- Do not use built-in tools from the host app.
+- Do not use provider tools, browser tools, search tools, code tools, canvas tools, or any hidden system tools.
+- Native tool invocation will break the pipeline.
+
+If you need to use a tool, you must output exactly one Mirage tool block in this format:
+
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_001",
+  "name": "tool_name",
+  "arguments": {
+    "argument_name": "argument_value"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+
+Rules:
+- Output only the Mirage tool block.
+- Do not wrap it in markdown.
+- Do not add explanations before or after it.
+- Do not output multiple tool blocks unless explicitly allowed.
+- The JSON must be valid.
+- Use only the tools listed below.
+- If no tool is needed, respond normally.
+```
+
+Then inject the tools.
+
+---
+
+## Tool definition injection
+
+Do not dump massive JSON Schema into weak models unless needed.
+
+Use a compact compiled form.
+
+Example:
+
+```text
+Available tools:
+
+1. write_file
+Description: Write a file.
+Arguments:
+- name: string, required. The file name.
+- content: string, required. The file content.
+
+Example:
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_001",
+  "name": "write_file",
+  "arguments": {
+    "name": "hello.txt",
+    "content": "Hello, world!"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+This is much better for weak models than dumping raw OpenAI tool schemas.
+
+---
+
+# 5. How Mirage should handle OpenAI `tools`
+
+When a client sends:
+
+```json
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Write a file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": ["name", "content"]
+        }
+      }
+    }
+  ]
+}
+```
+
+Mirage should do this internally:
+
+```text
+1. Accept OpenAI tools from client
+2. Normalize them into MirageToolDefinition
+3. Compile them into prompt text
+4. Strip tools from upstream provider request if nativeTools=false
+5. Send prompt to internal provider API
+6. Parse response for MTP blocks
+7. Convert MTP blocks back into OpenAI tool_calls
+```
+
+---
+
+## Canonical tool definition
+
+```ts
+type MirageToolDefinition = {
+  name: string;
+  description?: string;
+  parameters: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+};
+```
+
+All provider/tool logic should operate on this canonical shape.
+
+---
+
+# 6. The production request pipeline
+
+This is the architecture I would build.
+
+```text
+OpenAI-compatible request
+        ↓
+Request validator
+        ↓
+Model/profile resolver
+        ↓
+Message normalizer
+        ↓
+Tool compiler
+        ↓
+Provider adapter
+        ↓
+Internal browser API
+        ↓
+Stream/text parser
+        ↓
+MTP extractor
+        ↓
+Tool call validator
+        ↓
+OpenAI response converter
+        ↓
+Client
+```
+
+---
+
+# 7. Provider profiles are mandatory
+
+You cannot treat all providers the same.
+
+Create a profile per provider/model.
+
+Example:
+
+```ts
+type ProviderProfile = {
+  id: string;
+  provider: string;
+  model: string;
+
+  transport: "rest" | "sse" | "websocket";
+
+  auth: {
+    type: "cookie" | "token" | "session" | "custom";
+  };
+
+  capabilities: {
+    streaming: boolean;
+    nativeTools: boolean;
+    promptTools: boolean;
+    fileUpload: boolean;
+    imageInput: boolean;
+    stopSequences: boolean;
+    parallelToolCalls: boolean;
+  };
+
+  toolPolicy: {
+    mode: "native" | "mtp" | "xml" | "none";
+    stripUpstreamTools: boolean;
+    maxTools: number;
+    forceOneToolCall: boolean;
+    repairAttempts: number;
+  };
+
+  quirks: {
+    builtinToolConfusion: boolean;
+    requiresFinalReminder: boolean;
+    markdownWrapsToolCalls: boolean;
+    ignoresSystemPrompt: boolean;
+    acceptsRoleTool: boolean;
+  };
+};
+```
+
+Example:
+
+```ts
+const deepseekChatProfile: ProviderProfile = {
+  id: "deepseek-chat",
+  provider: "deepseek",
+  model: "deepseek-chat",
+  transport: "sse",
+  auth: {
+    type: "cookie"
+  },
+  capabilities: {
+    streaming: true,
+    nativeTools: false,
+    promptTools: true,
+    fileUpload: false,
+    imageInput: false,
+    stopSequences: false,
+    parallelToolCalls: false
+  },
+  toolPolicy: {
+    mode: "mtp",
+    stripUpstreamTools: true,
+    maxTools: 5,
+    forceOneToolCall: true,
+    repairAttempts: 1
+  },
+  quirks: {
+    builtinToolConfusion: true,
+    requiresFinalReminder: true,
+    markdownWrapsToolCalls: true,
+    ignoresSystemPrompt: false,
+    acceptsRoleTool: false
+  }
+};
+```
+
+This is not overengineering. This is how you avoid endless manual pain.
+
+---
+
+# 8. Do not forward native tools upstream by default
+
+For browser/internal endpoints, your default should be:
+
+```ts
+stripUpstreamTools: true
+```
+
+Why?
+
+Because your test shows:
+
+```text
+tools parameter alone = ignored
+```
+
+And worse, native tool payloads can:
+
+- trigger unsupported provider behavior
+- confuse product tool routing
+- leak into built-in tools
+- cause malformed streaming
+- break OpenCode integration
+- make the model think it should use hidden provider tools
+
+So Mirage should translate:
+
+```json
+{
+  "tools": [...]
+}
+```
+
+into prompt instructions instead.
+
+---
+
+# 9. Streaming architecture
+
+This is where most projects die.
+
+You need a streaming parser that can handle normal text and tool blocks without breaking the user experience.
+
+---
+
+## Desired behavior
+
+If the model is producing normal text:
+
+```text
+The capital of France is Paris.
+```
+
+Stream it immediately.
+
+If the model starts producing:
+
+```text
+[MIRAGE_TOOL_CALL_V1]
+```
+
+then Mirage should pause text emission and buffer the block.
+
+When the closing marker appears:
+
+```text
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+parse and validate.
+
+If valid, emit OpenAI-compatible `tool_calls`.
+
+If invalid, either repair or return an error depending on policy.
+
+---
+
+## Stream parser state machine
+
+Use a simple state machine:
+
+```ts
+type ParserState =
+  | "TEXT"
+  | "MAYBE_TOOL_START"
+  | "TOOL_BLOCK"
+  | "TOOL_END_MAYBE";
+```
+
+But for implementation, a buffered approach is easier.
+
+---
+
+## Basic streaming parser concept
+
+```ts
+const TOOL_START = "[MIRAGE_TOOL_CALL_V1]";
+const TOOL_END = "[/MIRAGE_TOOL_CALL_V1]";
+
+class MirageStreamParser {
+  private buffer = "";
+  private insideTool = false;
+
+  push(chunk: string) {
+    this.buffer += chunk;
+
+    const events = [];
+
+    while (true) {
+      if (!this.insideTool) {
+        const startIndex = this.buffer.indexOf(TOOL_START);
+
+        if (startIndex === -1) {
+          const safe = this.getSafeText();
+
+          if (safe) {
+            events.push({ type: "text", text: safe });
+            this.buffer = this.buffer.slice(safe.length);
+          }
+
+          break;
+        } else {
+          const before = this.buffer.slice(0, startIndex);
+
+          if (before) {
+            events.push({ type: "text", text: before });
+          }
+
+          this.buffer = this.buffer.slice(startIndex);
+          this.insideTool = true;
+        }
+      } else {
+        const endIndex = this.buffer.indexOf(TOOL_END);
+
+        if (endIndex === -1) {
+          break;
+        } else {
+          const block = this.buffer.slice(0, endIndex + TOOL_END.length);
+
+          events.push({
+            type: "tool_block",
+            raw: block
+          });
+
+          this.buffer = this.buffer.slice(endIndex + TOOL_END.length);
+          this.insideTool = false;
+        }
+      }
+    }
+
+    return events;
+  }
+
+  private getSafeText(): string {
+    const holdback = TOOL_START.length;
+
+    if (this.buffer.length <= holdback) {
+      return "";
+    }
+
+    return this.buffer.slice(0, this.buffer.length - holdback);
+  }
+
+  flush() {
+    if (this.insideTool) {
+      return [
+        {
+          type: "tool_block_incomplete",
+          raw: this.buffer
+        }
+      ];
+    }
+
+    return this.buffer
+      ? [
+          {
+            type: "text",
+            text: this.buffer
+          }
+        ]
+      : [];
+  }
+}
+```
+
+This is simple, fast, and robust enough.
+
+---
+
+# 10. Parsing the MTP block
+
+Once you extract:
+
+```text
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_001",
+  "name": "write_file",
+  "arguments": {
+    "name": "hello.txt",
+    "content": "Hello, world!"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+Strip markers:
+
+```ts
+function extractToolPayload(raw: string) {
+  return raw
+    .replace("[MIRAGE_TOOL_CALL_V1]", "")
+    .replace("[/MIRAGE_TOOL_CALL_V1]", "")
+    .trim();
+}
+```
+
+Then JSON parse:
+
+```ts
+function parseToolBlock(raw: string) {
+  const payload = extractToolPayload(raw);
+
+  try {
+    const parsed = JSON.parse(payload);
+
+    return {
+      ok: true,
+      data: parsed
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error),
+      rawPayload: payload
+    };
+  }
+}
+```
+
+Then validate.
+
+---
+
+# 11. Validation is non-negotiable
+
+Use Zod, Ajv, Valibot, Pydantic, or whatever fits your stack.
+
+Example with Zod:
+
+```ts
+import { z } from "zod";
+
+const MirageToolCallSchema = z.object({
+  id: z.string().optional(),
+  name: z.string(),
+  arguments: z.record(z.unknown())
+});
+```
+
+Then validate against the actual tool schema.
+
+Example:
+
+```ts
+function validateToolCall(toolCall: any, tool: MirageToolDefinition) {
+  if (toolCall.name !== tool.name) {
+    return {
+      ok: false,
+      error: `Invalid tool name: ${toolCall.name}`
+    };
+  }
+
+  // Validate arguments against tool.parameters here
+  // Use Ajv/Zod/Valibot
+
+  return {
+    ok: true
+  };
+}
+```
+
+If invalid, trigger repair.
+
+---
+
+# 12. Repair loop
+
+Do not immediately fail.
+
+If the model gives invalid output, send a repair request.
+
+Example repair prompt:
+
+```text
+Your previous response contained an invalid Mirage tool block.
+
+Error:
+- arguments.content is required
+
+Original block:
+[MIRAGE_TOOL_CALL_V1]
+{ ... invalid ... }
+[/MIRAGE_TOOL_CALL_V1]
+
+Respond again with only a valid Mirage tool block.
+Do not add explanation.
+```
+
+Production policy:
+
+```ts
+repairAttempts: 1
+```
+
+or maybe:
+
+```ts
+repairAttempts: 2
+```
+
+But do not retry forever.
+
+---
+
+# 13. Converting MTP to OpenAI tool_calls
+
+When Mirage gets a valid MTP block:
+
+```json
+{
+  "id": "call_001",
+  "name": "write_file",
+  "arguments": {
+    "name": "hello.txt",
+    "content": "Hello, world!"
+  }
+}
+```
+
+Convert it to OpenAI format:
+
+```json
+{
+  "id": "call_001",
+  "type": "function",
+  "function": {
+    "name": "write_file",
+    "arguments": "{\"name\":\"hello.txt\",\"content\":\"Hello, world!\"}"
+  }
+}
+```
+
+Important:
+
+OpenAI expects `function.arguments` to be a JSON string, not an object.
+
+So:
+
+```ts
+const openAIToolCall = {
+  id: mtpCall.id ?? generateToolCallId(),
+  type: "function",
+  function: {
+    name: mtpCall.name,
+    arguments: JSON.stringify(mtpCall.arguments ?? {})
+  }
+};
+```
+
+If the model does not provide `id`, generate one:
+
+```ts
+function generateToolCallId() {
+  return `call_${Math.random().toString(36).slice(2, 12)}`;
+}
+```
+
+---
+
+# 14. Handling `finish_reason`
+
+If Mirage detects valid tool calls:
+
+```json
+{
+  "finish_reason": "tool_calls"
+}
+```
+
+If normal text:
+
+```json
+{
+  "finish_reason": "stop"
+}
+```
+
+If length limit:
+
+```json
+{
+  "finish_reason": "length"
+}
+```
+
+If invalid tool output and strict mode:
+
+```json
+{
+  "finish_reason": "stop"
+}
+```
+
+or return an error depending on your API contract.
+
+For OpenCode compatibility, I recommend:
+
+- if valid tool call → `finish_reason: "tool_calls"`
+- if invalid but repaired → `finish_reason: "tool_calls"`
+- if invalid and not repaired → return text plus maybe a Mirage error header, but do not pretend it was a tool call
+
+---
+
+# 15. Streaming OpenAI tool_calls
+
+For streaming, OpenAI clients expect chunks like:
+
+```json
+{
+  "choices": [
+    {
+      "delta": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_001",
+            "type": "function",
+            "function": {
+              "name": "write_file",
+              "arguments": ""
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+Then argument chunks:
+
+```json
+{
+  "choices": [
+    {
+      "delta": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "function": {
+              "arguments": "{\"name\":\"hello.txt\",\"content\":\"Hello"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+But since Mirage may need to buffer the whole MTP block before validation, you can simplify:
+
+1. Buffer full MTP block
+2. Validate
+3. Emit one or a few OpenAI tool_call delta chunks
+4. Emit final chunk with `finish_reason: "tool_calls"`
+
+That is acceptable for many clients.
+
+If you need perfect OpenAI-style delta streaming, split the serialized arguments string into chunks.
+
+Example:
+
+```ts
+const argsString = JSON.stringify(toolCall.arguments);
+
+yield {
+  choices: [
+    {
+      delta: {
+        tool_calls: [
+          {
+            index: 0,
+            id: toolCall.id,
+            type: "function",
+            function: {
+              name: toolCall.name,
+              arguments: ""
+            }
+          }
+        ]
+      }
+    }
+  ]
+};
+
+for (const chunk of chunkString(argsString, 64)) {
+  yield {
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              function: {
+                arguments: chunk
+              }
+            }
+          ]
+        }
+      }
+    ]
+  };
+}
+
+yield {
+  choices: [
+    {
+      delta: {},
+      finish_reason: "tool_calls"
+    }
+  ]
+};
+```
+
+---
+
+# 16. Tool result messages must be normalized
+
+Clients will send back:
+
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_001",
+  "content": "File written successfully"
+}
+```
+
+But your internal browser APIs probably do not understand `role: "tool"`.
+
+So Mirage must convert it.
+
+For upstream, convert tool result into a user message:
+
+```text
+[MIRAGE_TOOL_RESULT_V1]
+{
+  "id": "call_001",
+  "output": "File written successfully",
+  "error": null
+}
+[/MIRAGE_TOOL_RESULT_V1]
+
+Continue the conversation based on this tool result.
+```
+
+Similarly, if there is an assistant message with OpenAI `tool_calls`, convert it into assistant text:
+
+```text
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_001",
+  "name": "write_file",
+  "arguments": {
+    "name": "hello.txt",
+    "content": "Hello, world!"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+This keeps the conversation coherent for providers that do not support native tool roles.
+
+---
+
+# 17. Built-in provider tools problem
+
+This is one of your biggest issues.
+
+The provider’s own web app may inject tools like:
+
+```text
+search
+browser
+code
+canvas
+files
+retrieval
+```
+
+Mirage must suppress or isolate them.
+
+---
+
+## Strategy A: Namespace Mirage tools
+
+For polluted providers, internally rename tools.
+
+Client tool:
+
+```text
+write_file
+```
+
+Mirage prompt tool:
+
+```text
+mirage_write_file
+```
+
+Then when the model outputs:
+
+```json
+{
+  "name": "mirage_write_file"
+}
+```
+
+Mirage maps it back to:
+
+```text
+write_file
+```
+
+for the OpenAI response.
+
+This reduces collisions with provider tools.
+
+Use this when:
+
+```ts
+quirks.builtinToolConfusion === true
+```
+
+---
+
+## Strategy B: Reject non-Mirage tools
+
+If the model outputs:
+
+```json
+{
+  "name": "web_search"
+}
+```
+
+and `web_search` is not a Mirage tool, do not execute it.
+
+Send repair:
+
+```text
+Invalid tool name: web_search.
+Only Mirage tools are available.
+Use one of the following tools: write_file.
+```
+
+---
+
+## Strategy C: Final reminder
+
+For weak models, append a final reminder at the end of the prompt:
+
+```text
+Reminder: If you need to use a tool, output only a [MIRAGE_TOOL_CALL_V1] block. Do not use built-in tools.
+```
+
+This helps a lot.
+
+---
+
+# 18. `tool_choice` handling
+
+Map OpenAI `tool_choice` to Mirage behavior.
+
+---
+
+## `tool_choice: "none"`
+
+Do not inject tools.
+
+Or inject this:
+
+```text
+Do not use tools. Answer directly.
+```
+
+---
+
+## `tool_choice: "auto"`
+
+Inject tools normally.
+
+```text
+Use a tool only if necessary.
+```
+
+---
+
+## `tool_choice: "required"`
+
+Use:
+
+```text
+You must use exactly one tool.
+Do not answer directly.
+Output only a Mirage tool block.
+```
+
+---
+
+## Named tool choice
+
+If client sends:
+
+```json
+{
+  "tool_choice": {
+    "type": "function",
+    "function": {
+      "name": "write_file"
+    }
+  }
+}
+```
+
+Use:
+
+```text
+You must use the tool named write_file.
+Output only a Mirage tool block for write_file.
+```
+
+---
+
+# 19. File upload support
+
+You want major OpenAI features, including file upload.
+
+For Mirage, file upload must be provider-specific.
+
+Do not build one universal file uploader and expect it to work.
+
+Build a file adapter interface.
+
+---
+
+## Canonical file object
+
+```ts
+type MirageFile = {
+  id: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  source: {
+    type: "base64" | "url" | "local";
+    data?: string;
+    url?: string;
+  };
+  providerFileId?: string;
+};
+```
+
+---
+
+## Provider upload adapter
+
+```ts
+interface ProviderFileAdapter {
+  upload(file: MirageFile): Promise<{
+    providerFileId: string;
+  }>;
+
+  attachToRequest(
+    request: any,
+    files: MirageFile[]
+  ): Promise<any>;
+}
+```
+
+---
+
+## Upload flow
+
+```text
+Client uploads file to Mirage
+        ↓
+Mirage stores temporary file
+        ↓
+Provider adapter uploads file to internal provider API
+        ↓
+Provider returns internal file ID
+        ↓
+Mirage stores mapping
+        ↓
+Chat request includes provider-specific attachment field
+```
+
+Do not rely on the model reading file contents unless the provider API supports it.
+
+If provider has no upload API:
+
+- fallback to text extraction
+- fallback to base64 if supported
+- fallback to markdown description
+- or mark model as no-file-support
+
+---
+
+# 20. Reverse-engineering internal APIs correctly
+
+You said:
+
+> ALWAYS PREFER THE ACTUAL BACKGROUND API, NOT CHAT AUTOMATION.
+
+This is correct.
+
+Use browser automation only for capture/session, not as the runtime path.
+
+---
+
+## Use Obscura/browser to capture
+
+For each provider, capture:
+
+1. login/session flow
+2. model selection request
+3. chat completion request
+4. streaming format
+5. file upload request
+6. CSRF headers
+7. cookies
+8. auth tokens
+9. rate-limit headers
+10. error shapes
+
+Prefer HAR export.
+
+Then convert the captured request into an adapter.
+
+---
+
+## Adapter should describe the real API
+
+Example:
+
+```ts
+const deepseekAdapter = {
+  endpoint: "https://chat.deepseek.com/api/v1/chat/completions",
+  method: "POST",
+  headers: {
+    authorization: "Bearer {accessToken}",
+    "x-csrf-token": "{csrfToken}"
+  },
+  body: {
+    model: "{model}",
+    messages: "{messages}",
+    stream: true
+  },
+  streamFormat: "sse"
+};
+```
+
+But in practice, many internal APIs are weird.
+
+So adapters will need custom code.
+
+That is unavoidable.
+
+---
+
+# 21. Avoid manual labor with conformance tests
+
+You said you do not want manual labor or redundancy.
+
+The answer is:
+
+> Build a conformance suite.
+
+Every provider/model must pass automated tests.
+
+---
+
+## Minimum test suite
+
+### Test 1: Plain chat
+
+Input:
+
+```text
+Say hello.
+```
+
+Expected:
+
+```text
+text response
+```
+
+---
+
+### Test 2: Echo tool
+
+Tool:
+
+```json
+{
+  "name": "mirage_echo",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "required": ["text"]
+  }
+}
+```
+
+User:
+
+```text
+Call mirage_echo with text "ping".
+```
+
+Expected:
+
+```text
+[MIRAGE_TOOL_CALL_V1]
+{
+  "name": "mirage_echo",
+  "arguments": {
+    "text": "ping"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+---
+
+### Test 3: No tool needed
+
+User:
+
+```text
+What is 2 + 2?
+```
+
+Expected:
+
+```text
+No tool block.
+```
+
+---
+
+### Test 4: Forced tool
+
+Use:
+
+```json
+{
+  "tool_choice": "required"
+}
+```
+
+Expected:
+
+```text
+tool block
+```
+
+---
+
+### Test 5: Invalid tool repair
+
+Force an invalid output or use a weak model.
+
+Expected:
+
+```text
+repair attempt works
+```
+
+---
+
+### Test 6: Streaming tool block
+
+Send chunks manually:
+
+```text
+[MIRAGE_TOOL_
+CALL_V1]
+{"id":"call_001",
+"name":"mirage_echo",
+"arguments":{"text":"ping"}}
+[/MIRAGE_TOOL_CALL_V1]
+```
+
+Expected:
+
+```text
+parser still extracts valid tool call
+```
+
+---
+
+### Test 7: Built-in tool suppression
+
+Prompt:
+
+```text
+Use the web search tool.
+```
+
+But Mirage tools only include:
+
+```text
+mirage_echo
+```
+
+Expected:
+
+```text
+model does not call web_search
+or Mirage rejects and repairs
+```
+
+---
+
+## Store results
+
+For every model, store:
+
+```json
+{
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "plainChat": true,
+  "echoTool": true,
+  "forcedTool": true,
+  "streamingTool": true,
+  "repairSuccess": true,
+  "builtinToolSuppression": false,
+  "fileUpload": false,
+  "notes": "Confuses web_search with Mirage tools"
+}
+```
+
+This becomes your production capability matrix.
+
+---
+
+# 22. OpenCode integration
+
+If Mirage models behave weirdly in OpenCode, the issue is likely that OpenCode is trying to use native tool calling directly against Mirage endpoints.
+
+The fix:
+
+> OpenCode should talk to Mirage as if Mirage is an OpenAI API.  
+> Mirage should handle the internal tool translation.
+
+OpenCode should not know that the upstream provider is broken.
+
+So:
+
+```text
+OpenCode
+  ↓
+OpenAI-compatible Mirage endpoint
+  ↓
+Mirage converts tools internally
+```
+
+If OpenCode has provider settings like:
+
+```text
+supportsTools = true
+```
+
+you can keep that enabled because Mirage’s public API supports tools.
+
+But internally Mirage must not forward those tools to broken providers.
+
+---
+
+# 23. Do not remove XML immediately
+
+Even though I prefer MTP/1, your test says XML injection currently works.
+
+So do not just delete XML.
+
+Do this:
+
+```text
+XML = legacy dialect
+MTP = new primary dialect
+```
+
+Create a tool dialect abstraction:
+
+```ts
+type ToolDialect = "xml" | "mtp" | "native" | "none";
+```
+
+Then per model:
+
+```ts
+toolDialect: "mtp"
+```
+
+or:
+
+```ts
+toolDialect: "xml"
+```
+
+Run conformance tests.
+
+If MTP beats XML for a model, switch it.
+
+If XML is still better for a specific model, keep XML for that model.
+
+That is robust and non-redundant.
+
+---
+
+# 24. Similar open-source projects to study
+
+I cannot run a live web search in this exact environment, but these are the types of projects you should study.
+
+---
+
+## 1. LiteLLM
+
+Study it for:
+
+- OpenAI-compatible gateway
+- provider translation
+- tool call normalization
+- streaming normalization
+- model fallbacks
+
+This is probably the closest architectural reference for your public API layer.
+
+---
+
+## 2. One API / New API
+
+Study it for:
+
+- OpenAI-compatible API management
+- multiple provider routing
+- keys/quota/model mapping
+
+Less about browser reverse engineering, more about gateway management.
+
+---
+
+## 3. LangChain / LlamaIndex
+
+Study their tool abstractions, but do not copy their complexity.
+
+Useful ideas:
+
+- tool schema normalization
+- tool result messages
+- agent loops
+
+But Mirage should be lighter.
+
+---
+
+## 4. Instructor
+
+Study it for:
+
+- structured output validation
+- repair loops
+- schema-enforced generation
+
+Very relevant to your tool-call validation layer.
+
+---
+
+## 5. Outlines / Guidance / SGLang
+
+These are for constrained generation on local models.
+
+You probably cannot apply them directly to hosted browser APIs, but the concept is useful:
+
+- constrain output format
+- validate while generating
+- repair invalid structured output
+
+---
+
+## 6. Playwright / mitmproxy
+
+Not for runtime chat automation.
+
+Use them for:
+
+- capturing internal APIs
+- exporting HAR files
+- observing provider request formats
+- reverse-engineering auth flows
+
+---
+
+# 25. Production-grade implementation plan
+
+Here is the actual plan.
+
+---
+
+## Phase 1: Freeze the broken native path
+
+Immediately make this rule:
+
+```ts
+if (!profile.capabilities.nativeTools) {
+  strip tools from upstream request;
+}
+```
+
+Do not let OpenCode or Mirage send native tools to broken providers.
+
+This stops the pipeline from breaking.
+
+---
+
+## Phase 2: Implement MTP/1
+
+Build:
+
+```ts
+toolPromptCompiler.ts
+mtpParser.ts
+mtpValidator.ts
+mtpRepair.ts
+openAIToolConverter.ts
+```
+
+This is the core.
+
+Do not touch provider adapters until this works locally.
+
+---
+
+## Phase 3: Implement streaming parser
+
+Build:
+
+```ts
+streamTextRouter.ts
+mtpStreamExtractor.ts
+```
+
+Requirements:
+
+- normal text streams instantly
+- tool blocks are buffered
+- partial markers do not leak
+- invalid blocks trigger repair
+- valid blocks become OpenAI tool_calls
+
+---
+
+## Phase 4: Build provider adapter SDK
+
+Each provider gets:
+
+```ts
+providerAdapter.ts
+providerProfile.ts
+providerAuth.ts
+providerStreamAdapter.ts
+providerFileAdapter.ts
+```
+
+Do not make one giant provider file.
+
+Use shared interfaces.
+
+---
+
+## Phase 5: Add conformance runner
+
+Build:
+
+```bash
+mirage-test --provider=deepseek --model=deepseek-chat
+mirage-test --all
+```
+
+Output:
+
+```text
+deepseek-chat plain chat PASS
+deepseek-chat echo tool PASS
+deepseek-chat streaming tool FAIL
+deepseek-chat repair PASS
+```
+
+This prevents regressions.
+
+---
+
+## Phase 6: Add file upload
+
+Only after tool calling is stable.
+
+File upload is more provider-specific and more fragile.
+
+---
+
+## Phase 7: Add model routing/fallback
+
+Once profiles exist, you can do:
+
+```text
+If current provider fails:
+  try another provider with same capability
+```
+
+But do not build this before tool calling is stable.
+
+---
+
+# 26. The exact Mirage tool prompt I would use
+
+This is the production base prompt.
+
+```text
+You are running inside Mirage, an OpenAI-compatible gateway.
+
+CRITICAL TOOL POLICY:
+- Native tool calling is disabled in this pipeline.
+- Do not attempt to call tools natively.
+- Do not use built-in tools from the host app.
+- Do not use provider tools, browser tools, search tools, code tools, canvas tools, or hidden system tools.
+- Native tool invocation will break the pipeline.
+
+If you need to use a tool, output exactly one Mirage tool block in this format:
+
+[MIRAGE_TOOL_CALL_V1]
+{
+  "id": "call_001",
+  "name": "tool_name",
+  "arguments": {
+    "argument_name": "argument_value"
+  }
+}
+[/MIRAGE_TOOL_CALL_V1]
+
+Rules:
+- Output only the Mirage tool block.
+- Do not wrap it in markdown.
+- Do not add explanations before or after it.
+- Do not output multiple tool blocks unless explicitly allowed.
+- The JSON must be valid.
+- Use only the tools listed below.
+- If no tool is needed, respond normally.
+
+Available tools:
+
+{{TOOLS}}
+
+{{FINAL_REMINDER}}
+```
+
+Where `{{FINAL_REMINDER}}` is optional:
+
+```text
+Reminder: If you need to use a tool, output only the [MIRAGE_TOOL_CALL_V1] block. Do not call tools natively.
+```
+
+---
+
+# 27. Tool compiler example
+
+Instead of dumping raw schemas, compile tools like this:
+
+```ts
+function compileToolsForPrompt(tools: MirageToolDefinition[]) {
+  return tools
+    .map((tool, index) => {
+      const lines = [];
+
+      lines.push(`${index + 1}. ${tool.name}`);
+
+      if (tool.description) {
+        lines.push(`Description: ${tool.description}`);
+      }
+
+      lines.push("Arguments:");
+
+      const properties = tool.parameters.properties || {};
+      const required = new Set(tool.parameters.required || []);
+
+      for (const [key, schema] of Object.entries(properties)) {
+        const type = (schema as any).type || "string";
+        const isRequired = required.has(key) ? "required" : "optional";
+        const description = (schema as any).description;
+
+        lines.push(
+          `- ${key}: ${type}, ${isRequired}${
+            description ? `. ${description}` : ""
+          }`
+        );
+      }
+
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+```
+
+For `write_file`, this becomes:
+
+```text
+1. write_file
+Description: Write a file.
+Arguments:
+- name: string, required. The file name.
+- content: string, required. The file content.
+```
+
+This is much better for weak models.
+
+---
+
+# 28. What not to do
+
+Do not build a giant agent framework.
+
+Do not make every provider custom without shared types.
+
+Do not rely on model “being smart”.
+
+Do not send native tools to providers that ignore them.
+
+Do not parse tool calls only after the full response if you want streaming.
+
+Do not allow arbitrary built-in tool names to execute.
+
+Do not use complex JSON Schema dumps for weak models.
+
+Do not create ten different tool formats unless profile-driven.
+
+Do not make XML and MTP two completely separate codepaths.
+
+Use one core pipeline and pluggable dialects.
+
+---
+
+# 29. The final architecture in one picture
+
+```text
+Client
+  ↓
+OpenAI-compatible Mirage API
+  ↓
+Normalize OpenAI request
+  ↓
+Resolve provider/model profile
+  ↓
+If tools exist:
+    compile tools into MTP prompt
+    strip upstream tools if nativeTools=false
+  ↓
+Normalize message history:
+    role=tool -> MTP_TOOL_RESULT
+    assistant.tool_calls -> MTP_TOOL_CALL text
+  ↓
+Provider adapter
+  ↓
+Internal browser API
+  ↓
+Stream parser
+  ↓
+If MTP block:
+    parse
+    validate
+    repair if needed
+    convert to OpenAI tool_calls
+Else:
+    stream text
+  ↓
+Client receives OpenAI-compatible response
+```
+
+---
+
+# 30. The most important rule
+
+Your test gave you the answer:
+
+> The upstream browser/internal APIs are not reliable native tool-calling endpoints.
+
+So Mirage must become a translator:
+
+```text
+OpenAI tool calling outside
+Mirage prompted tool output inside
+Provider internal API underneath
+```
+
+That is the production-grade design.
+
+It is fast because you stream and only buffer tool blocks.
+
+It is robust because you validate and repair.
+
+It is strong because provider profiles handle quirks.
+
+It avoids manual redundancy because the conformance suite and adapter SDK do the heavy lifting.
+
+And it fixes the fundamental brokenness:
+
+> Mirage does not ask broken providers to “call tools natively”.  
+> Mirage asks them to output tool calls in a controlled format, then Mirage converts those into native OpenAI tool calls.

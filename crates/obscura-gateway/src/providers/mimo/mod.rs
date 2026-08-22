@@ -8,7 +8,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
@@ -89,9 +89,6 @@ impl Provider for MiMoProvider {
         ]
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn supports_attachments(&self) -> bool {
         true
@@ -201,25 +198,10 @@ impl Provider for MiMoProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["textarea"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[type='submit']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        ".message-content"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        None
-    }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(1500))
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // Mimo web API support for JSON mode is unverified.
@@ -285,7 +267,7 @@ mod tests {
         assert!(p.models().iter().any(|m| m.id == "mimo-v2-flash"));
         assert!(p.models().iter().any(|m| m.id == "mimo-v2-pro"));
         assert!(p.models().iter().any(|m| m.id == "mimo-v2-omni"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+
     }
 
     fn request(model: &str) -> ChatCompletionRequest {

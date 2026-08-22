@@ -1,5 +1,4 @@
 use serde_json::Value;
-use tracing::warn;
 use crate::error::GatewayError;
 use crate::models::{Citation, Tool, ToolCall, FunctionCall};
 use crate::providers::tool_call::{
@@ -375,26 +374,38 @@ fn extract_tool_calls(payload: &[Value], text: &str) -> Option<Vec<ToolCall>> {
     None
 }
 
-/// Extract native Gemini tool calls from candidate[28].
+/// Extract native Gemini tool calls from candidate[28] or search candidate slots.
 fn extract_native_tool_calls(payload: &[Value]) -> Option<Vec<ToolCall>> {
     let candidates = payload.get(4)?.as_array()?;
     let candidate = candidates.first()?.as_array()?;
-    let tool_data = match candidate.get(28) {
-        Some(v) => v.as_array()?,
-        None => {
-            warn!(
-                "Gemini response format may have changed: expected tool calls at index 28, candidate len={}",
-                candidate.len()
-            );
-            return None;
+
+    let mut tool_data_opt = candidate.get(28).and_then(|v| v.as_array());
+    if tool_data_opt.is_none() || tool_data_opt.map_or(true, |a| a.is_empty()) {
+        for elem in candidate.iter() {
+            if let Some(arr) = elem.as_array() {
+                if !arr.is_empty() {
+                    if let Some(first_call) = arr.first().and_then(|v| v.as_array()) {
+                        if first_call.len() >= 2 && first_call.get(0).and_then(|v| v.as_str()).is_some() {
+                            tool_data_opt = Some(arr);
+                            break;
+                        }
+                    }
+                }
+            }
         }
-    };
+    }
+
+    let tool_data = tool_data_opt?;
     let mut calls = Vec::new();
 
     for entry in tool_data {
         let arr = entry.as_array()?;
         let name = arr.get(0)?.as_str()?;
-        let args = arr.get(2)?.as_str().unwrap_or("{}");
+        let args = match arr.get(2) {
+            Some(Value::String(s)) => s.clone(),
+            Some(v @ Value::Object(_)) => v.to_string(),
+            _ => "{}".to_string(),
+        };
         let id = arr
             .get(3)
             .and_then(|v| v.as_str())
@@ -411,7 +422,7 @@ fn extract_native_tool_calls(payload: &[Value]) -> Option<Vec<ToolCall>> {
             r#type: "function".to_string(),
             function: FunctionCall {
                 name: name.to_string(),
-                arguments: args.to_string(),
+                arguments: args,
             },
         });
     }
@@ -463,45 +474,79 @@ fn extract_citations(payload: &[Value]) -> Option<Vec<Citation>> {
 
 /// Parse a single citation value into a `Citation`.
 fn parse_citation_value(value: &Value) -> Option<Citation> {
-    let obj = value.as_object()?;
+    if let Some(obj) = value.as_object() {
+        let url = obj
+            .get("url")
+            .or_else(|| obj.get("link"))
+            .or_else(|| obj.get("href"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-    let url = obj
-        .get("url")
-        .or_else(|| obj.get("link"))
-        .or_else(|| obj.get("href"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        let title = obj
+            .get("title")
+            .or_else(|| obj.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-    let title = obj
-        .get("title")
-        .or_else(|| obj.get("name"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        let snippet = obj
+            .get("snippet")
+            .or_else(|| obj.get("summary"))
+            .or_else(|| obj.get("content"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-    let snippet = obj
-        .get("snippet")
-        .or_else(|| obj.get("summary"))
-        .or_else(|| obj.get("content"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        let index = obj
+            .get("index")
+            .or_else(|| obj.get("cite_index"))
+            .and_then(|v| v.as_i64());
 
-    let index = obj
-        .get("index")
-        .or_else(|| obj.get("cite_index"))
-        .and_then(|v| v.as_i64());
+        if url.is_none() && title.is_none() && snippet.is_none() {
+            return None;
+        }
 
-    if url.is_none() && title.is_none() && snippet.is_none() {
-        return None;
+        return Some(Citation {
+            index,
+            title,
+            url,
+            snippet,
+            start_ix: None,
+            end_ix: None,
+        });
+    } else if let Some(arr) = value.as_array() {
+        if arr.is_empty() {
+            return None;
+        }
+        let first_str = arr.get(0).and_then(|v| v.as_str());
+        let second_str = arr.get(1).and_then(|v| v.as_str());
+        let third_str = arr.get(2).and_then(|v| v.as_str());
+
+        let (url, title, snippet) = if let Some(s) = first_str {
+            if s.starts_with("http://") || s.starts_with("https://") {
+                (Some(s.to_string()), second_str.map(|v| v.to_string()), third_str.map(|v| v.to_string()))
+            } else if let Some(u) = second_str {
+                if u.starts_with("http://") || u.starts_with("https://") {
+                    (Some(u.to_string()), Some(s.to_string()), third_str.map(|v| v.to_string()))
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+        return Some(Citation {
+            index: None,
+            title,
+            url,
+            snippet,
+            start_ix: None,
+            end_ix: None,
+        });
     }
 
-    Some(Citation {
-        index,
-        title,
-        url,
-        snippet,
-        start_ix: None,
-        end_ix: None,
-    })
+    None
 }
 
 /// Parse the full response body, taking the LAST frame's data.

@@ -1,0 +1,16 @@
+{
+  "state": "done",
+  "summary": {
+    "bytes_in": 0,
+    "bytes_out": 0,
+    "count": 110,
+    "ended_at": "2026-08-19T16:05:40.184+00:00",
+    "errors": [],
+    "get_count": 67,
+    "internal_excluded": 0,
+    "post_count": 43,
+    "schema": "whelmer/1",
+    "started_at": "2026-08-19T16:00:40.054+00:00"
+  },
+  "updated_at": "2026-08-19T16:05:40.186+00:00"
+}

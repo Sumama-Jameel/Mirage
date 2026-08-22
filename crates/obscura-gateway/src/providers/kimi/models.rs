@@ -15,8 +15,8 @@ pub struct KimiModelDef {
 pub fn resolve_model(model_id: &str) -> Option<KimiModelDef> {
     match model_id {
         // Flagship — launched July 16, 2026, ~2.8T MoE, 1M context, always thinks
-        "kimi-k3" => Some(KimiModelDef {
-            id: "kimi-k3".to_string(),
+        "kimi-k3" | "kimi-k3-instant" | "kimi-k3-swarm" => Some(KimiModelDef {
+            id: model_id.to_string(),
             kimiplus_id: "kimi".to_string(),
             use_search: false,
             use_research: false,
@@ -125,6 +125,8 @@ pub fn resolve_model(model_id: &str) -> Option<KimiModelDef> {
 pub fn to_public_models() -> Vec<Model> {
     const KNOWN: &[&str] = &[
         "kimi-k3",
+        "kimi-k3-instant",
+        "kimi-k3-swarm",
         "kimi-k2.7-code",
         "kimi-k2.7-code-highspeed",
         "kimi-k2.6",
@@ -226,6 +228,6 @@ mod tests {
         assert!(ids.contains(&"kimi-k2.5"));
         assert!(ids.contains(&"kimi-search"));
         assert!(ids.contains(&"kimi-research"));
-        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.len(), 9);
     }
 }

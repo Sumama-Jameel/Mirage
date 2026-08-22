@@ -20,8 +20,14 @@ pub const CHATGPT_MODELS: &[(&str, &str)] = &[
     ("gpt-4.5-pro",    "gpt-4.5-pro"),
     ("gpt-5",          "gpt-5"),
     ("gpt-5.4",        "gpt-5.4"),
+    ("gpt-5.4-pro",    "gpt-5.4-pro"),
     ("gpt-5.5",        "gpt-5.5"),
+    ("gpt-5.5-pro",    "gpt-5.5-pro"),
     ("gpt-5.6",        "gpt-5.6"),
+    ("gpt-5.6-sol",    "gpt-5.6-sol"),
+    ("gpt-5.6-terra",  "gpt-5.6-terra"),
+    ("gpt-5.6-luna",   "gpt-5.6-luna"),
+    ("gpt-5-chat-latest", "gpt-5-chat-latest"),
 ];
 
 #[derive(Debug, Clone, Copy)]

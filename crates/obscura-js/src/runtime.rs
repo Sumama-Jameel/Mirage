@@ -666,7 +666,16 @@ impl ObscuraJsRuntime {
             self.runtime.load_side_es_module_from_code(&specifier, deno_core::ModuleCodeString::from(source_code)),
         ).await {
             Ok(Ok(id)) => id,
-            Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
+            Ok(Err(e)) => {
+                // Log the full error including any sub-import failures
+                let error_str = format!("{}", e);
+                tracing::warn!(
+                    url = url,
+                    error = %error_str,
+                    "ES module load failure detail"
+                );
+                return Err(format!("Module load error: {}", e));
+            },
             Err(_) => {
                 tracing::warn!("Module graph load timed out after {}ms: {}", budget_ms, url);
                 return Ok(());

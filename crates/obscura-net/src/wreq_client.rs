@@ -34,6 +34,33 @@ pub const STEALTH_UA_PLATFORM: &str = "Windows";
 #[cfg(feature = "stealth")]
 pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 
+/// Per-client timeout tuning. `connect` bounds TCP+TLS setup, `request`
+/// bounds the whole call including body read. Streaming callers should widen
+/// `request` because SSE/NDJSON responses stay open while tokens stream.
+#[cfg(feature = "stealth")]
+#[derive(Clone, Copy)]
+pub struct Timeouts {
+    pub connect: Duration,
+    pub request: Duration,
+}
+
+#[cfg(feature = "stealth")]
+impl Timeouts {
+    pub const DEFAULT: Timeouts = Timeouts {
+        connect: Duration::from_secs(5),
+        request: Duration::from_secs(30),
+    };
+
+    /// For long-lived provider streams (LLM token SSE runs for the whole
+    /// conversation turn, up to minutes).
+    pub fn streaming() -> Timeouts {
+        Timeouts {
+            connect: Duration::from_secs(5),
+            request: Duration::from_secs(300),
+        }
+    }
+}
+
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
@@ -58,10 +85,19 @@ pub struct StreamingResponse {
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None)
+        Self::with_timeouts(cookie_jar, None, None)
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_timeouts(cookie_jar, proxy_url, None)
+    }
+
+    pub fn with_timeouts(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        timeouts: Option<Timeouts>,
+    ) -> Self {
+        let timeouts = timeouts.unwrap_or(Timeouts::DEFAULT);
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
@@ -69,7 +105,8 @@ impl StealthHttpClient {
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(timeouts.connect)
+            .timeout(timeouts.request)
             .redirect(wreq::redirect::Policy::none());
 
         if let Some(proxy) = proxy_url {

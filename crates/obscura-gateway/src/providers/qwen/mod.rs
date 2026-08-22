@@ -8,12 +8,29 @@ use futures::StreamExt;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
 use direct::DirectClient;
 use state::QwenSessionStore;
+
+const VERSIONED_MODEL_IDS: &[&str] = &[
+    "qwen3.8-max",
+    "qwen3.8-max-preview",
+    "qwen3.7-plus",
+    "qwen3.6-max-preview",
+    "qwen3.5-omni-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7",
+    "qwen3.6",
+    "qwen3.5",
+    "qwen3",
+    "qwen3-vl",
+    "qwen3-coder",
+    "qwen3-vl-235b-a22b",
+];
 
 mod auth;
 mod direct;
@@ -56,7 +73,7 @@ impl Provider for QwenProvider {
     }
 
     fn models(&self) -> Vec<Model> {
-        vec![
+        let mut models = vec![
             Model {
                 id: "qwen-auto".to_string(),
                 object: "model".to_string(),
@@ -95,12 +112,16 @@ impl Provider for QwenProvider {
             },
             // Note: qwen-research is available through Alibaba Cloud API (DashScope) but not through
             // the free chat.qwen.ai endpoint used here. Removed until Deep Research API is added.
-        ]
+        ];
+        models.extend(VERSIONED_MODEL_IDS.iter().map(|id| Model {
+            id: (*id).to_string(),
+            object: "model".to_string(),
+            created: 1_700_000_000,
+            owned_by: "alibaba".to_string(),
+        }));
+        models
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn supports_attachments(&self) -> bool {
         true
@@ -177,25 +198,10 @@ impl Provider for QwenProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["textarea", "[contenteditable='true']"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[type='submit']", "[data-testid='send-button']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        "[data-testid='assistant-message']"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        None
-    }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(1500))
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // Qwen web API support for JSON mode is unverified.
@@ -216,6 +222,7 @@ impl Provider for QwenProvider {
             "qwen-coder",
             "qwen-vl",
             "qwen-auto",
+            "qwen3.8-max",
         ];
         if !valid_models.contains(&request.model.as_str()) {
             return Err(GatewayError::BadRequest(format!(
@@ -246,12 +253,12 @@ mod tests {
         let p = QwenProvider::new();
         assert_eq!(p.name(), "qwen");
         assert_eq!(p.url(), "https://chat.qwen.ai");
-        assert_eq!(p.models().len(), 6);
+        assert_eq!(p.models().len(), 6 + VERSIONED_MODEL_IDS.len());
         assert!(p.models().iter().any(|m| m.id == "qwen-plus"));
         assert!(p.models().iter().any(|m| m.id == "qwen-max"));
         assert!(p.models().iter().any(|m| m.id == "qwen-flash"));
         assert!(p.models().iter().any(|m| m.id == "qwen-coder"));
         assert!(p.models().iter().any(|m| m.id == "qwen-vl"));
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+
     }
 }

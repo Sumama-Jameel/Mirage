@@ -82,14 +82,19 @@ impl ModuleLoader for ObscuraModuleLoader {
                 proxy_url.as_deref().unwrap_or("direct")
             );
 
+            tracing::info!(url = %url, "ObscuraModuleLoader: fetching sub-module");
             let resp = client
                 .get(&url)
                 .header("Accept", "application/javascript, text/javascript, */*")
                 .send()
                 .await
-                .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                .map_err(|e| {
+                    tracing::warn!(url = %url, error = %e, "ObscuraModuleLoader: sub-module fetch failed");
+                    io_err(format!("Failed to fetch module {}: {}", url, e))
+                })?;
 
             if !resp.status().is_success() {
+                tracing::warn!(url = %url, status = %resp.status(), "ObscuraModuleLoader: sub-module returned error status");
                 return Err(io_err(format!(
                     "Module {} returned HTTP {}",
                     url,

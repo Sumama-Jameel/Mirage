@@ -8,7 +8,7 @@ use futures::StreamExt;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
@@ -82,14 +82,11 @@ impl Provider for MetaAiProvider {
             .collect()
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
-    /// The DGW endpoint has no file-upload channel, so attachments are
-    /// rejected (fail closed) by `validate_request`.
+    /// Images are uploaded to the rupload endpoint and embedded in the DGW
+    /// prompt proto as an attachment block.
     fn supports_attachments(&self) -> bool {
-        false
+        true
     }
 
     fn chat(
@@ -171,25 +168,10 @@ impl Provider for MetaAiProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["textarea", "[contenteditable='true']"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["button[type='submit']", "[data-testid='send-button']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        "[data-message-author-role='assistant']"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        None
-    }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(1500))
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // Meta AI web API support for JSON mode is unverified.
@@ -211,18 +193,7 @@ impl Provider for MetaAiProvider {
             )));
         }
 
-        let has_attachments = request.messages.iter().any(|message| {
-            !message.content.image_urls().is_empty() || !message.content.file_urls().is_empty()
-        });
-        if has_attachments {
-            return Err(GatewayError::BadRequest(
-                "muse-spark does not support file or image attachments on the DGW endpoint"
-                    .to_string(),
-            ));
-        }
-
         // The DGW endpoint has no native web-search channel; fail closed
-        // instead of silently ignoring the flag.
         if request.search.unwrap_or(false) {
             return Err(GatewayError::BadRequest(
                 "muse-spark does not expose a web-search channel on the DGW endpoint".to_string(),
@@ -267,8 +238,8 @@ mod tests {
         assert!(p.models().iter().any(|m| m.id == "muse-spark"));
         assert!(p.models().iter().any(|m| m.id == "muse-spark-thinking"));
         assert!(p.models().iter().any(|m| m.id == "muse-spark-contemplating"));
-        assert!(!p.supports_attachments());
-        assert!(matches!(p.chat_mode(), ChatMode::Direct));
+        assert!(p.supports_attachments());
+
     }
 
     #[test]
@@ -297,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_attachments() {
+    fn validate_accepts_attachments() {
         let p = MetaAiProvider::new();
         let mut req = request("muse-spark", None);
         req.messages = vec![crate::models::ChatMessage {
@@ -314,6 +285,6 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        assert!(p.validate_request(&req).is_err());
+        assert!(p.validate_request(&req).is_ok());
     }
 }

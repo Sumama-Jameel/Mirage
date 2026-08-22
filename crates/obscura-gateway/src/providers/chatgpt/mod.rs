@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use crate::error::GatewayError;
 use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
 use crate::providers::session_guard::SessionGuardStream;
-use crate::providers::{ChatMode, DoneSignal, Provider};
+use crate::providers::Provider;
 use crate::session::SessionManager;
 use crate::state::AppState;
 
@@ -67,9 +67,6 @@ impl Provider for ChatGPTProvider {
         true
     }
 
-    fn chat_mode(&self) -> ChatMode {
-        ChatMode::Direct
-    }
 
     fn chat(
         &self,
@@ -145,25 +142,10 @@ impl Provider for ChatGPTProvider {
         })
     }
 
-    fn input_selectors(&self) -> &'static [&'static str] {
-        &["#prompt-textarea", "[contenteditable='true']"]
-    }
 
-    fn submit_selectors(&self) -> &'static [&'static str] {
-        &["[data-testid='send-button']", "button[type='submit']"]
-    }
 
-    fn response_selector(&self) -> &'static str {
-        ".conversation-turn, .message"
-    }
 
-    fn thinking_selector(&self) -> Option<&'static str> {
-        Some(".reasoning-panel")
-    }
 
-    fn done_signal(&self) -> DoneSignal {
-        DoneSignal::TextStable(std::time::Duration::from_millis(2000))
-    }
 
     fn validate_request(&self, request: &ChatCompletionRequest) -> Result<(), GatewayError> {
         // ChatGPT web API supports native JSON mode on vision-capable models.
