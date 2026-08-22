@@ -14,9 +14,7 @@ use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     ChatMessageDelta, ChunkChoice, Citation, ToolCall, Usage,
 };
-use crate::providers::tool_call::{
-    convert_xml_tool_calls, format_tool_results, inject_tool_prompt,
-};
+use crate::providers::mtp;
 use crate::providers::send_with_retry;
 use crate::session::SessionHandle;
 
@@ -254,7 +252,7 @@ impl ClaudeDirectClient {
             .map(|(c, id, o)| (c.as_ref(), id.as_deref(), o.as_str()))
             .collect();
 
-        let formatted = format_tool_results(&refs);
+        let formatted = mtp::format_tool_results(&refs);
         if formatted.is_empty() {
             Vec::new()
         } else {
@@ -404,7 +402,11 @@ impl ClaudeDirectClient {
         }
 
         let tool_prompt = match request.tools.as_ref() {
-            Some(tools) => inject_tool_prompt("claude", &prompt, tools, request.tool_choice.as_ref()),
+            Some(tools) => format!(
+                "{}\n\nUser request:\n{}",
+                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false),
+                prompt
+            ),
             None => String::new(),
         };
 
@@ -438,7 +440,13 @@ impl ClaudeDirectClient {
             if !native_tool_calls.is_empty() {
                 (text.clone(), Some(native_tool_calls))
             } else {
-                convert_xml_tool_calls(&text, true)
+                // MTP fallback: parse [MIRAGE_TOOL_CALL_V1] blocks.
+                let defs: Vec<crate::models::Tool> = request.tools.clone().unwrap_or_default();
+                let mut st = mtp::MtpStreamState::new();
+                let stripped = st.process_delta(&text, &defs);
+                st.finish(&defs);
+                let calls = std::mem::take(&mut st.collected_tool_calls);
+                if calls.is_empty() { (text.clone(), None) } else { (stripped, Some(calls)) }
             }
         } else {
             (text.clone(), None)
@@ -534,7 +542,11 @@ impl ClaudeDirectClient {
             // No per-session lock held - allow concurrent requests.
 
             let tool_prompt = match request.tools.as_ref() {
-                Some(tools) => inject_tool_prompt("claude", &prompt, tools, request.tool_choice.as_ref()),
+                Some(tools) => format!(
+                "{}\n\nUser request:\n{}",
+                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false),
+                prompt
+            ),
                 None => String::new(),
             };
 
@@ -583,6 +595,10 @@ impl ClaudeDirectClient {
             let mut collected_tool_calls: Vec<ToolCall> = Vec::new();
             let mut session_url: Option<String> = None;
             let mut conv_token = conv_token.clone();
+            // MTP state absorbs tool blocks from content deltas inline.
+            let tool_defs: Vec<crate::models::Tool> =
+                request.tools.clone().unwrap_or_default();
+            let mut mtp_state = mtp::MtpStreamState::new();
 
             while let Some(chunk) = stream.next().await {
                 let bytes = match chunk {
@@ -634,12 +650,24 @@ impl ClaudeDirectClient {
                                     None
                                 };
 
+                                let raw_delta = delta.unwrap_or_default();
+                                let visible_delta = if tool_defs.is_empty() {
+                                    raw_delta
+                                } else {
+                                    let visible = mtp_state.process_delta(&raw_delta, &tool_defs);
+                                    for call in mtp_state.collected_tool_calls.drain(..) {
+                                        if !collected_tool_calls.iter().any(|c| c.id == call.id) {
+                                            collected_tool_calls.push(call);
+                                        }
+                                    }
+                                    visible
+                                };
                                 build_streaming_chunk(
                                     &tx,
                                     &counter,
                                     &id_prefix,
                                     &model_id,
-                                    delta.unwrap_or_default(),
+                                    visible_delta,
                                     reasoning,
                                     tool_calls,
                                     citations,
@@ -661,14 +689,14 @@ impl ClaudeDirectClient {
                 buffer.drain(0..consumed);
             }
 
-            // Post-stream tool-call extraction. When the request had tools,
-            // parse `<tool_call>` markers from the accumulated text and emit
-            // a structured chunk so the client sees `tool_calls`.
+            // Post-stream tool-call extraction. Flush any pending MTP block
+            // and emit collected calls so the client sees `tool_calls`.
             let mut finish_reason = "stop".to_string();
-            if had_tools && !previous_text.is_empty() {
-                let (clean_text, parsed) = convert_xml_tool_calls(&previous_text, true);
-                if let Some(calls) = parsed {
-                    if !calls.is_empty() {
+            if had_tools {
+                mtp_state.finish(&tool_defs);
+                let calls = std::mem::take(&mut mtp_state.collected_tool_calls);
+                if !calls.is_empty() {
+                    {
                         counter.fetch_add(1, Ordering::Relaxed);
                         let chunk = ChatCompletionChunk {
                             id: format!("{}-{}", id_prefix, counter.load(Ordering::Relaxed)),
@@ -698,8 +726,6 @@ impl ClaudeDirectClient {
                             }
                         }
                         finish_reason = "tool_calls".to_string();
-
-                        let _ = clean_text;
                     }
                 }
             }
@@ -799,7 +825,7 @@ mod tests {
 <tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>
 And also check time.
 <tool_call>{"name":"get_time","arguments":{"tz":"UTC"}}</tool_call>"#;
-        let (cleaned, calls) = convert_xml_tool_calls(text, true);
+        let (cleaned, calls) = crate::providers::tool_call::convert_xml_tool_calls(text, true);
         let calls = calls.expect("should have tool calls");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "get_weather");
@@ -812,7 +838,7 @@ And also check time.
     #[test]
     fn extract_tool_calls_from_text_without_markers() {
         let text = "Hello, how can I help you?";
-        let (cleaned, calls) = convert_xml_tool_calls(text, true);
+        let (cleaned, calls) = crate::providers::tool_call::convert_xml_tool_calls(text, true);
         assert!(calls.is_none());
         assert_eq!(cleaned, text);
     }
@@ -820,7 +846,7 @@ And also check time.
     #[test]
     fn extract_tool_calls_from_text_empty() {
         let text = "";
-        let (cleaned, calls) = convert_xml_tool_calls(text, true);
+        let (cleaned, calls) = crate::providers::tool_call::convert_xml_tool_calls(text, true);
         assert!(calls.is_none());
         assert_eq!(cleaned, "");
     }
@@ -828,7 +854,7 @@ And also check time.
     #[test]
     fn extract_tool_calls_from_text_single_call() {
         let text = r#"<tool_call>{"name":"search","arguments":{"q":"weather"}}</tool_call>"#;
-        let (cleaned, calls) = convert_xml_tool_calls(text, true);
+        let (cleaned, calls) = crate::providers::tool_call::convert_xml_tool_calls(text, true);
         let calls = calls.expect("should have tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "search");
@@ -838,7 +864,7 @@ And also check time.
     #[test]
     fn extract_tool_calls_from_text_with_id() {
         let text = r#"<tool_call>{"name":"read_file","arguments":{"path":"/etc/hosts"},"id":"call_abc"}</tool_call>"#;
-        let (_, calls) = convert_xml_tool_calls(text, true);
+        let (_, calls) = crate::providers::tool_call::convert_xml_tool_calls(text, true);
         let calls = calls.expect("should have tool calls");
         assert_eq!(calls[0].id, "call_abc");
         assert_eq!(calls[0].function.name, "read_file");
@@ -850,7 +876,7 @@ And also check time.
             "name":"complex",
             "arguments":{"nested":"value"}
         }</tool_call>"#;
-        let (_, calls) = convert_xml_tool_calls(text, true);
+        let (_, calls) = crate::providers::tool_call::convert_xml_tool_calls(text, true);
         let calls = calls.expect("should have tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "complex");

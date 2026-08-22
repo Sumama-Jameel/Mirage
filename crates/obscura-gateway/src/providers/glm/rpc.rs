@@ -73,7 +73,7 @@ pub fn build_completion_body(
         .map(|m| convert_message(m, files))
         .collect::<Vec<_>>();
 
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
         "stream": true,
         "model": internal_model_id,
         "messages": messages,

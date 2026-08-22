@@ -55,9 +55,6 @@ use crate::models::{
     ChatContent, ChatMessage, ChatMessageDelta, ChunkChoice, ToolCall, Usage,
 };
 use crate::providers::tokenizer::estimate_tokens;
-use crate::providers::tool_call::{
-    convert_xml_tool_calls, inject_tool_prompt, XmlToolCallStripper,
-};
 use crate::session::SessionHandle;
 
 use super::auth::{build_cookie_header, extract_ecto_token, extract_meta_cookies, validate_meta_session};
@@ -1247,25 +1244,29 @@ async fn ws_chat(
 
 // ─── Streaming emit context ──────────────────────────────────────────────────
 
-/// Streaming state that strips tool-call XML and emits OpenAI chunks.
+/// Streaming state that strips MTP tool blocks and emits OpenAI chunks.
 struct StreamEmitCtx {
     tx: mpsc::UnboundedSender<Result<ChatCompletionChunk, GatewayError>>,
     id: String,
     created: i64,
     model: String,
     session_url: String,
-    request_had_tools: bool,
+    tool_defs: Vec<crate::models::Tool>,
     sent_first_chunk: bool,
-    stripper: XmlToolCallStripper,
+    mtp_state: crate::providers::mtp::MtpStreamState,
     collected_calls: Vec<ToolCall>,
 }
 
 impl StreamEmitCtx {
     fn emit_delta(&mut self, delta: &str) {
-        let clean = if self.request_had_tools {
-            let (clean, tool_call) = self.stripper.process(delta);
-            if let Some(tool_call) = tool_call {
-                self.collected_calls.push(tool_call);
+        let clean = if !self.tool_defs.is_empty() {
+            let clean = self.mtp_state.process_delta(delta, &self.tool_defs);
+            if !self.mtp_state.collected_tool_calls.is_empty() {
+                for call in self.mtp_state.collected_tool_calls.drain(..) {
+                    if !self.collected_calls.iter().any(|c| c.id == call.id) {
+                        self.collected_calls.push(call);
+                    }
+                }
             }
             clean
         } else {
@@ -1617,7 +1618,15 @@ impl DirectClient {
         let tools = request.tools.clone().unwrap_or_default();
         let request_had_tools = !tools.is_empty();
         if request_had_tools {
-            prompt = inject_tool_prompt("metaai", &prompt, &tools, request.tool_choice.as_ref());
+            prompt = format!(
+                "{}\n\nUser request:\n{}",
+                crate::providers::mtp::build_mtp_system_prompt(
+                    &tools,
+                    request.tool_choice.as_ref(),
+                    false
+                ),
+                prompt
+            );
         }
 
         Ok((prompt, conversation_id, session_url, !is_continuation, request_had_tools))
@@ -1772,11 +1781,25 @@ impl DirectClient {
                 }
             }
         }
-        let (clean_content, xml_calls) = convert_xml_tool_calls(&clean_content, request_had_tools);
+        // MTP blocks from prompt-injected tool definitions: absorbed and
+        // validated against the client definitions, never leaked.
+        let (clean_content, mtp_calls) = {
+            if request_had_tools {
+                let defs = request.tools.clone().unwrap_or_default();
+                let mut st = crate::providers::mtp::MtpStreamState::new();
+                let cleaned = st.process_delta(&clean_content, &defs);
+                st.finish(&defs);
+                (cleaned, std::mem::take(&mut st.collected_tool_calls))
+            } else {
+                (clean_content, Vec::new())
+            }
+        };
         let tool_calls = if !native_calls.is_empty() {
             Some(native_calls)
+        } else if !mtp_calls.is_empty() {
+            Some(mtp_calls)
         } else {
-            xml_calls
+            None
         };
         let finish_reason = if tool_calls.is_some() {
             "tool_calls"
@@ -1811,8 +1834,9 @@ impl DirectClient {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, GatewayError>>, GatewayError> {
-        let (prompt, conversation_id, session_url, is_new, request_had_tools) =
+        let (prompt, conversation_id, session_url, is_new, _request_had_tools) =
             self.prepare_turn(&request)?;
+        let tools_for_stream = request.tools.clone().unwrap_or_default();
         let template_b64 = if is_new { HOME_TEMPLATE_B64 } else { CHAT_TEMPLATE_B64 };
 
         self.warmup_and_mode_switch(&conversation_id, request.thinking).await?;
@@ -1830,9 +1854,9 @@ impl DirectClient {
             created: current_timestamp(),
             model: request.model.clone(),
             session_url,
-            request_had_tools,
+            tool_defs: tools_for_stream,
             sent_first_chunk: false,
-            stripper: XmlToolCallStripper::new(),
+            mtp_state: crate::providers::mtp::MtpStreamState::new(),
             collected_calls: Vec::new(),
         };
 
@@ -1850,8 +1874,13 @@ impl DirectClient {
             .await
             {
                 Ok(()) => {
-                    if let Some(tool_call) = ctx.stripper.finish_pending() {
-                        ctx.collected_calls.push(tool_call);
+                    if !ctx.tool_defs.is_empty() {
+                        ctx.mtp_state.finish(&ctx.tool_defs);
+                        for call in ctx.mtp_state.collected_tool_calls.drain(..) {
+                            if !ctx.collected_calls.iter().any(|c| c.id == call.id) {
+                                ctx.collected_calls.push(call);
+                            }
+                        }
                     }
                     if !ctx.sent_first_chunk && ctx.collected_calls.is_empty() {
                         // Empty upstream response: treat as a failure, not a

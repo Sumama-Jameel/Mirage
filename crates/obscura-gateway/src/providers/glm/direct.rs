@@ -1262,12 +1262,6 @@ fn inject_tool_context(messages: &mut [ChatMessage], context: &str) {
     }
 }
 
-fn update_last_user_text(messages: &mut [ChatMessage], text: &str) {
-    if let Some(idx) = messages.iter().rposition(|m| m.role == "user") {
-        messages[idx].content = crate::models::ChatContent::String(text.to_string());
-    }
-}
-
 fn send_content_chunk(
     tx: &mpsc::UnboundedSender<Result<ChatCompletionChunk, GatewayError>>,
     counter: &AtomicU32,

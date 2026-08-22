@@ -12,7 +12,6 @@ use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatContent,
     ChatMessage, ChatMessageDelta, ChunkChoice, ToolCall, Usage,
 };
-use crate::providers::mtp;
 use crate::providers::streaming_upload::download_and_hash_batch;
 use crate::session::{SessionHandle, SessionManager};
 

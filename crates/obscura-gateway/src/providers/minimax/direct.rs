@@ -14,7 +14,6 @@ use crate::models::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatContent,
     ChatMessage, ChatMessageDelta, ChunkChoice, FunctionCall, ToolCall, Usage,
 };
-use crate::providers::tool_call::{convert_xml_tool_calls, parse_manual_tool_call};
 use crate::session::SessionHandle;
 
 use super::state::{MinimaxSessionState, MinimaxSessionStore};
@@ -370,8 +369,8 @@ struct AgentMessage {
 
 #[derive(Default)]
 struct StreamState {
-    in_tool_call: bool,
-    tool_call_buffer: String,
+    mtp_state: crate::providers::mtp::MtpStreamState,
+    tool_defs: Vec<crate::models::Tool>,
     collected_tool_calls: Vec<ToolCall>,
 }
 
@@ -489,34 +488,13 @@ fn parse_minimax_invoke(invoke: &str) -> Option<ToolCall> {
 }
 
 fn process_content_text(content: &str, state: &mut StreamState) -> String {
-    const START: &str = "<tool_call>";
-    const END: &str = "</tool_call>";
-    let mut output = String::new();
-    let mut rest = content;
-    while !rest.is_empty() {
-        if state.in_tool_call {
-            if let Some(end) = rest.find(END) {
-                state.tool_call_buffer.push_str(&rest[..end]);
-                if let Some(tc) = parse_manual_tool_call(&state.tool_call_buffer) {
-                    state.collected_tool_calls.push(tc);
-                }
-                state.in_tool_call = false;
-                state.tool_call_buffer.clear();
-                rest = &rest[end + END.len()..];
-            } else {
-                state.tool_call_buffer.push_str(rest);
-                break;
-            }
-        } else if let Some(start) = rest.find(START) {
-            output.push_str(&rest[..start]);
-            rest = &rest[start + START.len()..];
-            state.in_tool_call = true;
-        } else {
-            output.push_str(rest);
-            break;
-        }
+    // MTP blocks are absorbed, validated against the client definitions,
+    // and collected; visible text passes through.
+    let out = state.mtp_state.process_delta(content, &state.tool_defs);
+    for tc in state.mtp_state.collected_tool_calls.drain(..) {
+        state.collected_tool_calls.push(tc);
     }
-    output
+    out
 }
 
 fn build_extra_headers() -> HashMap<String, String> {
@@ -866,7 +844,8 @@ impl DirectClient {
             // are the primary path. Only fall back to XML marker parsing when
             // no native calls were produced.
             if tool_calls.is_empty() {
-                // Try MiniMax-native format first, then fall back to generic <tool_call> format
+                // Try MiniMax-native format first, then fall back to MTP
+                // blocks (the universal dialect).
                 let (cleaned, parsed) = parse_minimax_tool_calls(&full_content);
                 if let Some(calls) = parsed {
                     if !calls.is_empty() {
@@ -874,12 +853,15 @@ impl DirectClient {
                         full_content = cleaned;
                     }
                 } else {
-                    let (cleaned, parsed) = convert_xml_tool_calls(&full_content, true);
-                    if let Some(calls) = parsed {
-                        if !calls.is_empty() {
-                            tool_calls = calls;
-                            full_content = cleaned;
-                        }
+                    let defs: Vec<crate::models::Tool> =
+                        request.tools.clone().unwrap_or_default();
+                    let mut st = crate::providers::mtp::MtpStreamState::new();
+                    let cleaned = st.process_delta(&full_content, &defs);
+                    st.finish(&defs);
+                    let calls = std::mem::take(&mut st.collected_tool_calls);
+                    if !calls.is_empty() {
+                        tool_calls = calls;
+                        full_content = cleaned;
                     }
                 }
             }
@@ -1081,7 +1063,7 @@ impl DirectClient {
             .map(|(c, id, o)| (c.as_ref(), id.as_deref(), o.as_str()))
             .collect();
 
-        crate::providers::tool_call::format_tool_results(&refs)
+        crate::providers::mtp::format_tool_results(&refs)
     }
 
     /// Process file attachments: upload them via Minimax's file API and
@@ -1152,6 +1134,23 @@ impl DirectClient {
             content = format!("{}\n\n{}", tool_context, content);
         }
 
+        // Compile client tools into the MTP system prompt. Native
+        // `tools` are never forwarded upstream (the endpoint ignores them;
+        // the model emits [MIRAGE_TOOL_CALL_V1] blocks instead).
+        if let Some(tools) = &request.tools {
+            if !tools.is_empty() {
+                content = format!(
+                    "{}\n\nUser request:\n{}",
+                    crate::providers::mtp::build_mtp_system_prompt(
+                        tools,
+                        request.tool_choice.as_ref(),
+                        false
+                    ),
+                    content
+                );
+            }
+        }
+
         // Build structured attachments array matching web app format
         let attach_values: Vec<serde_json::Value> = attachments
             .iter()
@@ -1186,9 +1185,8 @@ impl DirectClient {
             payload["attachments"] = serde_json::Value::Array(attach_values);
         }
 
-        if let Some(ref tools) = request.tools {
-            payload["tools"] = serde_json::json!(tools);
-        }
+        // OpenAI tools/tool_choice are never forwarded upstream (MTP
+        // invariant): the compiled prompt carries the tool contract.
         let body_str = serde_json::to_string(&payload)
             .map_err(|e| GatewayError::Internal(format!("JSON serialization failed: {e}")))?;
 
@@ -1253,12 +1251,18 @@ impl DirectClient {
 
         let (tx, rx) = mpsc::unbounded_channel::<Result<ChatCompletionChunk, GatewayError>>();
 
+        // Clone tool defs for the spawned task (request borrow cannot cross).
+        let stream_tool_defs = request.tools.clone().unwrap_or_default();
         tokio::spawn({
             let tx = tx.clone();
             async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
                 let mut http_chunks = response.bytes_stream();
-                let mut state = StreamState::default();
+                let mut state = StreamState {
+                    mtp_state: crate::providers::mtp::MtpStreamState::new(),
+                    tool_defs: stream_tool_defs,
+                    collected_tool_calls: Vec::new(),
+                };
                 let mut saw_tool_calls = false;
 
                 tracing::debug!("SSE stream reading started");
