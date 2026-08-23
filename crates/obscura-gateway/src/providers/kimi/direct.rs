@@ -60,14 +60,17 @@ fn current_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-/// Opt-in ConnectRPC transport for new chats (kimi.ai web protocol).
+/// ConnectRPC transport for NEW chats (kimi.ai web protocol). The JWT minted
+/// on kimi.ai carries `aud=["kimi.ai"]`, which is the audience this endpoint
+/// requires; legacy moonshot tokens will not work here.
 ///
-/// The legacy SSE endpoints remain the default until live verification
-/// completes: continuation fields for the ConnectRPC request body are not
-/// captured yet, so ConnectRPC is used for NEW chats only and any failure
-/// falls back to the working legacy path.
+/// Continuation turns stay on the legacy path until the ConnectRPC
+/// continuation wire format is captured. Any ConnectRPC failure falls back to
+/// the working legacy path, so defaulting this on is safe.
 fn connect_rpc_enabled() -> bool {
-    std::env::var("OBSCURA_KIMI_CONNECT_RPC").ok().as_deref() == Some("1")
+    std::env::var("OBSCURA_KIMI_CONNECT_RPC")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Decode a JWT payload's `sub` claim (used as `x-traffic-id`).

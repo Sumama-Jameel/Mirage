@@ -39,8 +39,18 @@ fn access_token_is_usable(token: &str) -> bool {
     claims.exp.map(|exp| exp > chrono::Utc::now().timestamp() as u64).unwrap_or(true)
 }
 
-/// Web app URL (cookies and localStorage live here, not on kimi.moonshot.cn).
-const KIMI_WEB_URL: &str = "https://www.kimi.com";
+/// Web app URL. The live web client runs on kimi.ai (cookies and localStorage
+/// live here); kimi.com is an older surface kept as a fallback origin.
+const KIMI_WEB_URL: &str = "https://www.kimi.ai";
+/// All origins that may hold Kimi browser credentials, most-recent first.
+const KIMI_ORIGINS: &[&str] = &[
+    "https://www.kimi.ai",
+    "https://kimi.ai",
+    "https://www.kimi.com",
+    "https://kimi.com",
+];
+/// Cookie domains that may hold the kimi-auth session cookie.
+const KIMI_COOKIE_DOMAINS: &[&str] = &["www.kimi.ai", ".kimi.ai", "www.kimi.com", ".www.kimi.com"];
 /// API base URL (the API stays on kimi.moonshot.cn even though the web app redirects).
 pub const KIMI_API_URL: &str = "https://kimi.moonshot.cn";
 
@@ -56,9 +66,8 @@ pub fn extract_from_import(
     // Try kimi-auth cookie first — it's synced from the active browser session
     // and is more likely to be fresh than a stored localStorage token.
     if let Some(jar) = cookie_jar {
-        if let Some(cookie_value) = find_cookie_value(jar, "www.kimi.com", "kimi-auth")
-            .or_else(|| find_cookie_value(jar, ".www.kimi.com", "kimi-auth"))
-        {
+        let cookie_value = KIMI_COOKIE_DOMAINS.iter().find_map(|d| find_cookie_value(jar, d, "kimi-auth"));
+        if let Some(cookie_value) = cookie_value {
             if !access_token_is_usable(&cookie_value) {
                 info!("Ignoring expired Kimi auth cookie; refreshing from the live page");
             } else {
@@ -70,15 +79,17 @@ pub fn extract_from_import(
     }
 
     // Fallback: only an access token is valid in the API Authorization header.
-    if let Some(token) = find_local_storage(local_storage, "https://www.kimi.com", "access_token")
-    {
-        if !access_token_is_usable(&token) {
-            info!("Ignoring expired Kimi local-storage access token; refreshing from the live page");
-            return None;
+    // kimi.ai is checked first (current web app), then older origins.
+    for origin in KIMI_ORIGINS {
+        if let Some(token) = find_local_storage(local_storage, origin, "access_token") {
+            if !access_token_is_usable(&token) {
+                info!(origin, "Ignoring expired Kimi local-storage access token; refreshing from the live page");
+                return None;
+            }
+            let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
+            info!(origin, "Kimi auth extracted from imported localStorage");
+            return Some(AuthData { access_token: token, device_id });
         }
-        let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
-        info!("Kimi auth extracted from imported localStorage");
-        return Some(AuthData { access_token: token, device_id });
     }
 
     None
@@ -153,7 +164,7 @@ pub async fn extract_refresh_token(
         if let Some(token) = token {
             if !access_token_is_usable(token) {
                 return Err(GatewayError::Auth(
-                    "Kimi page returned an expired access token; log in again at https://www.kimi.com".to_string(),
+                    "Kimi page returned an expired access token; log in again at https://www.kimi.ai".to_string(),
                 ));
             }
             info!(session_id = %session_id, "Kimi auth extracted from live page");
@@ -169,9 +180,8 @@ pub async fn extract_refresh_token(
     // it. Use the cookie only after localStorage refresh has had a chance to
     // rotate the credentials.
     if let Some(jar) = cookie_jar {
-        if let Some(cookie_value) = find_cookie_value(jar, "www.kimi.com", "kimi-auth")
-            .or_else(|| find_cookie_value(jar, ".www.kimi.com", "kimi-auth"))
-        {
+        let cookie_value = KIMI_COOKIE_DOMAINS.iter().find_map(|d| find_cookie_value(jar, d, "kimi-auth"));
+        if let Some(cookie_value) = cookie_value {
             if access_token_is_usable(&cookie_value) {
                 info!(session_id = %session_id, "Kimi auth found in refreshed session cookie");
                 let device_id = format!("{:016}", rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64));
@@ -182,13 +192,13 @@ pub async fn extract_refresh_token(
 
     Err(GatewayError::Auth(format!(
         "Kimi auth token not found. \
-         Ensure the session is navigated to https://www.kimi.com \
+         Ensure the session is navigated to https://www.kimi.ai \
          and the page is fully loaded with a valid login session."
     )))
 }
 
 /// Build HTTP headers for Kimi API requests. The API lives on kimi.moonshot.cn
-/// even though the web app is at www.kimi.com.
+/// even though the web app is at www.kimi.ai.
 pub fn build_request_headers(
     access_token: &str,
     device_id: &str,

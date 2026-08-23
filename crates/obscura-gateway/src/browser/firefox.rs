@@ -222,6 +222,8 @@ fn import_local_storage(snapshot_path: &Path) -> Result<Vec<LocalStorageEntry>, 
     }
 
     for (label, origin, storage_dir) in [
+        ("Kimi", "https://www.kimi.ai", "https+++www.kimi.ai"),
+        ("Kimi", "https://kimi.ai", "https+++kimi.ai"),
         ("Kimi", "https://www.kimi.com", "https+++www.kimi.com"),
         ("Kimi", "https://kimi.com", "https+++kimi.com"),
         ("Kimi", "https://kimi.moonshot.cn", "https+++kimi.moonshot.cn"),

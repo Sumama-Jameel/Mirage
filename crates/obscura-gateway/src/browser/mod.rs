@@ -194,10 +194,16 @@ fn is_google_domain(host: &str) -> bool {
     host == "google.com" || host.ends_with(".google.com")
 }
 
-/// Returns true for Moonshot/Kimi web-session hosts.
+/// Returns true for Moonshot/Kimi web-session hosts (kimi.ai is the current
+/// web app; kimi.com and moonshot.cn are older surfaces kept for fallback).
 fn is_kimi_domain(host: &str) -> bool {
     let host = host.trim_start_matches('.').to_lowercase();
-    host == "kimi.com" || host.ends_with(".kimi.com") || host == "moonshot.cn" || host.ends_with(".moonshot.cn")
+    host == "kimi.ai"
+        || host.ends_with(".kimi.ai")
+        || host == "kimi.com"
+        || host.ends_with(".kimi.com")
+        || host == "moonshot.cn"
+        || host.ends_with(".moonshot.cn")
 }
 
 /// Returns true for Z.AI's public GLM chat hosts.
