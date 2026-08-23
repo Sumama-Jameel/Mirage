@@ -430,7 +430,7 @@ impl GeminiDirectClient {
         if let Some(tools) = &request.tools {
             (
                 format!(
-                    "{}\n\nUser request:\n{}",
+                    "{}\n\n=== USER REQUEST (execute this task now) ===\n{}\n=== END USER REQUEST ===",
                     crate::providers::mtp::build_mtp_system_prompt(
                         tools,
                         request.tool_choice.as_ref(),
