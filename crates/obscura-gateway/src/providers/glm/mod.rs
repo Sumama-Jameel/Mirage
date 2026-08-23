@@ -111,6 +111,9 @@ impl GlmProvider {
             &state.config.glm.sign_secret,
             &state.config.glm.upstream_url,
             state.config.browser.profile_path.as_deref().map(std::path::Path::new),
+            crate::providers::drift_snapshot::DriftSnapshots::with_data_dir(
+                state.config.data_dir.clone(),
+            ),
         )
         .await;
 
@@ -149,6 +152,9 @@ impl GlmProvider {
             &state.config.glm.sign_secret,
             &state.config.glm.upstream_url,
             state.config.browser.profile_path.as_deref().map(std::path::Path::new),
+            crate::providers::drift_snapshot::DriftSnapshots::with_data_dir(
+                state.config.data_dir.clone(),
+            ),
         )
         .await;
 

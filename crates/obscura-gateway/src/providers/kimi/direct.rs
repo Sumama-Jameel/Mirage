@@ -844,6 +844,14 @@ impl KimiDirectClient {
             tracing::debug!(raw_response = %body_str, "K3 raw response body");
             let (text, thinking, turn_id) = collect_text_from_new_sse(&body);
 
+            // Empty 200 with a non-empty body is the protocol-drift
+            // signature (the "1 chunk, 0 deltas" failure class). Snapshot
+            // the raw body for healing before it is dropped.
+            if text.is_empty() && thinking.as_deref().is_none() && !body.is_empty() {
+                crate::providers::drift_snapshot::global()
+                    .record("kimi", "empty-200", &body);
+            }
+
             // Extract tool calls from the response if tools were requested
             let has_tools = request.tools.is_some();
             let native_tool_calls = if has_tools {

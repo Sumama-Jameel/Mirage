@@ -197,6 +197,8 @@ pub struct GlmDirectClient {
     user_agent: String,
     profile_path: Option<std::path::PathBuf>,
     models_cache: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Raw-response snapshots for drift healing.
+    drift: crate::providers::drift_snapshot::DriftSnapshots,
 }
 
 impl GlmDirectClient {
@@ -210,6 +212,7 @@ impl GlmDirectClient {
         sign_secret: &str,
         upstream_url: &str,
         profile_path: Option<&std::path::Path>,
+        drift: crate::providers::drift_snapshot::DriftSnapshots,
     ) -> Result<Self, DirectError> {
         let auth = resolve_auth(&session.local_storage, &session.cookie_jar)
             .await
@@ -248,6 +251,7 @@ impl GlmDirectClient {
             user_agent: session.user_agent.clone(),
             profile_path: profile_path.map(std::path::PathBuf::from),
             models_cache: std::sync::Mutex::new(None),
+            drift,
         })
     }
 
@@ -637,6 +641,10 @@ impl GlmDirectClient {
                             .trim_start()
                             .starts_with("data:"))
                 {
+                    // Keep the raw payload for drift healing before it is
+                    // dropped with this task.
+                    self.drift
+                        .record("glm", if status >= 400 { "http-error" } else { "parse" }, &body_bytes);
                     let snippet = String::from_utf8_lossy(&body_bytes)
                         .chars()
                         .take(500)

@@ -18,6 +18,7 @@ pub mod claude;
 #[cfg(test)]
 pub mod conformance;
 pub mod deepseek;
+pub mod drift_snapshot;
 pub mod file_upload;
 pub mod gemini;
 pub mod glm;

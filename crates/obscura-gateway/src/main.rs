@@ -76,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let sessions = SessionManager::spawn(&config).await?;
     info!("Browser session pool warm-up started in background");
 
+    // Drift snapshots: raw bodies of unparseable upstream responses, for
+    // human-in-loop protocol healing (docs/wire/drift-healing.md).
+    crate::providers::drift_snapshot::init_global(config.data_dir.clone());
+
     let mut registry = ProviderRegistry::new();
     // DeepSeek's legacy direct adapter needs a provider-supplied PoW module.
     // Its optional failure must not prevent the browser-UI providers from

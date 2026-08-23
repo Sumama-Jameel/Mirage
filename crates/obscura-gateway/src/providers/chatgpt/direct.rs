@@ -969,6 +969,13 @@ impl ChatGptDirectClient {
                 // Parse SSE content, thinking, and native tool calls
                 let (text, thinking, native_tool_calls) = Self::collect_text_from_sse(&body);
 
+                // Empty 200 with a non-empty body is the drift signature;
+                // snapshot for healing before the body is dropped.
+                if text.is_empty() && thinking.as_deref().is_none() && !body.is_empty() {
+                    crate::providers::drift_snapshot::global()
+                        .record("chatgpt", "empty-200", &body);
+                }
+
                 tracing::debug!(text_len = text.len(), text_snippet = %text.chars().take(200).collect::<String>(), has_native = native_tool_calls.is_some(), "SSE parsed text");
 
                 // Prefer native tool calls from SSE, fall back to MTP blocks
