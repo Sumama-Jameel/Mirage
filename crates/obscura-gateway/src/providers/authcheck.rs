@@ -90,8 +90,14 @@ pub fn probes() -> &'static [AuthProbe] {
         },
         AuthProbe {
             provider: "kimi",
-            cookie_domains: &["kimi.com", "www.kimi.com"],
+            cookie_domains: &["kimi.ai", "www.kimi.ai", "kimi.com", "www.kimi.com"],
             any_of_cookies: &["kimi-auth"],
+            any_local_storage: &[
+                ("https://www.kimi.ai", "access_token"),
+                ("https://www.kimi.ai", "refresh_token"),
+                ("https://www.kimi.com", "access_token"),
+                ("https://www.kimi.com", "refresh_token"),
+            ],
             ..AuthProbe::none()
         },
         AuthProbe {
@@ -182,6 +188,8 @@ pub fn check(
     }
 
     let mut missing: Vec<String> = Vec::new();
+    let mut missing_cookies = false;
+    let mut missing_local_storage = false;
 
     // Cookie probes.
     let mut any_cookie_hits = 0usize;
@@ -201,6 +209,7 @@ pub fn check(
         }
     }
     if !probe.any_of_cookies.is_empty() && any_cookie_hits == 0 {
+        missing_cookies = true;
         missing.push(format!(
             "/{} cookie on {}",
             probe.any_of_cookies.join(", "),
@@ -220,12 +229,29 @@ pub fn check(
             .unwrap_or(false)
     });
     if !probe.any_local_storage.is_empty() && !any_ls_hits {
+        missing_local_storage = true;
         missing.push(format!(
             "localStorage {}/{} on {}",
             probe.any_local_storage[0].1,
             probe.any_local_storage[0].0,
             "any"
         ));
+    }
+
+    // Alternative-evidence semantics: when a probe declares both cookie and
+    // localStorage groups (GLM, Kimi), satisfying EITHER proves the login.
+    // Requiring both produced false negatives for browsers that keep the
+    // credential in only one of the two stores.
+    if !probe.any_of_cookies.is_empty() && !probe.any_local_storage.is_empty() {
+        if !(missing_cookies && missing_local_storage) {
+            missing.retain(|m| {
+                let is_cookie_diag = m.starts_with('/');
+                let is_ls_diag = m.starts_with("localStorage ");
+                !(is_cookie_diag || is_ls_diag)
+            });
+        }
+    } else {
+        // Single-group probes: required_* entries still apply verbatim.
     }
 
     if missing.is_empty() {
@@ -359,6 +385,44 @@ mod tests {
     fn kimi_ok_with_kimi_auth_cookie() {
         let jar = jar_with(&[("www.kimi.com", "kimi-auth", "test-token")]);
         assert!(check("kimi", &jar, &[]).ok);
+    }
+
+    #[test]
+    fn glm_passes_on_local_storage_alone() {
+        // Regression: GLM declares cookie AND localStorage evidence; the
+        // browser keeps the token only in localStorage. Either must suffice.
+        let ls = storage_with(&[("https://chat.z.ai", "token", "jwt-value")]);
+        let verdict = check("glm", &jar_with(&[]), &ls);
+        assert!(verdict.ok, "localStorage-only login rejected: {:?}", verdict.missing);
+    }
+
+    #[test]
+    fn glm_passes_on_cookie_alone() {
+        let jar = jar_with(&[("chat.z.ai", "token", "jwt-value")]);
+        let verdict = check("glm", &jar, &[]);
+        assert!(verdict.ok, "cookie-only login rejected: {:?}", verdict.missing);
+    }
+
+    #[test]
+    fn glm_fails_when_both_groups_missing() {
+        let verdict = check("glm", &jar_with(&[]), &[]);
+        assert!(!verdict.ok);
+        assert!(
+            verdict.missing.iter().any(|m| m.contains("cookie")),
+            "should report the missing cookie group: {:?}",
+            verdict.missing
+        );
+        assert!(
+            verdict.missing.iter().any(|m| m.contains("localStorage")),
+            "should report the missing localStorage group: {:?}",
+            verdict.missing
+        );
+    }
+
+    #[test]
+    fn kimi_ai_local_storage_accepted() {
+        let ls = storage_with(&[("https://www.kimi.ai", "refresh_token", "rt")]);
+        assert!(check("kimi", &jar_with(&[]), &ls).ok);
     }
 
     #[test]
