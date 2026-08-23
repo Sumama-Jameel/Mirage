@@ -32,6 +32,16 @@ struct AntiBotState {
     consecutive_403s: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedRelease {
+    pub value: String,
+    /// Unix seconds when the release was scraped.
+    pub scraped_at_unix: u64,
+}
+
+/// Re-scrape the release at most this often (grok.com deploys are infrequent).
+pub const RELEASE_TTL_SECS: u64 = 6 * 60 * 60;
+
 /// On-disk envelope: conversations plus the anti-bot section. Older files
 /// were a bare conversations map and are still readable (`deny_unknown_fields`
 /// makes the envelope parse fail on bare maps so the legacy path runs).
@@ -42,6 +52,10 @@ struct PersistedFile {
     conversations: HashMap<String, ConversationState>,
     #[serde(default)]
     anti_bot: Option<AntiBotState>,
+    /// Cached grok.com deploy release (sentry-release build hash) with the
+    /// unix time it was scraped. The upstream rejects requests whose declared
+    /// release does not match the live deploy ("page out of date").
+    release: Option<CachedRelease>,
 }
 
 fn unix_now() -> u64 {
@@ -58,6 +72,7 @@ pub struct GrokSessionStore {
     session_file: std::sync::Arc<Mutex<Option<PathBuf>>>,
     loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     anti_bot: std::sync::Arc<Mutex<Option<AntiBotState>>>,
+    release: std::sync::Arc<Mutex<Option<CachedRelease>>>,
 }
 
 impl GrokSessionStore {
@@ -88,6 +103,7 @@ impl GrokSessionStore {
                     Ok(persisted) => {
                         *self.inner.lock().unwrap() = persisted.conversations;
                         *self.anti_bot.lock().unwrap() = persisted.anti_bot;
+                        *self.release.lock().unwrap() = persisted.release;
                     }
                     Err(_) => {
                         if let Ok(persisted) =
@@ -108,6 +124,7 @@ impl GrokSessionStore {
         let file = PersistedFile {
             conversations: self.inner.lock().unwrap().clone(),
             anti_bot: self.anti_bot.lock().unwrap().clone(),
+            release: self.release.lock().unwrap().clone(),
         };
         let json = serde_json::to_string(&file).unwrap_or_default();
         let tmp = path.with_extension("tmp");
@@ -140,6 +157,34 @@ impl GrokSessionStore {
         let until = guard.as_ref()?.quarantined_until_unix;
         let now = unix_now();
         (until > now).then(|| Duration::from_secs(until - now))
+    }
+
+    /// Cached deploy release, if fresh enough to trust.
+    pub fn cached_release(&self) -> Option<String> {
+        self.ensure_loaded();
+        let guard = self.release.lock().unwrap();
+        let cached = guard.as_ref()?;
+        let age = unix_now().saturating_sub(cached.scraped_at_unix);
+        (age <= RELEASE_TTL_SECS).then(|| cached.value.clone())
+    }
+
+    /// Persist a freshly scraped deploy release.
+    pub fn store_release(&self, value: String) {
+        self.ensure_loaded();
+        *self.release.lock().unwrap() = Some(CachedRelease {
+            value,
+            scraped_at_unix: unix_now(),
+        });
+        drop(self.release.lock().unwrap());
+        self.save_to_disk();
+    }
+
+    /// Drop the cached release (upstream declared it stale).
+    pub fn invalidate_release(&self) {
+        self.ensure_loaded();
+        *self.release.lock().unwrap() = None;
+        drop(self.release.lock().unwrap());
+        self.save_to_disk();
     }
 
     #[allow(dead_code)]
@@ -282,12 +327,36 @@ mod tests {
                     quarantined_until_unix: unix_now().saturating_sub(10),
                     consecutive_403s: 2,
                 }),
+                release: None,
             };
             std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
             drop(store);
         }
         let reopened = GrokSessionStore::with_data_dir(Some(dir.clone()));
         assert!(reopened.anti_bot_quarantine_remaining().is_none(), "expired quarantine must not block");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn release_cache_roundtrip_and_invalidation() {        let dir = temp_dir();
+        {
+            let store = GrokSessionStore::with_data_dir(Some(dir.clone()));
+            assert!(store.cached_release().is_none());
+            store.store_release("40480cda06c2c96e3460c999ebbad66c144d2b47f7".to_string());
+            assert_eq!(
+                store.cached_release().as_deref(),
+                Some("40480cda06c2c96e3460c999ebbad66c144d2b47f7")
+            );
+        }
+        // Persists across restart.
+        let reopened = GrokSessionStore::with_data_dir(Some(dir.clone()));
+        assert_eq!(
+            reopened.cached_release().as_deref(),
+            Some("40480cda06c2c96e3460c999ebbad66c144d2b47f7")
+        );
+        reopened.invalidate_release();
+        assert!(reopened.cached_release().is_none());
 
         std::fs::remove_dir_all(dir).ok();
     }

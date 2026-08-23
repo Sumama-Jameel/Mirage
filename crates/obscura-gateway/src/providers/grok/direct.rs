@@ -271,6 +271,25 @@ async fn send_stealth_stream(
     ))
 }
 
+/// Extract the Sentry release hash from grok.com HTML.
+fn extract_sentry_release(html: &str) -> Option<String> {
+    let marker = "sentry-release=";
+    let pos = html.find(marker)?;
+    let rest = &html[pos + marker.len()..];
+    let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    (hex.len() >= 16).then_some(hex)
+}
+
+/// Fallback: grok.com's Next.js build id is a 40-hex token in the page.
+fn extract_build_token(html: &str) -> Option<String> {
+    for window in html.split('"') {
+        if window.len() == 40 && window.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(window.to_string());
+        }
+    }
+    None
+}
+
 pub struct DirectClient {
     stealth: Arc<obscura_net::StealthHttpClient>,
     mode_id: String,
@@ -314,11 +333,69 @@ impl DirectClient {
     /// `x-statsig-id` is a fresh per-request browser error marker; cookies are
     /// applied by the stealth client from the shared jar, so no Cookie header
     /// is needed here (the jar already carries sso + sso-rw).
-    fn build_request_headers(&self) -> std::collections::HashMap<String, String> {
+    /// Scrape the current grok.com deploy release from the homepage.
+    ///
+    /// The page embeds the Sentry build hash the frontend declares in its
+    /// Baggage header; upstream rejects requests whose declared release does
+    /// not match the live deploy with code 7 ("page out of date").
+    async fn current_release(&self) -> Option<String> {
+        if let Some(cached) = self.store.cached_release() {
+            return Some(cached);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+        let html = client
+            .get("https://grok.com/")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            )
+            .send()
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        // Prefer the explicit sentry-release marker; fall back to a bare
+        // 40-hex build token (the shape of grok.com's Next.js build id).
+        let release = extract_sentry_release(&html).or_else(|| extract_build_token(&html))?;
+        tracing::info!(release = %release, "Grok deploy release scraped");
+        self.store.store_release(release.clone());
+        Some(release)
+    }
+
+    fn build_request_headers_with_release(&self, release: Option<&str>) -> std::collections::HashMap<String, String> {
+        let mut headers = Self::build_request_headers_base();
+        if let Some(release) = release {
+            headers.insert(
+                "Baggage".into(),
+                format!(
+                    "sentry-environment=production,sentry-release={release},sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c"
+                ),
+            );
+        }
+        headers.insert("x-statsig-id".into(), super::statsig::browser_statsig_id());
+        headers.insert("x-xai-request-id".into(), new_uuid());
+        let trace_id: String = (0..16).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
+        let span_id: String = (0..8).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
+        headers.insert("traceparent".into(), format!("00-{trace_id}-{span_id}-00"));
+        headers
+    }
+
+    /// Resolve headers for one request: cached/scraped deploy release when
+    /// available, otherwise sent without Baggage.
+    async fn request_headers(&self) -> std::collections::HashMap<String, String> {
+        let release = self.current_release().await;
+        self.build_request_headers_with_release(release.as_deref())
+    }
+
+    fn build_request_headers_base() -> std::collections::HashMap<String, String> {
         let mut headers = std::collections::HashMap::new();
         headers.insert("Accept".into(), "*/*".into());
         headers.insert("Accept-Language".into(), "en-US,en;q=0.9".into());
-        headers.insert("Baggage".into(), "sentry-environment=production,sentry-release=d6add6fb0460641fd482d767a335ef72b9b6abb8,sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c".into());
         headers.insert("Cache-Control".into(), "no-cache".into());
         headers.insert("Content-Type".into(), "application/json".into());
         headers.insert("Origin".into(), "https://grok.com".into());
@@ -338,11 +415,6 @@ impl DirectClient {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".into(),
         );
-        headers.insert("x-statsig-id".into(), super::statsig::browser_statsig_id());
-        headers.insert("x-xai-request-id".into(), new_uuid());
-        let trace_id: String = (0..16).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
-        let span_id: String = (0..8).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
-        headers.insert("traceparent".into(), format!("00-{trace_id}-{span_id}-00"));
         headers
     }
 
@@ -588,7 +660,7 @@ impl DirectClient {
         let url = format!("{GROK_BASE_URL}{CONVERSATIONS_PATH}");
         let body = serde_json::to_string(payload)
             .map_err(|e| GatewayError::Internal(format!("JSON serialization failed: {e}")))?;
-        let headers = self.build_request_headers();
+        let headers = self.request_headers().await;
         send_stealth_stream(&self.stealth, "POST", &url, &headers, &body).await
     }
 
@@ -622,6 +694,27 @@ impl DirectClient {
 
         let mut response = response;
         let body = self.drain_error_body(&mut response).await;
+
+        // "Page out of date" (code 7) means the deploy release we declared is
+        // stale. Drop the cached release so the next attempt rescrapes, then
+        // retry once with the fresh one.
+        if body.contains("out of date") || (body.contains("\"code\":7") && status == 400) {
+            tracing::warn!("Grok deploy release rejected; rescraping and retrying once");
+            self.store.invalidate_release();
+            let retry_headers = self.request_headers().await;
+            let url = format!("{GROK_BASE_URL}{CONVERSATIONS_PATH}");
+            let body_json = serde_json::to_string(payload)
+                .map_err(|e| GatewayError::Internal(format!("JSON serialization failed: {e}")))?;
+            let retry = send_stealth_stream(&self.stealth, "POST", &url, &retry_headers, &body_json).await?;
+            if (200..300).contains(&retry.status) {
+                return Ok(retry);
+            }
+            let mut retry = retry;
+            let retry_body = self.drain_error_body(&mut retry).await;
+            return Err(GatewayError::Provider(format!(
+                "Grok API error after release refresh: {retry_body}"
+            )));
+        }
 
         if status == 403 {
             tracing::warn!(
