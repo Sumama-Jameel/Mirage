@@ -15,7 +15,6 @@ use crate::models::{
     ChatMessageDelta, ChunkChoice, Citation, Tool, ToolCall, Usage,
 };
 use crate::providers::tokenizer::estimate_tokens;
-use crate::providers::mtp;
 use crate::providers::tool_call::format_tool_results;
 use crate::providers::send_with_retry;
 use crate::session::{SessionHandle, SessionManager};

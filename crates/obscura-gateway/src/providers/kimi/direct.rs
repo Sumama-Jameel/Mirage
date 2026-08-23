@@ -25,6 +25,7 @@ use super::auth::{
     build_request_headers, extract_from_import, extract_refresh_token, navigate_to_kimi, AuthData,
     KIMI_API_URL,
 };
+use super::connectrpc;
 use super::models::{resolve_model, KimiModelDef};
 use super::rpc::{
     build_request_payload, collect_text_from_new_sse, collect_text_from_sse,
@@ -57,6 +58,30 @@ fn current_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Opt-in ConnectRPC transport for new chats (kimi.ai web protocol).
+///
+/// The legacy SSE endpoints remain the default until live verification
+/// completes: continuation fields for the ConnectRPC request body are not
+/// captured yet, so ConnectRPC is used for NEW chats only and any failure
+/// falls back to the working legacy path.
+fn connect_rpc_enabled() -> bool {
+    std::env::var("OBSCURA_KIMI_CONNECT_RPC").ok().as_deref() == Some("1")
+}
+
+/// Decode a JWT payload's `sub` claim (used as `x-traffic-id`).
+fn jwt_sub(token: &str) -> Option<String> {
+    let payload_b64 = token.split('.').nth(1)?;
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&decoded)
+        .ok()?
+        .get("sub")
+        .and_then(|s| s.as_str())
+        .map(String::from)
 }
 
 pub struct KimiDirectClient {
@@ -294,6 +319,257 @@ impl KimiDirectClient {
         }
 
         payload
+    }
+
+    /// Send a message to an existing chat session using the new Kimi message API
+    /// (used by K3 and future models).
+    ///
+    /// Endpoint: `POST /mavis/api/session/{chat_id}/message`
+    ///
+    /// Unlike the legacy `completion/stream` endpoint, this receives SSE events
+    /// with a JSON `type` discriminator field.
+    async fn send_connect_chat(&self, body: &serde_json::Value) -> Result<reqwest::Response, GatewayError> {
+        let traffic_id = jwt_sub(&self.auth.access_token).unwrap_or_default();
+        let headers = connectrpc::build_headers(
+            &self.auth.access_token,
+            &self.auth.device_id,
+            &self.auth.device_id,
+            &traffic_id,
+        );
+        let frame = connectrpc::encode_frame(body.to_string().as_bytes());
+        let mut req = self.http.post(connectrpc::CONNECT_CHAT_URL);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req.body(frame)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Provider(format!("Kimi ConnectRPC request failed: {e}")))
+    }
+
+    /// Stream one turn over the kimi.ai ConnectRPC transport (new chats only;
+    /// continuation stays on the legacy path until the continuation wire
+    /// format is captured).
+    async fn chat_stream_connect(
+        &mut self,
+        request: ChatCompletionRequest,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, GatewayError>>, GatewayError> {
+        let last_msg = request.messages.last();
+        let content = last_msg.map(|m| m.content.as_text()).unwrap_or_default();
+
+        // MTP system prompt when the client supplied tools.
+        let final_content = match request.tools.as_ref() {
+            Some(tools) if !tools.is_empty() => format!(
+                "{}\n\nUser request:\n{}",
+                crate::providers::mtp::build_mtp_system_prompt(
+                    tools,
+                    request.tool_choice.as_ref(),
+                    false
+                ),
+                content
+            ),
+            _ => content,
+        };
+
+        let thinking = request.thinking.unwrap_or(self.model_def.is_thinking);
+        let search = request.search.unwrap_or(false);
+        let body = connectrpc::build_chat_body(&final_content, thinking, search, None);
+
+        let resp = self.send_connect_chat(&body).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(GatewayError::Provider(format!(
+                "Kimi ConnectRPC returned {status}"
+            )));
+        }
+        let byte_stream = resp.bytes_stream();
+
+        let model_id = self.model_id.clone();
+        let id_prefix = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+        let tool_defs = request.tools.clone().unwrap_or_default();
+        let store = self.store.clone();
+
+        let (tx, rx) = mpsc::unbounded_channel::<Result<ChatCompletionChunk, GatewayError>>();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut decoder = connectrpc::FrameDecoder::new();
+            let mut mtp_state = crate::providers::mtp::MtpStreamState::new();
+            let mut saw_tool_calls = false;
+            let mut chat_id: Option<String> = None;
+            let mut assistant_message_id: Option<String> = None;
+            let mut role_emitted = false;
+            let mut stream = byte_stream;
+
+            while let Some(chunk) = stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(GatewayError::Provider(format!(
+                            "Kimi ConnectRPC stream error: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                decoder.push(&bytes);
+                for event in decoder.drain() {
+                    match connectrpc::classify_event(&event) {
+                        connectrpc::KimiEvent::ThinkDelta(t) => {
+                            if t.is_empty() {
+                                continue;
+                            }
+                            let _ = tx.send(Ok(ChatCompletionChunk {
+                                id: id_prefix.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: current_timestamp(),
+                                model: model_id.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChatMessageDelta {
+                                        role: None,
+                                        content: None,
+                                        reasoning_content: Some(t),
+                                        citations: None,
+                                        tool_calls: None,
+                                    },
+                                    finish_reason: None,
+                                }],
+                                session_url: None,
+                            }));
+                        }
+                        connectrpc::KimiEvent::TextDelta(t) => {
+                            if t.is_empty() {
+                                continue;
+                            }
+                            let visible = if tool_defs.is_empty() {
+                                t
+                            } else {
+                                let clean = mtp_state.process_delta(&t, &tool_defs);
+                                if !mtp_state.collected_tool_calls.is_empty() {
+                                    let calls =
+                                        std::mem::take(&mut mtp_state.collected_tool_calls);
+                                    saw_tool_calls = true;
+                                    let _ = tx.send(Ok(ChatCompletionChunk {
+                                        id: id_prefix.clone(),
+                                        object: "chat.completion.chunk".to_string(),
+                                        created: current_timestamp(),
+                                        model: model_id.clone(),
+                                        choices: vec![ChunkChoice {
+                                            index: 0,
+                                            delta: ChatMessageDelta {
+                                                role: None,
+                                                content: None,
+                                                reasoning_content: None,
+                                                citations: None,
+                                                tool_calls: Some(calls),
+                                            },
+                                            finish_reason: None,
+                                        }],
+                                        session_url: None,
+                                    }));
+                                }
+                                clean
+                            };
+                            if visible.is_empty() && !saw_tool_calls {
+                                continue;
+                            }
+                            let role = if !role_emitted && !visible.is_empty() {
+                                role_emitted = true;
+                                Some("assistant".to_string())
+                            } else {
+                                None
+                            };
+                            let _ = tx.send(Ok(ChatCompletionChunk {
+                                id: id_prefix.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: current_timestamp(),
+                                model: model_id.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChatMessageDelta {
+                                        role,
+                                        content: if visible.is_empty() { None } else { Some(visible) },
+                                        reasoning_content: None,
+                                        citations: None,
+                                        tool_calls: None,
+                                    },
+                                    finish_reason: None,
+                                }],
+                                session_url: None,
+                            }));
+                        }
+                        connectrpc::KimiEvent::ChatId(id) => chat_id = Some(id),
+                        connectrpc::KimiEvent::MessageId(id) => assistant_message_id = Some(id),
+                        connectrpc::KimiEvent::Done | connectrpc::KimiEvent::Heartbeat => {}
+                        connectrpc::KimiEvent::References(_) => {}
+                        connectrpc::KimiEvent::Other => {}
+                    }
+                }
+            }
+
+            // Flush any pending MTP block at stream end.
+            if !tool_defs.is_empty() {
+                mtp_state.finish(&tool_defs);
+                let calls = std::mem::take(&mut mtp_state.collected_tool_calls);
+                if !calls.is_empty() {
+                    saw_tool_calls = true;
+                    let _ = tx.send(Ok(ChatCompletionChunk {
+                        id: id_prefix.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created: current_timestamp(),
+                        model: model_id.clone(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChatMessageDelta {
+                                role: None,
+                                content: None,
+                                reasoning_content: None,
+                                citations: None,
+                                tool_calls: Some(calls),
+                            },
+                            finish_reason: None,
+                        }],
+                        session_url: None,
+                    }));
+                }
+            }
+
+            // Persist conversation ids so the next turn can continue.
+            if let Some(chat_id) = chat_id {
+                let token = new_session_token();
+                store
+                    .insert(
+                        token.clone(),
+                        &StoredConversation {
+                            chat_id: chat_id.clone(),
+                            model_id: model_id.clone(),
+                            segment_id: assistant_message_id,
+                        },
+                        &model_id,
+                    )
+                    .await;
+                let session_url = make_session_url(&token, &chat_id);
+                let finish_reason = if saw_tool_calls { "tool_calls" } else { "stop" };
+                let _ = tx.send(Ok(ChatCompletionChunk {
+                    id: format!("{id_prefix}-final"),
+                    object: "chat.completion.chunk".to_string(),
+                    created: current_timestamp(),
+                    model: model_id.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChatMessageDelta::default(),
+                        finish_reason: Some(finish_reason.to_string()),
+                    }],
+                    session_url: Some(session_url),
+                }));
+            } else {
+                // No chat id seen: upstream did not accept the turn.
+                let _ = tx.send(Err(GatewayError::Provider(
+                    "Kimi ConnectRPC stream ended without a chat id".to_string(),
+                )));
+            }
+        });
+
+        Ok(UnboundedReceiverStream::new(rx).boxed())
     }
 
     /// Send a message to an existing chat session using the new Kimi message API
@@ -752,6 +1028,17 @@ impl KimiDirectClient {
         &mut self,
         request: ChatCompletionRequest,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, GatewayError>>, GatewayError> {
+        // ConnectRPC transport for NEW chats when opted in; any failure
+        // falls through to the legacy path below.
+        if connect_rpc_enabled() && request.session_url.is_none() {
+            match self.chat_stream_connect(request.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Kimi ConnectRPC path failed; falling back to legacy SSE");
+                }
+            }
+        }
+
         let (conv_token, stored_conv) =
             match self.resolve_conversation(&request.session_url).await? {
                 Some((token, stored)) => {

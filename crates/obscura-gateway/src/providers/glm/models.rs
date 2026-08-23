@@ -45,6 +45,10 @@ pub struct GlmModelDef {
     pub supports_thinking: bool,
     pub supports_vision: bool,
     pub supports_search: bool,
+    /// Historical: whether the model accepted the upstream `tool_stream`
+    /// flag. Unused since the MTP migration (client tools are never
+    /// forwarded upstream); kept so the model table stays capture-aligned.
+    #[allow(dead_code)]
     pub supports_tool_streaming: bool,
     pub supports_tools: bool,
 }

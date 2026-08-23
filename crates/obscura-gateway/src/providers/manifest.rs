@@ -461,7 +461,12 @@ pub fn builtin_manifests() -> Vec<ProviderManifest> {
                 ..Default::default()
             },
             stream: StreamSpec {
-                kind: StreamKind::Sse,
+                // Legacy path is SSE; the kimi.ai web app now speaks
+                // ConnectRPC (see providers/kimi/connectrpc.rs and
+                // captures/kimi_chat_wire.txt). Framed reflects the
+                // target transport; the legacy SSE path remains as
+                // fallback until live verification flips the default.
+                kind: StreamKind::Framed,
                 line_prefix: Some("data: ".into()),
                 delta_path: Some("choices[0].delta.content".into()),
                 finish_reason_path: Some("choices[0].finish_reason".into()),

@@ -15,6 +15,15 @@
 //! Dialect dispatch follows `profile.tool_dialect`: `Mtp` is the universal
 //! default; `Xml` and `Gemini` keep the legacy parsers from
 //! [`crate::providers::tool_call`] as selectable rollback dialects.
+//!
+//! The pipeline is the conformance-suite entry point and the dialect
+//! dispatch surface; individual provider adapters may drive the underlying
+//! [`mtp`] primitives directly when their transport shape demands it (flat
+//! prompt providers, cumulative-text streams).
+
+// Some accessors exist for the repair loop and diagnostics paths that only
+// specific adapters exercise; they are covered by the conformance suite.
+#![allow(dead_code)]
 
 use crate::models::{ChatCompletionRequest, ChatMessage, Tool, ToolCall};
 

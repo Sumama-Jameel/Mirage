@@ -15,6 +15,7 @@ use crate::state::AppState;
 use self::state::SessionStore;
 
 mod auth;
+pub mod connectrpc;
 mod direct;
 mod models;
 mod rpc;

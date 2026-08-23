@@ -136,7 +136,9 @@ pub fn builtin_profiles() -> Vec<ProviderProfile> {
     ]
 }
 
-/// Look up a profile by provider and model.
+/// Look up a profile by provider and model (exact match; the pipeline uses
+/// the model-only lookup, this variant is for diagnostics and tests).
+#[allow(dead_code)]
 pub fn find_profile(provider: &str, model: &str) -> Option<ProviderProfile> {
     builtin_profiles()
         .into_iter()

@@ -227,6 +227,10 @@ pub struct MtpStreamParser {
     pending_blocks: Vec<String>,
 }
 
+// `process`/`in_tool_call`/`finish_pending` are the single-block legacy
+// surface kept for the Xml/Gemini dialect rollback path and direct parser
+// use; providers normally drive `MtpStreamState::process_delta` instead.
+#[allow(dead_code)]
 impl MtpStreamParser {
     /// Create a new parser with no in-flight tool call.
     pub fn new() -> Self {
@@ -429,6 +433,8 @@ pub fn validate_tool_call(
 }
 
 /// Build a repair prompt asking the model to re-emit a valid MTP block.
+// `build_repair_prompt` is consumed via `MtpPipeline::next_repair_prompt`.
+#[allow(dead_code)]
 pub fn build_repair_prompt(error: &MtpError, original_block: &str) -> String {
     format!(
         "Your previous response contained an invalid Mirage tool block.\n\n\
@@ -564,6 +570,8 @@ pub struct MtpStreamState {
     errors: Vec<(String, MtpError)>,
 }
 
+// Error/diagnostics accessors are consumed through `MtpPipeline`.
+#[allow(dead_code)]
 impl MtpStreamState {
     /// Create a new MTP stream state.
     pub fn new() -> Self {
