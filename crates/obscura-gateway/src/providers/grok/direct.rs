@@ -566,6 +566,21 @@ impl DirectClient {
         Ok((full_text, reasoning_text, None, finish_reason))
     }
 
+    /// Fail fast while a persisted anti-bot quarantine is armed (e.g. right
+    /// after a restart following a 403 challenge) instead of re-hammering
+    /// grok.com. The error text classifies as `challenge_required`, which
+    /// arms the in-memory circuit for its normal cooldown.
+    fn ensure_not_quarantined(&self) -> Result<(), GatewayError> {
+        if let Some(remaining) = self.store.anti_bot_quarantine_remaining() {
+            return Err(GatewayError::Provider(format!(
+                "Grok API 403 anti-bot quarantine active for another {}s: solve the \
+                 challenge in the source browser, then retry",
+                remaining.as_secs()
+            )));
+        }
+        Ok(())
+    }
+
     async fn send_chat_request(
         &self,
         payload: &serde_json::Value,
@@ -619,6 +634,13 @@ impl DirectClient {
             }
             let mut retry = retry;
             let retry_body = self.drain_error_body(&mut retry).await;
+            // Persist the challenge so a restart does not immediately
+            // re-hammer grok.com while it is still serving the wall.
+            let quarantine_secs = self.store.record_anti_bot_403();
+            tracing::warn!(
+                quarantine_secs,
+                "Grok 403 persisted after marker refresh; arming anti-bot quarantine"
+            );
             return Err(GatewayError::Provider(format!(
                 "Grok API 403 after marker refresh: {}. The grok.com session may be \
                  expired; re-login to grok.com and re-import the browser profile.",
@@ -638,6 +660,7 @@ impl DirectClient {
         let conversation_id = new_uuid();
         let conv = self.store.get_or_create(request.session_url.as_deref(), &request.model, conversation_id);
         let conversation_id = conv.conversation_id;
+        self.ensure_not_quarantined()?;
         let processed_urls = self.process_attachments(&request).await?;
         let payload = self.build_conversation_payload(&request, &processed_urls, &conversation_id);
 
@@ -647,7 +670,6 @@ impl DirectClient {
         let tools = request.tools.as_deref().unwrap_or(&[]);
         let (full_text, reasoning_text, tool_calls, finish_reason) =
             Self::process_stream(response, tools).await?;
-
         if let Some(ref calls) = tool_calls {
             self.store.store_tool_calls(&conversation_id, calls);
         }
@@ -693,6 +715,7 @@ impl DirectClient {
         let conversation_id = new_uuid();
         let conv = self.store.get_or_create(request.session_url.as_deref(), &request.model, conversation_id);
         let conversation_id = conv.conversation_id;
+        self.ensure_not_quarantined()?;
         let processed_urls = self.process_attachments(&request).await?;
         let payload = self.build_conversation_payload(&request, &processed_urls, &conversation_id);
 
