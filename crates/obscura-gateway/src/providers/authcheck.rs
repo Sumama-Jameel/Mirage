@@ -55,7 +55,13 @@ pub fn probes() -> &'static [AuthProbe] {
         AuthProbe {
             provider: "chatgpt",
             cookie_domains: &["chatgpt.com"],
-            any_of_cookies: &["__Secure-next-auth.session-token", "__Host-next-auth.csrf-token"],
+            // chatgpt.com splits large session tokens across `.0`/`.1` chunk
+            // cookies; the unsplit legacy name is kept for older profiles.
+            any_of_cookies: &[
+                "__Secure-next-auth.session-token",
+                "__Secure-next-auth.session-token.0",
+                "__Host-next-auth.csrf-token",
+            ],
             ..AuthProbe::none()
         },
         AuthProbe {
@@ -330,8 +336,18 @@ mod tests {
     }
 
     #[test]
-    fn claude_ok_when_both_cookies_present() {
-        let jar = jar_with(&[("claude.ai", "sessionKey", "s"), ("claude.ai", "lastActiveOrg", "o")]);
+    fn chatgpt_split_session_cookie_accepted() {
+        // chatgpt.com chunks the NextAuth session token across `.0`/`.1`
+        // cookies; the probe must treat their presence as logged-in.
+        let jar = jar_with(&[
+            ("chatgpt.com", "__Secure-next-auth.session-token.0", "part0"),
+            ("chatgpt.com", "__Secure-next-auth.session-token.1", "part1"),
+        ]);
+        assert!(check("chatgpt", &jar, &[]).ok, "split-cookie login rejected");
+    }
+
+    #[test]
+    fn claude_ok_when_both_cookies_present() {        let jar = jar_with(&[("claude.ai", "sessionKey", "s"), ("claude.ai", "lastActiveOrg", "o")]);
         let verdict = check("claude", &jar, &[]);
         assert!(verdict.ok, "{:?}", verdict.missing);
     }
