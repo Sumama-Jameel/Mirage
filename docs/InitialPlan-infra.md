@@ -110,6 +110,12 @@ concurrency slot on drop. `record_ratelimited` halts token grants for
 
 [gap] plan §8.2 priority queue: not implemented (single queue).
 
+> UPDATE 2026-08-23: the gap above is CLOSED. `ConcurrencyGate`
+> (providers/health.rs) implements 4 per-provider FIFO lanes —
+> `Priority::{UserLive, Continuation, Canary, ResearchProbe}` — and
+> `gate_new_request` returns `UserLive` normally and `Canary` for the
+> half-open probe. Unit-tested (priority ordering under contention).
+
 ## Credential pre-flight (`providers/authcheck.rs`)
 
 `check(provider, cookie_jar, local_storage) -> AuthVerdict { ok, missing }`.
@@ -174,10 +180,30 @@ Providers without a declared probe are not gated.
 |-------------------------------------------------------|--------|
 | Release build clean                                   | yes (0 warnings) |
 | Test build clean                                      | yes (0 warnings) |
-| Tests pass                                            | 483 pass, 0 fail (`cargo nextest run -p obscura-gateway`) |
+| Tests pass                                            | 577 pass, 0 fail (`cargo test -p obscura-gateway`; nextest preferred per AGENTS.md) |
 | Phase 0 (health/breaker/limiter/classifier)           | done |
-| Phase 1 GLM direct-only                               | done (fallback removed) |
-| Phase 5 Grok constants/vault                          | partial: randomized statsig + retry-once on 403 + streaming timeouts; dynamic vault still open |
-| Phase 3 Kimi, Phase 4 Gemini, Phase 2 ChatGPT          | live verification pending |
+| Phase 1 GLM direct-only                               | done (fallback removed; real chats/new; cdn_url uploads) |
+| Phase 5 Grok constants/vault                          | done-for-current-wire: dynamic synthetic x-statsig-id (no constants to cache), retry-once on 403, streaming timeouts, persisted anti-bot quarantine across restarts |
+| Phase 3 Kimi                                          | done at code level: legacy + K3 mavis + ConnectRPC transports (`OBSCURA_KIMI_CONNECT_RPC=1`, new chats, legacy fallback), bounded async file-parse polling; live verification pending |
+| Phase 2 ChatGPT                                       | done at code level: f/conversation prepare+sentinel PoW, continuation fork semantics, citations, upload; free-web anon fallback researched (docs/wire/chatgpt-free-web.md), blocked on HAR capture |
+| Phase 4 Gemini                                        | done at code level: envelope parser, request[9] stripped (MTP), candidate[28] tools, citations, continuation; live citation check pending |
 | Phase 6 auth-gated providers                          | done at the pre-flight level (Claude/MiMo/Minimax report clean auth status) |
 | No manual runtime labour                              | yes for the implemented paths |
+
+## Tool calling: MTP/1 (2026-08 migration)
+
+All providers use the MTP/1 prompted tool-output dialect
+(`providers/mtp.rs`, `mtp_pipeline.rs`); OpenAI `tools`/`tool_choice` are
+never forwarded upstream (strip invariant asserted in tests). Native
+provider tool signals remain priority-1 where the wire has them
+(grok tool_usage_card, claude content_block_start, minimax
+agent_message.tool_calls, gemini candidate[28]). XML/Gemini prompt dialects
+are retained as selectable rollback via `ProviderProfile.tool_dialect`.
+Behavioral gate: `providers/conformance.rs` (7 scenarios). Status per
+provider: `docs/research/mtp-provider-audit.md`.
+
+## Drift snapshots
+
+Parse failures / drift with raw bytes in hand write bounded snapshots to
+`<data_dir>/drift/<provider>/` (`providers/drift_snapshot.rs`). Healing is
+human-in-loop: `docs/wire/drift-healing.md`.
