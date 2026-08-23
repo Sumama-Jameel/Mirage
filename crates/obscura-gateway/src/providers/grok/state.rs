@@ -355,6 +355,7 @@ mod tests {
                     consecutive_403s: 2,
                 }),
                 release: None,
+                statsig: None,
             };
             std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
             drop(store);
