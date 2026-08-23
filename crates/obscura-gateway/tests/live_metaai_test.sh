@@ -33,7 +33,7 @@ echo "=== Starting server ==="
 # Pin the port to 3000 regardless of obscura-gateway.toml (which may set 8080),
 # so BASE above matches the bound address. Env overrides the config file.
 OBSCURA_GATEWAY__AUTH__API_KEY=$API_KEY \
-OBSCURA_GATEWAY__SERVER__PORT=3000 \
+OBSCURA_GATEWAY__SERVER__PORT=${OBSCURA_PORT:-3000} \
 $SERVER_BIN &
 SERVER_PID=$!
 

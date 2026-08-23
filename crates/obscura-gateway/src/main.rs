@@ -50,10 +50,24 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+
+    // CLI overrides: --data-dir <path> enables on-disk persistence (session
+    // stores, grok anti-bot quarantine, drift snapshots). Previously this
+    // flag was silently ignored, leaving persistence off in every
+    // flag-launched run.
+    for i in 0..args.len() {
+        if args[i] == "--data-dir" {
+            if let Some(path) = args.get(i + 1) {
+                config.data_dir = Some(std::path::PathBuf::from(path));
+            }
+        }
+    }
+
     info!(
         host = %config.server.host,
         port = config.server.port,
+        data_dir = ?config.data_dir,
         "Loaded configuration"
     );
 
