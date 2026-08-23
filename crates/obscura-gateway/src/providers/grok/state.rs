@@ -56,6 +56,8 @@ struct PersistedFile {
     /// unix time it was scraped. The upstream rejects requests whose declared
     /// release does not match the live deploy ("page out of date").
     release: Option<CachedRelease>,
+    /// Harvested signed x-statsig-id with scrape time.
+    statsig: Option<CachedRelease>,
 }
 
 fn unix_now() -> u64 {
@@ -73,6 +75,7 @@ pub struct GrokSessionStore {
     loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     anti_bot: std::sync::Arc<Mutex<Option<AntiBotState>>>,
     release: std::sync::Arc<Mutex<Option<CachedRelease>>>,
+    statsig: std::sync::Arc<Mutex<Option<CachedRelease>>>,
 }
 
 impl GrokSessionStore {
@@ -104,6 +107,7 @@ impl GrokSessionStore {
                         *self.inner.lock().unwrap() = persisted.conversations;
                         *self.anti_bot.lock().unwrap() = persisted.anti_bot;
                         *self.release.lock().unwrap() = persisted.release;
+                        *self.statsig.lock().unwrap() = persisted.statsig;
                     }
                     Err(_) => {
                         if let Ok(persisted) =
@@ -125,6 +129,7 @@ impl GrokSessionStore {
             conversations: self.inner.lock().unwrap().clone(),
             anti_bot: self.anti_bot.lock().unwrap().clone(),
             release: self.release.lock().unwrap().clone(),
+            statsig: self.statsig.lock().unwrap().clone(),
         };
         let json = serde_json::to_string(&file).unwrap_or_default();
         let tmp = path.with_extension("tmp");
@@ -184,6 +189,28 @@ impl GrokSessionStore {
         self.ensure_loaded();
         *self.release.lock().unwrap() = None;
         drop(self.release.lock().unwrap());
+        self.save_to_disk();
+    }
+
+    /// Cached harvested statsig id, if fresh enough. Statsig tokens are
+    /// minted per page session; a conservative 5-minute TTL avoids replaying
+    /// a token the upstream may have expired.
+    pub fn cached_statsig(&self) -> Option<String> {
+        self.ensure_loaded();
+        let guard = self.statsig.lock().unwrap();
+        let cached = guard.as_ref()?;
+        let age = unix_now().saturating_sub(cached.scraped_at_unix);
+        (age <= super::statsig::HARVEST_TTL_SECS).then(|| cached.value.clone())
+    }
+
+    /// Persist a freshly harvested statsig id.
+    pub fn store_statsig(&self, value: String) {
+        self.ensure_loaded();
+        *self.statsig.lock().unwrap() = Some(CachedRelease {
+            value,
+            scraped_at_unix: unix_now(),
+        });
+        drop(self.statsig.lock().unwrap());
         self.save_to_disk();
     }
 

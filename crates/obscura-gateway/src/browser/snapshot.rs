@@ -74,6 +74,8 @@ pub fn snapshot_firefox_profile(src: &Path) -> Result<TempDir, GatewayError> {
 
     // Additional provider localStorage databases (Kimi, GLM, Claude, Gemini, Qwen, Minimax).
     let provider_storage_dirs = &[
+        "https+++www.kimi.ai",
+        "https+++kimi.ai",
         "https+++www.kimi.com",
         "https+++kimi.com",
         "https+++kimi.moonshot.cn",

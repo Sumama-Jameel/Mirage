@@ -271,20 +271,30 @@ async fn send_stealth_stream(
     ))
 }
 
-/// Extract the Sentry release hash from grok.com HTML.
+/// Extract the Sentry release value from grok.com HTML, preserving the
+/// URL-encoded form the browser sends in Baggage
+/// (`grok-web%40<40-hex build hash>` — capture-verified,
+/// captures/WhileCapturingGrok).
 fn extract_sentry_release(html: &str) -> Option<String> {
     let marker = "sentry-release=";
     let pos = html.find(marker)?;
     let rest = &html[pos + marker.len()..];
-    let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-    (hex.len() >= 16).then_some(hex)
+    let end = rest
+        .find(|c: char| c == ',' || c == '"' || c == '\'' || c == '<' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let raw = &rest[..end];
+    // Must look like grok-web%40<hash>; a bare hex token here would be some
+    // other identifier.
+    (raw.starts_with("grok-web%40") && raw.len() >= 24).then(|| raw.to_string())
 }
 
-/// Fallback: grok.com's Next.js build id is a 40-hex token in the page.
+/// Fallback: reconstruct from a bare Next.js build id found in the page
+/// (40-42 hex chars; same value the release wraps).
 fn extract_build_token(html: &str) -> Option<String> {
     for window in html.split('"') {
-        if window.len() == 40 && window.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(window.to_string());
+        let n = window.len();
+        if (40..=42).contains(&n) && window.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(format!("grok-web%40{window}"));
         }
     }
     None
@@ -367,7 +377,11 @@ impl DirectClient {
         Some(release)
     }
 
-    fn build_request_headers_with_release(&self, release: Option<&str>) -> std::collections::HashMap<String, String> {
+    fn build_request_headers_with_release(
+        &self,
+        release: Option<&str>,
+        statsig: Option<&str>,
+    ) -> std::collections::HashMap<String, String> {
         let mut headers = Self::build_request_headers_base();
         if let Some(release) = release {
             headers.insert(
@@ -377,7 +391,13 @@ impl DirectClient {
                 ),
             );
         }
-        headers.insert("x-statsig-id".into(), super::statsig::browser_statsig_id());
+        // Prefer a signed id harvested from the live page; the synthetic
+        // error marker is rejected by current deploys (code 7).
+        let statsig = statsig
+            .map(String::from)
+            .or_else(|| self.store.cached_statsig())
+            .unwrap_or_else(super::statsig::browser_statsig_id);
+        headers.insert("x-statsig-id".into(), statsig);
         headers.insert("x-xai-request-id".into(), new_uuid());
         let trace_id: String = (0..16).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
         let span_id: String = (0..8).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
@@ -385,11 +405,12 @@ impl DirectClient {
         headers
     }
 
-    /// Resolve headers for one request: cached/scraped deploy release when
-    /// available, otherwise sent without Baggage.
+    /// Resolve headers for one request: cached/scraped deploy release and
+    /// cached/harvested statsig when available.
     async fn request_headers(&self) -> std::collections::HashMap<String, String> {
         let release = self.current_release().await;
-        self.build_request_headers_with_release(release.as_deref())
+        let statsig = self.store.cached_statsig();
+        self.build_request_headers_with_release(release.as_deref(), statsig.as_deref())
     }
 
     fn build_request_headers_base() -> std::collections::HashMap<String, String> {
@@ -1124,5 +1145,32 @@ impl GrokResponseExt for GrokStreamResponse {
 
     fn is_soft_stop(&self) -> bool {
         self.is_soft_stop.unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_url_encoded_release() {
+        // Capture-verified shape (captures/WhileCapturingGrok line 892).
+        let html = r#"sentry-trace" ... "sentry-environment=production,sentry-release=grok-web%4040480cda06c2c96e3460c999ebbad66c144d2b47f7,sentry-public_key=b311"#;
+        let rel = extract_sentry_release(html).unwrap();
+        assert_eq!(rel, "grok-web%4040480cda06c2c96e3460c999ebbad66c144d2b47f7");
+    }
+
+    #[test]
+    fn falls_back_to_build_token_with_prefix() {
+        let html = r#"<script src="/_next/static/x.js">"buildId":"40480cda06c2c96e3460c999ebbad66c144d2b47f7""#;
+        let rel = extract_build_token(html).unwrap();
+        assert!(rel.starts_with("grok-web%40"));
+        assert!(rel.ends_with("47f7"));
+    }
+
+    #[test]
+    fn rejects_bare_hex_as_release() {
+        // A bare hash after the marker is NOT a release (missing grok-web@).
+        assert!(extract_sentry_release("sentry-release=40480cda06c2c96e3460c999ebbad66c144d2b47f7,").is_none());
     }
 }

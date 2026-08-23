@@ -2,6 +2,7 @@ use base64::Engine;
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::info;
 
 use crate::auth_state::{find_cookie_value, find_local_storage};
@@ -95,7 +96,94 @@ pub fn extract_from_import(
     None
 }
 
-/// Navigate the session to www.kimi.com and wait for load.
+/// Refresh endpoints, most-recent first (auth.kimi.ai serves kimi.ai
+/// accounts; auth.kimi.com remains for older sessions).
+const KIMI_REFRESH_URLS: &[&str] = &[
+    "https://auth.kimi.ai/api/account.gateway.v1.AuthService/RefreshToken",
+    "https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken",
+];
+
+/// Exchange an imported refresh token for a fresh access token, calling the
+/// same Connect endpoint the web client uses — server-side, without needing
+/// the page. Used when the copied session's access token is expired and the
+/// live page treats the automation profile as logged out (the login panel
+/// wipes localStorage before page JS can rotate the token).
+pub async fn refresh_access_token_via_api(
+    refresh_token: &str,
+    device_id: &str,
+) -> Result<AuthData, GatewayError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| GatewayError::Internal(format!("client build failed: {e}")))?;
+    let mut last_err: Option<GatewayError> = None;
+    for url in KIMI_REFRESH_URLS {
+        let resp = match client
+            .post(*url)
+            .header("content-type", "application/json")
+            .header("x-msh-platform", "web")
+            .header("x-language", "en-US")
+            .json(&serde_json::json!({ "refreshToken": refresh_token }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(GatewayError::Auth(format!("Kimi token refresh failed: {e}")));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::debug!(url, status = resp.status().as_u16(), "Kimi refresh host rejected");
+            last_err = Some(GatewayError::Auth(format!(
+                "Kimi token refresh returned {}",
+                resp.status()
+            )));
+            continue;
+        }
+        let data: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(GatewayError::Auth(format!("Kimi token refresh decode failed: {e}")));
+                continue;
+            }
+        };
+        let access = data
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        if let Some(access) = access {
+            if !access_token_is_usable(access) {
+                return Err(GatewayError::Auth(
+                    "Kimi refresh returned an unusable access token".to_string(),
+                ));
+            }
+            info!(url, "Kimi access token refreshed via imported refresh token");
+            return Ok(AuthData {
+                access_token: access.to_string(),
+                device_id: device_id.to_string(),
+            });
+        }
+        last_err = Some(GatewayError::Auth(
+            "Kimi token refresh missing accessToken".to_string(),
+        ));
+    }
+    Err(last_err.unwrap_or_else(|| GatewayError::Auth("Kimi token refresh failed".to_string())))
+}
+
+/// Try every known Kimi origin for a stored refresh token.
+pub fn find_refresh_token_in_import(local_storage: &[LocalStorageEntry]) -> Option<String> {
+    for origin in KIMI_ORIGINS {
+        if let Some(rt) = find_local_storage(local_storage, origin, "refresh_token") {
+            if !rt.is_empty() {
+                return Some(rt);
+            }
+        }
+    }
+    None
+}
+
+/// Navigate the session to www.kimi.ai and wait for load.
 pub async fn navigate_to_kimi(sessions: &SessionManager, session_id: &str) -> Result<(), GatewayError> {
     info!(session_id = %session_id, url = %KIMI_WEB_URL, "Navigating session to Kimi");
     sessions.navigate(session_id, KIMI_WEB_URL).await?;
@@ -127,7 +215,7 @@ pub async fn extract_refresh_token(
                 }
                 if ((accessExpired || !at) && rt) {
                     const response = await fetch(
-                        'https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken',
+                        'https://auth.kimi.ai/api/account.gateway.v1.AuthService/RefreshToken',
                         {
                             method: 'POST',
                             headers: {

@@ -7,7 +7,8 @@ use reqwest::Client;
 use sha2::Digest;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::info;
+use rand::Rng;
+use tracing::{info, warn};
 
 use crate::error::GatewayError;
 use crate::models::{
@@ -22,8 +23,8 @@ use crate::providers::send_with_retry;
 use crate::session::{SessionHandle, SessionManager};
 
 use super::auth::{
-    build_request_headers, extract_from_import, extract_refresh_token, navigate_to_kimi, AuthData,
-    KIMI_API_URL,
+    build_request_headers, extract_from_import, extract_refresh_token, find_refresh_token_in_import,
+    navigate_to_kimi, refresh_access_token_via_api, AuthData, KIMI_API_URL,
 };
 use super::connectrpc;
 use super::models::{resolve_model, KimiModelDef};
@@ -111,10 +112,37 @@ impl KimiDirectClient {
         // A Firefox profile is a snapshot. Always give the live page a chance
         // to refresh a server-invalidated token before trusting imported data,
         // even when the JWT's local exp claim is still in the future.
+        // Server-side refresh from the imported refresh token BEFORE any
+        // navigation: if the copied access token is expired, loading kimi.ai
+        // in the automation profile shows the login panel (which wipes
+        // localStorage), so the page-JS path cannot recover. The refresh
+        // token itself is long-lived and works without a page.
         let imported = extract_from_import(
             &session.local_storage,
             Some(session.cookie_jar.as_ref()),
         );
+        let has_valid_import = imported.is_some();
+        let refreshed = if has_valid_import {
+            None // valid access token already available
+        } else {
+            match find_refresh_token_in_import(&session.local_storage) {
+                Some(rt) => {
+                    let device_id = format!(
+                        "{:016}",
+                        rand::thread_rng().gen_range(0..10_000_000_000_000_000_u64)
+                    );
+                    match refresh_access_token_via_api(&rt, &device_id).await {
+                        Ok(data) => Some(data),
+                        Err(e) => {
+                            warn!(error = %e, "Kimi server-side token refresh failed; trying page path");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+
         let auth = match navigate_to_kimi(sessions, &session.id).await {
             Ok(()) => match extract_refresh_token(
                 sessions,
@@ -127,9 +155,9 @@ impl KimiDirectClient {
                     info!("Kimi auth extracted after live page refresh");
                     data
                 }
-                Err(error) => imported.ok_or(error)?,
+                Err(page_error) => refreshed.or(imported).ok_or(page_error)?,
             },
-            Err(error) => imported.ok_or(error)?,
+            Err(error) => refreshed.or(imported).ok_or(error)?,
         };
 
         let headers = build_request_headers(&auth.access_token, &auth.device_id)?;

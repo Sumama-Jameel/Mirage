@@ -596,10 +596,24 @@ impl GlmDirectClient {
                 // never triggers captcha.
                 let body_json = serde_json::to_string(&body)
                     .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("JSON serialization failed: {e}"))))?;
-                // zai2api does NOT send cookies, but Z.AI's server requires at
-                // least the token cookie for auth. Send ONLY the auth token
-                // cookie - no stale Firefox cookies that conflict with Chrome TLS.
-                let token_cookie = format!("token={}", self.auth.token);
+                // Send the FULL chat.z.ai cookie set from the refreshed jar
+                // (token plus Z.AI's anti-bot cookies such as ssxmod_itna).
+                // A bare token= cookie authenticates but trips Aliyun NVC
+                // captcha; a live browser always carries the anti-bot pair.
+                // Fall back to token-only when the jar has nothing for z.ai.
+                let cookie_header = {
+                    let zai_url =
+                        url::Url::parse(&format!("{}/c/{}", CHAT_Z_AI_URL, chat_id)).ok();
+                    let full = zai_url
+                        .as_ref()
+                        .map(|u| self.stealth.cookie_jar.get_cookie_header(u))
+                        .unwrap_or_default();
+                    if full.contains("token=") {
+                        full
+                    } else {
+                        format!("token={}", self.auth.token)
+                    }
+                };
 
                 let mut headers = std::collections::HashMap::new();
                 headers.insert("Content-Type".to_string(), "application/json".to_string());
@@ -611,7 +625,7 @@ impl GlmDirectClient {
                 headers.insert("Connection".to_string(), "keep-alive".to_string());
                 headers.insert("X-Forwarded-For".to_string(), generate_random_ip());
                 headers.insert("X-Real-IP".to_string(), generate_random_ip());
-                headers.insert("Cookie".to_string(), token_cookie);
+                headers.insert("Cookie".to_string(), cookie_header);
 
                 let url_parsed = url::Url::parse(&url)
                     .map_err(|e| DirectError::Fatal(GatewayError::Internal(format!("invalid GLM URL: {e}"))))?;

@@ -112,6 +112,17 @@ impl Provider for GrokProvider {
         let sessions = sessions.clone();
         Box::pin(async move {
             let session = sessions.acquire().await?;
+            // Harvest a fresh signed x-statsig-id from the live page when the
+            // cached one is missing/expired. Failure is non-fatal: the
+            // request falls back to the synthetic marker.
+            if this.store.cached_statsig().is_none() {
+                match statsig::harvest_from_page(&sessions, &session.id).await {
+                    Some(id) => this.store.store_statsig(id),
+                    None => {
+                        tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
+                    }
+                }
+            }
             let client = match DirectClient::new(session.clone(), &request.model, this.store.clone())
                 .await
             {
@@ -146,6 +157,14 @@ impl Provider for GrokProvider {
         let sessions = sessions.clone();
         Box::pin(async move {
             let session = sessions.acquire().await?;
+            if this.store.cached_statsig().is_none() {
+                match statsig::harvest_from_page(&sessions, &session.id).await {
+                    Some(id) => this.store.store_statsig(id),
+                    None => {
+                        tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
+                    }
+                }
+            }
             let client = match DirectClient::new(session.clone(), &request.model, this.store.clone())
                 .await
             {
