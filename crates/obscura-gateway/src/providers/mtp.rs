@@ -168,6 +168,8 @@ pub fn build_mtp_system_prompt(
          - Do not output multiple tool blocks unless explicitly allowed.\n\
          - The JSON must be valid.\n\
          - Use only the tools listed below.\n\
+         - Never use patch, diff, apply_patch, or \"*** End Patch\" formats. Only the exact block format above.\n\
+         - The block markers must appear exactly as written, including their square brackets.\n\
          - If no tool is needed, respond normally.\n\n",
     );
 

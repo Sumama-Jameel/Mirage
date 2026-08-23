@@ -61,17 +61,18 @@ fn current_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-/// ConnectRPC transport for NEW chats (kimi.ai web protocol). The JWT minted
-/// on kimi.ai carries `aud=["kimi.ai"]`, which is the audience this endpoint
-/// requires; legacy moonshot tokens will not work here.
+/// ConnectRPC transport for NEW chats (kimi.ai web protocol).
 ///
-/// Continuation turns stay on the legacy path until the ConnectRPC
-/// continuation wire format is captured. Any ConnectRPC failure falls back to
-/// the working legacy path, so defaulting this on is safe.
+/// DEFAULT OFF: live testing showed the HTTP response stays silent (zero
+/// frames) even on a 200 handshake — the capture's own open question
+/// ("does reply text stream over the notilo WS or the HTTP response?")
+/// suggests replies may arrive over the notilo WebSocket instead. Legacy
+/// moonshot streaming with a refreshed kimi.ai token works and is the
+/// default. Opt in with OBSCURA_KIMI_CONNECT_RPC=1 to experiment.
 fn connect_rpc_enabled() -> bool {
     std::env::var("OBSCURA_KIMI_CONNECT_RPC")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Decode a JWT payload's `sub` claim (used as `x-traffic-id`).
@@ -367,6 +368,12 @@ impl KimiDirectClient {
             &self.auth.device_id,
             &traffic_id,
         );
+        tracing::debug!(
+            traffic_id = %traffic_id,
+            device_id = %self.auth.device_id,
+            token_prefix = %&self.auth.access_token[..40.min(self.auth.access_token.len())],
+            "Kimi ConnectRPC request"
+        );
         let frame = connectrpc::encode_frame(body.to_string().as_bytes());
         let mut req = self.http.post(connectrpc::CONNECT_CHAT_URL);
         for (k, v) in &headers {
@@ -408,6 +415,7 @@ impl KimiDirectClient {
 
         let resp = self.send_connect_chat(&body).await?;
         let status = resp.status();
+        tracing::info!(status = status.as_u16(), "Kimi ConnectRPC handshake complete");
         if !status.is_success() {
             return Err(GatewayError::Provider(format!(
                 "Kimi ConnectRPC returned {status}"
@@ -442,7 +450,11 @@ impl KimiDirectClient {
                     }
                 };
                 decoder.push(&bytes);
-                for event in decoder.drain() {
+                let frames = decoder.drain();
+                if !frames.is_empty() {
+                    tracing::info!(count = frames.len(), "Kimi ConnectRPC frames decoded");
+                }
+                for event in frames {
                     match connectrpc::classify_event(&event) {
                         connectrpc::KimiEvent::ThinkDelta(t) => {
                             if t.is_empty() {

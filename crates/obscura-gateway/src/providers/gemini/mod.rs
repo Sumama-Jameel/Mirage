@@ -229,42 +229,13 @@ impl Provider for GeminiProvider {
         // Generation parameters are not supported in Gemini's internal web API
         // (StreamGenerate endpoint). They are only available through the official
         // Google AI API at generativelanguage.googleapis.com (requires API key).
-        if request.temperature.is_some() {
-            return Err(GatewayError::BadRequest(format!(
-                "Gemini model '{}' does not support temperature (use the official Google AI API with an API key for generation parameter control)",
-                request.model
-            )));
-        }
-        if request.max_tokens.is_some() {
-            return Err(GatewayError::BadRequest(format!(
-                "Gemini model '{}' does not support max_tokens",
-                request.model
-            )));
-        }
-        if request.top_p.is_some() {
-            return Err(GatewayError::BadRequest(format!(
-                "Gemini model '{}' does not support top_p",
-                request.model
-            )));
-        }
-        if request.stop.is_some() {
-            return Err(GatewayError::BadRequest(format!(
-                "Gemini model '{}' does not support stop sequences",
-                request.model
-            )));
-        }
-        if request.presence_penalty.is_some() {
-            return Err(GatewayError::BadRequest(format!(
-                "Gemini model '{}' does not support presence_penalty",
-                request.model
-            )));
-        }
-        if request.frequency_penalty.is_some() {
-            return Err(GatewayError::BadRequest(format!(
-                "Gemini model '{}' does not support frequency_penalty",
-                request.model
-            )));
-        }
+        //
+        // They are silently IGNORED rather than rejected: agent harnesses
+        // (opencode et al.) always send temperature/max_tokens/top_p defaults,
+        // and failing the whole request over ignored sampling hints makes the
+        // provider unusable with them. Nothing upstream consumes these values.
+        let _ = (&request.temperature, &request.max_tokens, &request.top_p, &request.stop);
+        let _ = (&request.presence_penalty, &request.frequency_penalty);
 
         Ok(())
     }
