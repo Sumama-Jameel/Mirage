@@ -50,6 +50,105 @@ impl UploadCache {
 
 /// Validate that a remote URL does not point to a private network.
 
+/// How long to wait for Kimi's async file parsing after `parse_process`.
+/// `OBSCURA_KIMI_PARSE_WAIT_SECS=0` skips the wait entirely (legacy
+/// fire-and-forget behavior).
+fn parse_wait_budget() -> Duration {
+    let secs = std::env::var("OBSCURA_KIMI_PARSE_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15);
+    Duration::from_secs(secs)
+}
+
+const PARSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Outcome of waiting on Kimi's async file parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseWait {
+    Completed,
+    Failed,
+    TimedOut,
+    Skipped,
+}
+
+/// Map an upstream parse-status string to a wait outcome.
+///
+/// Success: `finish`/`finished`/`completed`/`parsed`/`done`.
+/// Failure: `failed`/`error`. Anything else keeps polling.
+fn classify_parse_status(status: &str) -> Option<ParseWait> {
+    match status {
+        "finish" | "finished" | "completed" | "parsed" | "done" => Some(ParseWait::Completed),
+        "failed" | "error" => Some(ParseWait::Failed),
+        _ => None,
+    }
+}
+
+/// Poll `GET /api/file/parse_status?ids=[<id>]` until the file finishes
+/// parsing, fails, or the budget expires.
+///
+/// Wire note: no local capture of this endpoint exists (see
+/// docs/wire/kimi-connectrpc.md evidence list). Recognized response shapes:
+/// - `{"data": [{"id": ..., "status": "..." }]}`
+/// - `[{"id": ..., "status": "..."}]`
+/// A timeout or unparseable response degrades to proceeding without parsed
+/// content (the pre-polling behavior) rather than failing an upload that is
+/// otherwise valid.
+async fn wait_for_parse_ready(http: &Client, file_id: &str) -> ParseWait {
+    let budget = parse_wait_budget();
+    if budget.is_zero() {
+        return ParseWait::Skipped;
+    }
+
+    let url = format!(
+        "https://kimi.moonshot.cn/api/file/parse_status?ids=[%22{file_id}%22]"
+    );
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut interval = tokio::time::interval(PARSE_POLL_INTERVAL);
+
+    loop {
+        interval.tick().await;
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                file_id = %file_id,
+                budget_secs = budget.as_secs(),
+                "Kimi file parse did not finish within budget; continuing unparsed"
+            );
+            return ParseWait::TimedOut;
+        }
+
+        let status: Option<String> = match http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                // Locate the entry for this file in either response shape.
+                let entries = v
+                    .get("data")
+                    .cloned()
+                    .unwrap_or_else(|| v.clone());
+                let arr = match entries.as_array() {
+                    Some(a) => a.clone(),
+                    None => vec![entries],
+                };
+                arr.iter()
+                    .find(|e| e.get("id").and_then(|i| i.as_str()) == Some(file_id))
+                    .or_else(|| arr.first())
+                    .and_then(|e| e.get("status"))
+                    .and_then(|s| s.as_str())
+                    .map(String::from)
+            }),
+            _ => None,
+        };
+
+        match status.as_deref().and_then(classify_parse_status) {
+            Some(ParseWait::Completed) => return ParseWait::Completed,
+            Some(ParseWait::Failed) => {
+                tracing::warn!(file_id = %file_id, status = ?status, "Kimi file parse failed upstream");
+                return ParseWait::Failed;
+            }
+            _ => continue,
+        }
+    }
+}
+
 /// Upload files to Kimi via the 4-step protocol:
 /// 1. POST /api/pre-sign-url (get upload URL)
 /// 2. PUT upload URL (push bytes)
@@ -229,6 +328,16 @@ pub async fn upload_files(
                         }
                     }
 
+                    // Step 5: Wait (bounded) until the server finished parsing
+                    // so the chat request references parsed content, not a
+                    // pending file. Timeout degrades to proceeding unparsed.
+                    if let ParseWait::Failed = wait_for_parse_ready(&http, &file_ref).await {
+                        return (
+                            idx,
+                            Err(format!("kimi file parse failed for {file_id}")),
+                        );
+                    }
+
                     cache.insert(hash.clone(), file_ref.clone()).await;
                     (idx, Ok(file_ref))
                 }
@@ -348,5 +457,24 @@ mod tests {
         let (bytes, mime) = result.unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "Hello, World");
         assert_eq!(mime, "text/plain");
+    }
+
+    #[test]
+    fn classify_parse_status_terminal_states() {
+        for s in ["finish", "finished", "completed", "parsed", "done"] {
+            assert_eq!(classify_parse_status(s), Some(ParseWait::Completed), "{s}");
+        }
+        for s in ["failed", "error"] {
+            assert_eq!(classify_parse_status(s), Some(ParseWait::Failed), "{s}");
+        }
+    }
+
+    #[test]
+    fn classify_parse_status_unknown_keeps_polling() {
+        // In-progress / unknown / localized statuses must keep the loop
+        // polling rather than terminating it.
+        for s in ["parsing", "pending", "", "processing", "处理中"] {
+            assert_eq!(classify_parse_status(s), None, "{s}");
+        }
     }
 }
