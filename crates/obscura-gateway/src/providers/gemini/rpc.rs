@@ -581,7 +581,15 @@ pub fn parse_full_response(body: &str) -> Result<ResponseData, GatewayError> {
     }
 
     if frames_found == 0 {
-        let preview: String = body.chars().take(200).collect();
+        // Upstream Bard error frames (e.g. `BardErrorInfo [1076]`) carry no
+        // text payload; surface them as a classified provider error rather
+        // than a parse failure so the circuit breaker sees the right class.
+        let preview: String = body.chars().take(300).collect();
+        if preview.contains("BardErrorInfo") || preview.contains("assistant.boq.bard") {
+            return Err(GatewayError::Provider(format!(
+                "Gemini upstream returned an error frame (BardErrorInfo). Body preview: {preview}"
+            )));
+        }
         return Err(GatewayError::Provider(format!(
             "Gemini response contained no parseable frames. Body preview: {preview}"
         )));
@@ -931,5 +939,30 @@ mod tests {
         let (delta, _, _, _, _) = result.unwrap();
         // Citation markers are stripped from the text
         assert_eq!(delta, "Result  here");
+    }
+
+    #[test]
+    fn streaming_cumulative_snapshots_emit_only_suffix() {
+        // Regression: Gemini re-emits cumulative text; the caller advances
+        // previous_text to full_text after each chunk, so the second
+        // identical snapshot must produce no delta and the grown snapshot
+        // only its suffix.
+        let line = wrb_line(r#"[[null,null,"1, 2, 3, 4, 5",null,null,[]]]"#);
+
+        let (d0, _, _, _, full0) = parse_streaming_chunk(&line, "").unwrap().unwrap();
+        assert_eq!(d0, "1, 2, 3, 4, 5");
+        assert_eq!(full0, "1, 2, 3, 4, 5");
+
+        let again = parse_streaming_chunk(&line, &full0).unwrap();
+        assert!(again.is_none(), "identical snapshot must dedupe to None");
+
+        let grown = format!("{} more", "1, 2, 3, 4, 5");
+        let line_grown = wrb_line(&format!(
+            r#"[[null,null,"{}" ,null,null,[]]]"#,
+            grown
+        ));
+        let (delta, _, _, _, _) =
+            parse_streaming_chunk(&line_grown, &full0).unwrap().unwrap();
+        assert_eq!(delta, " more", "only the suffix is a delta");
     }
 }

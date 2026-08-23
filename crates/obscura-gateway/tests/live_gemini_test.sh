@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SERVER_BIN="$REPO_ROOT/target/debug/obscura-gateway"
 API_KEY="obscura-local"
-BASE="http://127.0.0.1:3000"
+BASE="http://127.0.0.1:${OBSCURA_PORT:-3000}"
 AUTH="Authorization: Bearer $API_KEY"
 
 cleanup() {

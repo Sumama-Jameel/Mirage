@@ -632,7 +632,9 @@ impl GeminiDirectClient {
             let mut stream = resp.bytes_stream();
             let mut buffer = Vec::new();
             let mut emitted_role = false;
-            let previous_text = String::new();
+            // Gemini re-emits cumulative snapshots; deltas are computed
+            // against this and it advances with every accepted chunk.
+            let mut previous_text = String::new();
             let mut last_conversation: Option<ConversationState> = None;
             let mut collected_tool_calls: Vec<ToolCall> = Vec::new();
             let mut session_url: Option<String> = None;
@@ -689,7 +691,9 @@ impl GeminiDirectClient {
                                     None
                                 };
 
-                                let _ = full_text;
+                                // Advance the dedupe cursor to the full
+                                // cumulative snapshot.
+                                previous_text = full_text;
 
                                 if !build_streaming_chunk(
                                     &tx, &counter, &id_prefix, &model_id,
@@ -731,6 +735,8 @@ impl GeminiDirectClient {
                 }
                 match parse_streaming_chunk(&line, &previous_text) {
                     Ok(Some((delta, thinking, tool_calls, citations, full_text))) => {
+                        // Final partial line at stream end: no further dedupe
+                        // cursor to advance.
                         let _ = full_text;
                         build_streaming_chunk(
                             &tx, &counter, &id_prefix, &model_id,
