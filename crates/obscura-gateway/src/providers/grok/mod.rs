@@ -19,6 +19,7 @@ mod auth;
 mod direct;
 mod state;
 mod statsig;
+pub mod statsig_harvest;
 mod upload;
 
 #[derive(Clone)]
@@ -105,19 +106,20 @@ impl Provider for GrokProvider {
     fn chat(
         &self,
         sessions: &SessionManager,
-        _state: &AppState,
+        state: &AppState,
         request: ChatCompletionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ChatCompletionResponse, GatewayError>> + Send>> {
         let this = self.clone();
         let sessions = sessions.clone();
+        let config = state.config.clone();
         Box::pin(async move {
             let session = sessions.acquire().await?;
             // Harvest a fresh signed x-statsig-id from the live page when the
             // cached one is missing/expired. Failure is non-fatal: the
             // request falls back to the synthetic marker.
             if this.store.cached_statsig().is_none() {
-                match statsig::harvest_from_page(&sessions, &session.id).await {
-                    Some(id) => this.store.store_statsig(id),
+                match statsig_harvest::harvest_via_browser_sync(&config, &this.store) {
+                    Some(h) => this.store.store_statsig(h.statsig_id),
                     None => {
                         tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
                     }
@@ -141,7 +143,7 @@ impl Provider for GrokProvider {
     fn chat_stream(
         &self,
         sessions: &SessionManager,
-        _state: &AppState,
+        state: &AppState,
         request: ChatCompletionRequest,
     ) -> Pin<
         Box<
@@ -155,11 +157,12 @@ impl Provider for GrokProvider {
     > {
         let this = self.clone();
         let sessions = sessions.clone();
+        let config = state.config.clone();
         Box::pin(async move {
             let session = sessions.acquire().await?;
             if this.store.cached_statsig().is_none() {
-                match statsig::harvest_from_page(&sessions, &session.id).await {
-                    Some(id) => this.store.store_statsig(id),
+                match statsig_harvest::harvest_via_browser_sync(&config, &this.store) {
+                    Some(h) => this.store.store_statsig(h.statsig_id),
                     None => {
                         tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
                     }
