@@ -27,26 +27,7 @@ Gateway fixes made during this run are listed at the bottom.
    refresh, ChatGPT split-cookie probe, Gemini cumulative-stream dedupe,
    BardErrorInfo classification, Grok dynamic release + statsig harvest.
 
-## Guidance
 
-- **Recommended agent models**: `deepseek-chat`, `qwen-max`, `muse-spark`
-  (in that order of reliability).
-- **Chat-only models**: every provider works for plain conversation,
-  including gemini tiers and gpt-5.6.
-- **Known harness quirk**: opencode resolves its worktree to its data dir
-  when the cwd is not a git repo — `git init` test folders before running.
-- **Kimi**: use with explicit `tool_choice` or small toolsets until a
-  stronger K3-tier model handles large MTP tool menus.
-
-## Re-running
-
-```bash
-cd ~/obscura-agent-test
-# gateway must be up:
-#   OBSCURA_GATEWAY__AUTH__API_KEY=obscura-local obscura-gateway --data-dir <dir>
-export OPENCODE_CONFIG=$PWD/opencode.json   # bypass opencode's daemon config cache
-opencode run --model obscura/<model> "Create a file named <model>.txt containing exactly: Hello from <model>"
-```
 
 Note: opencode keeps a background server that caches provider config;
 `OPENCODE_CONFIG` forces a fresh read per invocation.

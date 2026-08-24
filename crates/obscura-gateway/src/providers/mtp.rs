@@ -477,6 +477,57 @@ fn generate_tool_call_id(name: &str, arguments: &str) -> String {
     format!("call_{:016x}", h)
 }
 
+/// Inputs for composing a single flat prompt for providers that transmit
+/// the whole conversation as one text blob.
+pub struct FlatPrompt<'a> {
+    /// Dialect/system prompt (MTP policy + tool menu). `None` on
+    /// continuations where the transcript already carries it.
+    pub system: Option<&'a str>,
+    /// Folded older turns, excluding the newest user instruction.
+    pub transcript: &'a str,
+    /// Latest tool results, already MTP-formatted. Empty string if none.
+    pub tool_results: &'a str,
+    /// The newest user instruction — always rendered last.
+    pub current_request: &'a str,
+}
+
+/// Compose a flat prompt with stable, salient ordering:
+///
+/// ```text
+/// [system] → transcript → tool_results → === USER REQUEST === ... === END ===
+/// ```
+///
+/// The newest instruction is always the final non-empty segment so weak
+/// models cannot bury it under transcript volume.
+pub fn compose_flat_prompt(p: FlatPrompt) -> String {
+    let mut out = String::new();
+    if let Some(system) = p.system {
+        if !system.is_empty() {
+            out.push_str(system);
+            out.push_str("\n\n");
+        }
+    }
+    if !p.transcript.is_empty() {
+        out.push_str(p.transcript);
+        out.push_str("\n\n");
+    }
+    if !p.tool_results.is_empty() {
+        out.push_str(p.tool_results);
+        out.push_str("\n\n");
+    }
+    out.push_str("=== USER REQUEST (execute this task now) ===\n");
+    out.push_str(p.current_request);
+    out.push_str("\n=== END USER REQUEST ===");
+    out
+}
+
+/// True when the folded transcript already carries Mirage protocol markers,
+/// meaning the dialect prompt was injected on an earlier turn and must not
+/// be repeated.
+pub fn has_mirage_history(transcript: &str) -> bool {
+    transcript.contains(TOOL_RESULT_START) || transcript.contains(TOOL_CALL_START)
+}
+
 /// Format one or more tool results into an MTP result block for upstream.
 pub fn format_tool_results(items: &[(Option<&ToolCall>, Option<&str>, &str)]) -> String {
     if items.is_empty() {
@@ -923,6 +974,44 @@ mod tests {
         let prompt = build_repair_prompt(&err, "[MIRAGE_TOOL_CALL_V1]...[/MIRAGE_TOOL_CALL_V1]");
         assert!(prompt.contains("unknown tool: nope"));
         assert!(prompt.contains("valid Mirage tool block"));
+    }
+
+    #[test]
+    fn compose_flat_prompt_ordering() {
+        let out = compose_flat_prompt(FlatPrompt {
+            system: Some("SYSTEM-POLICY"),
+            transcript: "Human: list files\nAssistant: here they are",
+            tool_results: "TOOL-RESULT-BLOCK",
+            current_request: "now write a file",
+        });
+        let sys = out.find("SYSTEM-POLICY").unwrap();
+        let transcript = out.find("Human: list files").unwrap();
+        let results = out.find("TOOL-RESULT-BLOCK").unwrap();
+        let request = out.find("now write a file").unwrap();
+        assert!(sys < transcript && transcript < results && results < request);
+        assert!(out.starts_with("SYSTEM-POLICY"));
+        assert!(out.ends_with("=== END USER REQUEST ==="));
+    }
+
+    #[test]
+    fn compose_flat_prompt_skips_empty_segments() {
+        let out = compose_flat_prompt(FlatPrompt {
+            system: None,
+            transcript: "",
+            tool_results: "",
+            current_request: "just answer",
+        });
+        assert_eq!(
+            out,
+            "=== USER REQUEST (execute this task now) ===\njust answer\n=== END USER REQUEST ==="
+        );
+    }
+
+    #[test]
+    fn has_mirage_history_detects_markers() {
+        assert!(has_mirage_history(&format!("x {TOOL_RESULT_START} y")));
+        assert!(has_mirage_history(&format!("x {TOOL_CALL_START} y")));
+        assert!(!has_mirage_history("plain transcript"));
     }
 
     #[test]
