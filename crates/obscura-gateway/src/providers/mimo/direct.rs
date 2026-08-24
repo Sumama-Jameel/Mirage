@@ -60,6 +60,8 @@ fn build_cookie_header(session: &SessionHandle) -> Result<String, GatewayError> 
             c.domain.contains("xiaomimimo.com")
                 || c.domain.contains("xiaomichatbot")
                 || c.domain.contains("mimo")
+                // Xiaomi SSO: the userId cookie lives on the account domain.
+                || c.domain.contains("account.xiaomi.com")
         })
         .collect();
     upload::validate_mimo_cookies(&filtered)?;
@@ -101,6 +103,8 @@ impl DirectClient {
                 c.domain.contains("xiaomimimo.com")
                     || c.domain.contains("xiaomichatbot")
                     || c.domain.contains("mimo")
+                    // Xiaomi SSO: userId lives on the account domain.
+                    || c.domain.contains("account.xiaomi.com")
             })
             .collect();
         let ph = upload::extract_ph(&filtered)

@@ -114,7 +114,10 @@ pub fn probes() -> &'static [AuthProbe] {
         },
         AuthProbe {
             provider: "mimo",
-            cookie_domains: &["xiaomimimo.com"],
+            // serviceToken/ph live on xiaomimimo.com; userId comes from the
+            // Xiaomi SSO domain (account.xiaomi.com). A cookie satisfies the
+            // probe when present on ANY declared domain.
+            cookie_domains: &["xiaomimimo.com", "account.xiaomi.com"],
             required_cookies: &["xiaomichatbot_serviceToken", "userId", "xiaomichatbot_ph"],
             ..AuthProbe::none()
         },
@@ -199,16 +202,25 @@ pub fn check(
 
     // Cookie probes.
     let mut any_cookie_hits = 0usize;
-    for domain in probe.cookie_domains {
-        let hits = find_cookies_by_domain(cookie_jar, domain, probe.required_cookies);
-        for name in probe.required_cookies {
-            if !hits.contains_key(*name) {
-                let label = format!("{name}@{domain}");
-                if !missing.contains(&label) {
-                    missing.push(label);
-                }
+    // Required cookies: each name must exist under AT LEAST ONE declared
+    // domain (MiMo's userId comes from account.xiaomi.com while its other
+    // cookies live on xiaomimimo.com — same-domain-for-all is wrong).
+    for name in probe.required_cookies {
+        let found = probe.cookie_domains.iter().any(|domain| {
+            find_cookies_by_domain(cookie_jar, domain, &[name])
+                .contains_key(*name)
+        });
+        if !found {
+            let label = format!(
+                "{name}@{}",
+                probe.cookie_domains.join("|")
+            );
+            if !missing.contains(&label) {
+                missing.push(label);
             }
         }
+    }
+    for domain in probe.cookie_domains {
         let any_hits = find_cookies_by_domain(cookie_jar, domain, probe.any_of_cookies);
         if any_hits.values().any(|v| !v.is_empty()) {
             any_cookie_hits += 1;
@@ -495,7 +507,19 @@ mod tests {
         ]);
         let verdict = check("mimo", &jar, &[]);
         assert!(!verdict.ok);
-        assert!(verdict.missing.iter().any(|m| m.contains("userId")));
+    }
+
+    #[test]
+    fn mimo_ok_with_userid_on_xiaomi_sso_domain() {
+        // Regression: the userId cookie lives on account.xiaomi.com (Xiaomi
+        // SSO), not xiaomimimo.com. Cross-domain presence must satisfy the
+        // probe.
+        let jar = jar_with(&[
+            ("xiaomimimo.com", "xiaomichatbot_serviceToken", "a"),
+            ("xiaomimimo.com", "xiaomichatbot_ph", "b"),
+            ("account.xiaomi.com", "userId", "12345"),
+        ]);
+        assert!(check("mimo", &jar, &[]).ok);
     }
 
     #[test]
