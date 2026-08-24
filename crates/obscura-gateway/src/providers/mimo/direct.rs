@@ -411,7 +411,9 @@ impl DirectClient {
         }
     }
 
-    /// Non-streaming chat. Buffers the SSE stream internally.
+    /// Non-streaming chat. Delegates to the migrated streaming path and
+    /// aggregates its chunks (single code path: MTP cleaning, tool-block
+    /// absorption, and tool_calls emission all live in `chat_stream`).
     pub async fn chat(
         &self,
         request: ChatCompletionRequest,
@@ -419,33 +421,24 @@ impl DirectClient {
     ) -> Result<ChatCompletionResponse, GatewayError> {
         let response_id = format!("chatcmpl-{}", upload::rand_hex(16));
         let model = request.model.clone();
+        let prompt_text: String = request
+            .messages
+            .iter()
+            .map(|m| m.content.as_text())
+            .collect();
 
-        let attachments = self.process_attachments(&request).await?;
-        let mut state = self.resolve_conversation(gateway_session_id, &request.session_url).await;
-        let is_continuation = request.session_url.is_some();
-        let query = self.build_query(&request, is_continuation);
-
-        // Apply per-request toggles onto the persisted state.
-        state.enable_thinking = request.thinking.unwrap_or(state.enable_thinking);
-        state.web_search_status = if request.search.unwrap_or(false) {
-            "enabled".to_string()
-        } else {
-            "disabled".to_string()
-        };
-        state.model = self.model_id.clone();
-        self.store.update(gateway_session_id, state.clone()).await;
-
-        let mut stream = self
-            .send_message_sse(&state, &request, &query, &attachments)
-            .await?;
+        let mut stream = self.chat_stream(request, gateway_session_id).await?;
         let mut full_content = String::new();
         let mut full_thinking = String::new();
         let mut tool_calls: Vec<crate::models::ToolCall> = Vec::new();
         let mut finish_reason = "stop".to_string();
-        let usage: Option<Usage> = None;
+        let mut session_url: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
+            if session_url.is_none() && chunk.session_url.is_some() {
+                session_url = chunk.session_url.clone();
+            }
             for choice in chunk.choices {
                 if let Some(ref fr) = choice.finish_reason {
                     finish_reason = fr.clone();
@@ -466,20 +459,7 @@ impl DirectClient {
             }
         }
 
-        let has_tool_calls = !tool_calls.is_empty();
-        if has_tool_calls {
-            finish_reason = "tool_calls".to_string();
-        } else if finish_reason == "tool_calls" {
-            finish_reason = "stop".to_string();
-        }
-
-        let prompt_text: String = request
-            .messages
-            .iter()
-            .map(|m| m.content.as_text())
-            .collect();
-        let usage = usage.unwrap_or_else(|| estimate_cost(&prompt_text, &full_content));
-
+        let usage = estimate_cost(&prompt_text, &full_content);
         Ok(ChatCompletionResponse {
             id: response_id,
             object: "chat.completion".to_string(),
@@ -497,13 +477,13 @@ impl DirectClient {
                         Some(full_thinking)
                     },
                     citations: None,
-                    tool_calls: if has_tool_calls { Some(tool_calls) } else { None },
+                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
                     tool_call_id: None,
                 },
                 finish_reason,
             }],
             usage,
-            session_url: Some(format!("{}/chat/{}", API_HOST, state.conversation_id)),
+            session_url: session_url.or_else(|| Some(format!("{}/chat", API_HOST))),
         })
     }
 
