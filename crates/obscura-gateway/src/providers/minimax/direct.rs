@@ -1104,7 +1104,6 @@ impl DirectClient {
         self.poll_session_idle(&session_state.session_id).await?;
 
         // Build content with structured conversation context (matching Python reference)
-        let mut content = String::new();
         let mut ctx_parts: Vec<String> = Vec::new();
         for m in request.messages.iter().take(request.messages.len().saturating_sub(1)) {
             let text = m.content.as_text();
@@ -1120,36 +1119,39 @@ impl DirectClient {
             };
             ctx_parts.push(format!("{}: {}", label, text));
         }
-        if let Some(last) = request.messages.last() {
-            let last_text = last.content.as_text();
-            if ctx_parts.is_empty() {
-                content = last_text;
-            } else {
-                content = format!("{}\n\n用户说: {}", ctx_parts.join("\n\n"), last_text);
-            }
-        }
+        let transcript = ctx_parts.join("\n\n");
+        let current_request = request
+            .messages
+            .last()
+            .map(|m| m.content.as_text())
+            .unwrap_or_default();
 
         let tool_context = self.handle_tool_results(gateway_session_id, &request.messages).await;
-        if !tool_context.is_empty() {
-            content = format!("{}\n\n{}", tool_context, content);
-        }
 
-        // Compile client tools into the MTP system prompt. Native
-        // `tools` are never forwarded upstream (the endpoint ignores them;
-        // the model emits [MIRAGE_TOOL_CALL_V1] blocks instead).
-        if let Some(tools) = &request.tools {
-            if !tools.is_empty() {
-                content = format!(
-                    "{}\n\nUser request:\n{}",
-                    crate::providers::mtp::build_mtp_system_prompt(
-                        tools,
-                        request.tool_choice.as_ref(),
-                        false
-                    ),
-                    content
-                );
-            }
-        }
+        // Compose with stable ordering (MTP policy once → transcript → tool
+        // results → newest instruction last). Continuations skip re-injecting
+        // the policy because the transcript already carries Mirage markers.
+        let continuation = crate::providers::mtp::has_mirage_history(&transcript)
+            || !tool_context.is_empty();
+        let system_prompt = if continuation {
+            None
+        } else {
+            request.tools.as_ref().filter(|t| !t.is_empty()).map(|tools| {
+                crate::providers::mtp::build_mtp_system_prompt(
+                    tools,
+                    request.tool_choice.as_ref(),
+                    false
+                )
+            })
+        };
+        let content = crate::providers::mtp::compose_flat_prompt(
+            crate::providers::mtp::FlatPrompt {
+                system: system_prompt.as_deref(),
+                transcript: &transcript,
+                tool_results: &tool_context,
+                current_request: &current_request,
+            },
+        );
 
         // Build structured attachments array matching web app format
         let attach_values: Vec<serde_json::Value> = attachments

@@ -302,6 +302,16 @@ impl DirectClient {
         };
         let messages = &request.messages[start..];
 
+        // The newest user instruction is rendered last, outside the
+        // transcript, so it cannot be buried (see compose_flat_prompt).
+        let current_request_idx = messages
+            .iter()
+            .rposition(|m| m.role == "user");
+        let current_request = current_request_idx
+            .and_then(|i| messages.get(i))
+            .map(|m| m.content.as_text())
+            .unwrap_or_default();
+
         // Collect assistant tool calls by id so tool-result messages can be
         // matched back to the call they answer (no native tool channel).
         let mut calls_by_id: std::collections::HashMap<&str, &crate::models::ToolCall> =
@@ -315,7 +325,10 @@ impl DirectClient {
         }
 
         let mut parts: Vec<String> = Vec::new();
-        for m in messages {
+        for (idx, m) in messages.iter().enumerate() {
+            if Some(idx) == current_request_idx {
+                continue; // rendered last via compose_flat_prompt
+            }
             let text = m.content.as_text();
             if m.role == "tool" {
                 let call = m
@@ -363,14 +376,25 @@ impl DirectClient {
         }
         let joined = parts.join("\n");
         // MiMo has no native function-calling channel (verified live). When
-        // tools are requested, compile them into the MTP system prompt and
-        // parse [MIRAGE_TOOL_CALL_V1] blocks out of the reply.
+        // tools are requested, compile them into the MTP system prompt (once
+        // — continuations already carry Mirage markers in the transcript);
+        // the newest user instruction is appended last via the composer.
         if let Some(tools) = &request.tools {
-            format!(
-                "{}\n\nUser request:\n{}",
-                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false),
-                joined
-            )
+            let system = if crate::providers::mtp::has_mirage_history(&joined) {
+                None
+            } else {
+                Some(mtp::build_mtp_system_prompt(
+                    tools,
+                    request.tool_choice.as_ref(),
+                    false
+                ))
+            };
+            crate::providers::mtp::compose_flat_prompt(crate::providers::mtp::FlatPrompt {
+                system: system.as_deref(),
+                transcript: &joined,
+                tool_results: "",
+                current_request: &current_request,
+            })
         } else {
             joined
         }

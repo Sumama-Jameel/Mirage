@@ -399,31 +399,60 @@ impl DirectClient {
         let fid = new_uuid();
         let child_id = new_uuid();
         let model = upstream_model(&self.model_id);
-        let raw_content = request.messages.iter()
+        // Fold all messages EXCEPT the newest user instruction into a
+        // transcript; the instruction is rendered last so it cannot be
+        // buried under transcript volume (the failure mode that made qwen
+        // echo text instead of emitting tool blocks).
+        let last_user_idx = request
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user");
+        let current_request = last_user_idx
+            .and_then(|i| request.messages.get(i))
             .map(|m| m.content.as_text())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let tool_context = self.handle_tool_results(gateway_session_id, &request.messages).await;
-        let mut content = if let Some(tools) = &request.tools {
-            if !tools.is_empty() {
-                format!(
-                    "{}\n\nUser request:\n{}",
-                    crate::providers::mtp::build_mtp_system_prompt(
-                        tools,
-                        request.tool_choice.as_ref(),
-                        false
-                    ),
-                    raw_content
-                )
-            } else {
-                raw_content
+            .unwrap_or_default();
+        let mut transcript_parts: Vec<String> = Vec::new();
+        for m in request.messages.iter() {
+            let text = m.content.as_text();
+            if text.is_empty() {
+                continue;
             }
-        } else {
-            raw_content
-        };
-        if !tool_context.is_empty() {
-            content = format!("{}\n\n{}", tool_context, content);
+            let label = match m.role.as_str() {
+                "system" => "System",
+                "assistant" => "Assistant",
+                "user" => "Human",
+                other => {
+                    // Tool-role turns are rendered as MTP result blocks in
+                    // the tool_results slot below, not as transcript lines.
+                    if other == "tool" {
+                        continue;
+                    }
+                    other
+                }
+            };
+            transcript_parts.push(format!("{}: {}", label, text));
         }
+        let transcript = transcript_parts.join("\n");
+
+        let tool_context = self.handle_tool_results(gateway_session_id, &request.messages).await;
+
+        let continuation = crate::providers::mtp::has_mirage_history(&transcript) || !tool_context.is_empty();
+        let system_prompt = if continuation { None } else {
+            request.tools.as_ref().filter(|t| !t.is_empty()).map(|tools| {
+                crate::providers::mtp::build_mtp_system_prompt(
+                    tools,
+                    request.tool_choice.as_ref(),
+                    false
+                )
+            })
+        };
+
+        let content = crate::providers::mtp::compose_flat_prompt(crate::providers::mtp::FlatPrompt {
+            system: system_prompt.as_deref(),
+            transcript: &transcript,
+            tool_results: &tool_context,
+            current_request: &current_request,
+        });
 
         let files = file_objects.to_vec();
 
