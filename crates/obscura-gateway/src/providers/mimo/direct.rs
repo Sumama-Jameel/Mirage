@@ -400,7 +400,14 @@ impl DirectClient {
                 current_request: &current_request,
             })
         } else {
-            joined
+            // No tools: still render the newest instruction last (it is
+            // excluded from the transcript loop above).
+            crate::providers::mtp::compose_flat_prompt(crate::providers::mtp::FlatPrompt {
+                system: None,
+                transcript: &joined,
+                tool_results: "",
+                current_request: &current_request,
+            })
         }
     }
 
