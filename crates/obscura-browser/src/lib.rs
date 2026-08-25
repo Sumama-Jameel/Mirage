@@ -7,6 +7,9 @@ pub use page::{NetworkEvent, Page, PageError};
 pub use context::BrowserContext;
 pub use lifecycle::{LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
+// Re-exported so the gateway can mint provider auth tokens (grok statsig)
+// inside its own V8 runtime without a browser page.
+pub use obscura_js::runtime::ObscuraJsRuntime;
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,
 // not obscura-js) can surface the interception channel types.
 pub use obscura_js::ops::{InterceptResolution, InterceptedRequest};
