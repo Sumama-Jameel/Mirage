@@ -117,7 +117,7 @@ impl Provider for GrokProvider {
             // cached one is missing/expired. Failure is non-fatal: the
             // request falls back to the synthetic marker.
             if this.store.cached_statsig().is_none() {
-                match statsig_harvest::harvest_via_browser_sync(&this.store) {
+                match statsig_harvest::harvest_auth(&this.store).await {
                     Some(h) => this.store.store_statsig(h.statsig_id),
                     None => {
                         tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
@@ -159,7 +159,7 @@ impl Provider for GrokProvider {
         Box::pin(async move {
             let session = sessions.acquire().await?;
             if this.store.cached_statsig().is_none() {
-                match statsig_harvest::harvest_via_browser_sync(&this.store) {
+                match statsig_harvest::harvest_auth(&this.store).await {
                     Some(h) => this.store.store_statsig(h.statsig_id),
                     None => {
                         tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
