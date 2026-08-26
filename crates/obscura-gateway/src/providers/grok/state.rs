@@ -58,6 +58,8 @@ struct PersistedFile {
     release: Option<CachedRelease>,
     /// Harvested signed x-statsig-id with scrape time.
     statsig: Option<CachedRelease>,
+    #[serde(default)]
+    token_pool: Vec<String>,
 }
 
 fn unix_now() -> u64 {
@@ -76,6 +78,7 @@ pub struct GrokSessionStore {
     anti_bot: std::sync::Arc<Mutex<Option<AntiBotState>>>,
     release: std::sync::Arc<Mutex<Option<CachedRelease>>>,
     statsig: std::sync::Arc<Mutex<Option<CachedRelease>>>,
+    token_pool: std::sync::Arc<Mutex<Vec<String>>>,
 }
 
 impl GrokSessionStore {
@@ -108,6 +111,7 @@ impl GrokSessionStore {
                         *self.anti_bot.lock().unwrap() = persisted.anti_bot;
                         *self.release.lock().unwrap() = persisted.release;
                         *self.statsig.lock().unwrap() = persisted.statsig;
+                        *self.token_pool.lock().unwrap() = persisted.token_pool;
                     }
                     Err(_) => {
                         if let Ok(persisted) =
@@ -130,6 +134,7 @@ impl GrokSessionStore {
             anti_bot: self.anti_bot.lock().unwrap().clone(),
             release: self.release.lock().unwrap().clone(),
             statsig: self.statsig.lock().unwrap().clone(),
+            token_pool: self.token_pool.lock().unwrap().clone(),
         };
         let json = serde_json::to_string(&file).unwrap_or_default();
         let tmp = path.with_extension("tmp");
@@ -201,6 +206,59 @@ impl GrokSessionStore {
         let cached = guard.as_ref()?;
         let age = unix_now().saturating_sub(cached.scraped_at_unix);
         (age <= super::statsig::HARVEST_TTL_SECS).then(|| cached.value.clone())
+    }
+
+    /// Load captured tokens from the Whelmer harvest file if the pool is
+    /// empty. Reads from `OBSCURA_GROK_TOKENS` env or `<data_dir>/grok_tokens.json`.
+    pub fn load_token_pool_if_empty(&self) {
+        {
+            let guard = self.token_pool.lock().unwrap();
+            if !guard.is_empty() {
+                return;
+            }
+        }
+        let token_file = std::env::var("OBSCURA_GROK_TOKENS").unwrap_or_default();
+        let path = if token_file.is_empty() {
+            self.session_file
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|f| f.parent().map(|p| p.join("grok_tokens.json")))
+        } else {
+            Some(std::path::PathBuf::from(token_file))
+        };
+        let Some(path) = path else { return };
+        let Ok(content) = std::fs::read_to_string(&path) else { return };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else { return };
+        let Some(tokens) = parsed.get("tokens").and_then(|t| t.as_array()) else { return };
+        let pool: Vec<String> = tokens
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
+        if !pool.is_empty() {
+            tracing::info!(count = pool.len(), "loaded captured grok statsig tokens");
+            *self.token_pool.lock().unwrap() = pool;
+        }
+    }
+
+    /// Load captured statsig tokens from a provided list.
+    #[allow(dead_code)]
+    pub fn load_token_pool(&self, tokens: Vec<String>) {
+        self.ensure_loaded();
+        let mut guard = self.token_pool.lock().unwrap();
+        *guard = tokens;
+        drop(guard);
+    }
+
+    /// Pop the next captured token from the rotation pool. Returns None when
+    /// the pool is empty.
+    pub fn next_captured_token(&self) -> Option<String> {
+        self.ensure_loaded();
+        let mut guard = self.token_pool.lock().unwrap();
+        if guard.is_empty() {
+            return None;
+        }
+        Some(guard.remove(0))
     }
 
     /// Persist a freshly harvested statsig id.
@@ -356,6 +414,7 @@ mod tests {
                 }),
                 release: None,
                 statsig: None,
+                token_pool: Vec::new(),
             };
             std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
             drop(store);

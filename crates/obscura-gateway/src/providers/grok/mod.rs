@@ -112,10 +112,17 @@ impl Provider for GrokProvider {
         let this = self.clone();
         let sessions = sessions.clone();
         Box::pin(async move {
+            // Load captured tokens from Whelmer harvest (once).
+            this.store.load_token_pool_if_empty();
+
             let session = sessions.acquire().await?;
-            // Harvest a fresh signed x-statsig-id from the live page when the
-            // cached one is missing/expired. Failure is non-fatal: the
-            // request falls back to the synthetic marker.
+            // Priority: captured token pool → V8 mint → synthetic fallback.
+            if this.store.cached_statsig().is_none() {
+                if let Some(tok) = this.store.next_captured_token() {
+                    tracing::info!(token_len = tok.len(), "using captured statsig token from pool");
+                    this.store.store_statsig(tok);
+                }
+            }
             if this.store.cached_statsig().is_none() {
                 match statsig_harvest::harvest_auth(&this.store).await {
                     Some(h) => this.store.store_statsig(h.statsig_id),
