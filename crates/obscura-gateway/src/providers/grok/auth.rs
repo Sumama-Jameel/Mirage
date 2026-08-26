@@ -27,15 +27,11 @@ pub fn extract_grok_cookies(session: &SessionHandle) -> Vec<CookieInfo> {
 /// failure). OmniRoute's GrokWebExecutor forwards exactly `sso` + `sso-rw`,
 /// which grok.com's anti-bot requires as a pair.
 pub fn filtered_grok_jar(session: &SessionHandle) -> std::sync::Arc<obscura_net::CookieJar> {
-    const ALLOWED: &[&str] = &["sso", "sso-rw"];
     let jar = obscura_net::CookieJar::new();
-    let filtered: Vec<CookieInfo> = session
-        .cookie_jar
-        .get_all_cookies()
-        .into_iter()
-        .filter(|c| ALLOWED.contains(&c.name.as_str()))
-        .collect();
-    jar.set_cookies_from_cdp(filtered);
+    // Send ALL grok.com cookies — the real browser sends ~15+ on every API
+    // request. Filtering to sso+sso-rw triggers session validation failures.
+    let all: Vec<CookieInfo> = extract_grok_cookies(session);
+    jar.set_cookies_from_cdp(all);
     std::sync::Arc::new(jar)
 }
 

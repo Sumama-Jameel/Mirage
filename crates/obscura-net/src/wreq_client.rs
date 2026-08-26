@@ -97,10 +97,21 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         timeouts: Option<Timeouts>,
     ) -> Self {
+        Self::with_emulation(cookie_jar, proxy_url, timeouts, wreq_util::Profile::Chrome145, wreq_util::Platform::Windows)
+    }
+
+    /// Stealth client with a specific browser emulation profile.
+    pub fn with_emulation(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        timeouts: Option<Timeouts>,
+        profile: wreq_util::Profile,
+        platform: wreq_util::Platform,
+    ) -> Self {
         let timeouts = timeouts.unwrap_or(Timeouts::DEFAULT);
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
+            .profile(profile)
+            .platform(platform)
             .build();
 
         let mut builder = wreq::Client::builder()

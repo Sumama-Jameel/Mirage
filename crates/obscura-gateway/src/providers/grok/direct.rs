@@ -1,4 +1,5 @@
 use futures::stream::{BoxStream, StreamExt};
+use obscura_net::wreq_util;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -317,18 +318,14 @@ impl DirectClient {
         // from the filtered jar on every request.
         validate_grok_session(&extract_grok_cookies(&session))?;
 
-        // wreq Chrome TLS emulation. Grok sits behind Cloudflare Enterprise,
-        // which rejects native rustls/reqwest ClientHello fingerprints with
-        // an anti-bot 403 even with valid sso + sso-rw cookies (verified in
-        // OmniRoute's GrokWebExecutor and the Mistral provider).
-        //
-        // The jar is filtered to sso + sso-rw: the profile's cf_clearance is
-        // pinned to the Firefox TLS fingerprint that earned it and replaying
-        // it under Chrome TLS is itself an anti-bot trigger.
-        let stealth = Arc::new(obscura_net::StealthHttpClient::with_timeouts(
+        // Stealth HTTP client with ALL grok.com cookies and Firefox TLS
+        // emulation — matches the real browser that earned these cookies.
+        let stealth = Arc::new(obscura_net::StealthHttpClient::with_emulation(
             super::auth::filtered_grok_jar(&session),
             None,
             Some(obscura_net::Timeouts::streaming()),
+            wreq_util::Profile::Firefox133,
+            wreq_util::Platform::Linux,
         ));
 
         Ok(Self {
@@ -414,28 +411,24 @@ impl DirectClient {
     }
 
     fn build_request_headers_base() -> std::collections::HashMap<String, String> {
+        // Match the REAL logged-in Firefox browser byte-for-byte.
+        // Previous Chrome/Windows UA + Chrome-only Sec-Ch-Ua headers were a
+        // mismatch against Firefox-earned cookies and triggered code 7.
         let mut headers = std::collections::HashMap::new();
         headers.insert("Accept".into(), "*/*".into());
-        headers.insert("Accept-Language".into(), "en-US,en;q=0.9".into());
-        headers.insert("Cache-Control".into(), "no-cache".into());
+        headers.insert("Accept-Language".into(), "en-US,en;q=0.5".into());
         headers.insert("Content-Type".into(), "application/json".into());
         headers.insert("Origin".into(), "https://grok.com".into());
-        headers.insert("Pragma".into(), "no-cache".into());
         headers.insert("Referer".into(), "https://grok.com/".into());
-        headers.insert(
-            "Sec-Ch-Ua".into(),
-            "\"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\", \"Not(A:Brand\";v=\"24\"".into(),
-        );
-        headers.insert("Sec-Ch-Ua-Mobile".into(), "?0".into());
-        headers.insert("Sec-Ch-Ua-Platform".into(), "\"Windows\"".into());
         headers.insert("Sec-Fetch-Dest".into(), "empty".into());
         headers.insert("Sec-Fetch-Mode".into(), "cors".into());
         headers.insert("Sec-Fetch-Site".into(), "same-origin".into());
         headers.insert(
             "User-Agent".into(),
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".into(),
+            "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0".into(),
         );
+        headers.insert("Priority".into(), "u=6".into());
+        headers.insert("TE".into(), "trailers".into());
         headers
     }
 

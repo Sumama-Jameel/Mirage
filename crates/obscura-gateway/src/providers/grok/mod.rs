@@ -165,14 +165,64 @@ impl Provider for GrokProvider {
         let sessions = sessions.clone();
         Box::pin(async move {
             let session = sessions.acquire().await?;
-            if this.store.cached_statsig().is_none() {
-                match statsig_harvest::harvest_auth(&this.store).await {
-                    Some(h) => this.store.store_statsig(h.statsig_id),
-                    None => {
-                        tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
-                    }
+
+            // Browser-as-transport proof of concept: navigate to grok.com,
+            // then make the API call from within the page context where the
+            // app's own interceptors add signed headers automatically.
+            sessions.navigate(&session.id, "https://grok.com").await?;
+            tracing::info!("grok: navigating to grok.com for browser transport");
+            for _ in 0..15 {
+                sessions.pump_event_loop(&session.id, 2000).await.ok();
+                let state = sessions.execute_js(&session.id,
+                    r#"document.readyState + '|' + String(typeof window.__next_f !== 'undefined')"#
+                ).await.unwrap_or(serde_json::Value::Null);
+                tracing::debug!(state = %state, "grok: page load check");
+                if state.as_str().map(|s| s.starts_with("complete|true")).unwrap_or(false) {
+                    break;
                 }
             }
+            tracing::info!("grok: page loaded, testing statsig capture");
+
+            // Trigger a lightweight REST call and capture its headers via
+            // XHR interception.
+            let hook = r#"(function(){
+                window.__capturedStatsig = null;
+                const origOpen = XMLHttpRequest.prototype.open;
+                const origHeader = XMLHttpRequest.prototype.setRequestHeader;
+                XMLHttpRequest.prototype.open = function(m, u) {
+                    this._url = u; return origOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+                    if (name.toLowerCase() === 'x-statsig-id') {
+                        window.__capturedStatsig = value;
+                    }
+                    return origHeader.apply(this, arguments);
+                };
+                // Trigger a small REST call
+                const x = new XMLHttpRequest();
+                x.open('GET', '/rest/modes');
+                x.send();
+                return 'hooks installed';
+            })()"#;
+            let _ = sessions.execute_js(&session.id, hook).await;
+
+            // Wait for the XHR to fire and capture the header.
+            for _ in 0..20 {
+                sessions.pump_event_loop(&session.id, 500).await.ok();
+                let captured = sessions.execute_js(&session.id,
+                    "window.__capturedStatsig || null"
+                ).await.unwrap_or(serde_json::Value::Null);
+                if let Some(tok) = captured.as_str() {
+                    if tok.len() > 40 {
+                        tracing::info!(statsig_len = tok.len(), "grok: statsig harvested from XHR");
+                        // Store it for DirectClient to use.
+                        this.store.store_statsig(tok.to_string());
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+
             let client = match DirectClient::new(session.clone(), &request.model, this.store.clone())
                 .await
             {

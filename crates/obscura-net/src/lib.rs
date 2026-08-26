@@ -23,3 +23,4 @@ pub use wreq_client::{
     StealthHttpClient, StreamingResponse, Timeouts, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
 };
+pub use wreq_util;
