@@ -694,9 +694,17 @@ impl MtpStreamState {
 /// passed through unchanged.
 pub fn normalize_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut out = Vec::with_capacity(messages.len());
-    for msg in messages {
+    let mut tool_step = 0usize;
+    // Find the index of the LAST tool message so we know when to add the
+    // completion hint vs the per-result trailer.
+    let last_tool_idx = messages
+        .iter()
+        .rposition(|m| m.role == "tool");
+
+    for (idx, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
             "tool" => {
+                tool_step += 1;
                 let id = msg.tool_call_id.clone().unwrap_or_else(|| "call_unknown".to_string());
                 let output_value: serde_json::Value = serde_json::from_str(&msg.content.as_text())
                     .unwrap_or_else(|_| serde_json::Value::String(msg.content.as_text()));
@@ -706,8 +714,17 @@ pub fn normalize_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                     error: None,
                 };
                 let block = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string());
+
+                // Only add "Continue" trailer on the LAST result.
+                let is_last = Some(idx) == last_tool_idx;
+                let trailer = if is_last {
+                    "\n\nAll tool results shown above. If your task is complete, respond directly to the user. Otherwise, call another tool."
+                } else {
+                    ""
+                };
+
                 let text = format!(
-                    "{TOOL_RESULT_START}\n{block}\n{TOOL_RESULT_END}\n\nContinue the conversation based on this tool result."
+                    "[Tool Result {tool_step}]\n{TOOL_RESULT_START}\n{block}\n{TOOL_RESULT_END}{trailer}"
                 );
                 out.push(ChatMessage {
                     role: "user".to_string(),
@@ -731,7 +748,13 @@ pub fn normalize_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                         arguments: args,
                     };
                     let block = serde_json::to_string(&mtp).unwrap_or_else(|_| "{}".to_string());
-                    blocks.push(format!("{TOOL_CALL_START}\n{block}\n{TOOL_CALL_END}"));
+                    blocks.push(format!(
+                        "[Tool Call {}]\n{}\n{}\n{}",
+                        tool_step + 1,
+                        TOOL_CALL_START,
+                        block,
+                        TOOL_CALL_END
+                    ));
                 }
                 let text = blocks.join("\n\n");
                 out.push(ChatMessage {
@@ -747,6 +770,29 @@ pub fn normalize_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             _ => out.push(msg.clone()),
         }
     }
+
+    // Task re-anchoring: after all normalized messages, remind the model of
+    // the original instruction from the first user turn.
+    if last_tool_idx.is_some() {
+        if let Some(first_user) = messages.iter().find(|m| m.role == "user") {
+            let task = first_user.content.as_text();
+            if !task.is_empty() {
+                out.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "=== Original task ===\n{task}\n=== Respond based on ALL tool results above ==="
+                    )
+                    .into(),
+                    name: None,
+                    reasoning_content: None,
+                    citations: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+    }
+
     out
 }
 

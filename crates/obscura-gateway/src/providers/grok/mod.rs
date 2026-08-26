@@ -106,7 +106,7 @@ impl Provider for GrokProvider {
     fn chat(
         &self,
         sessions: &SessionManager,
-        state: &AppState,
+        _state: &AppState,
         request: ChatCompletionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ChatCompletionResponse, GatewayError>> + Send>> {
         let this = self.clone();

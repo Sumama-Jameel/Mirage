@@ -252,6 +252,7 @@ impl GrokSessionStore {
 
     /// Pop the next captured token from the rotation pool. Returns None when
     /// the pool is empty.
+    #[allow(dead_code)]
     pub fn next_captured_token(&self) -> Option<String> {
         self.ensure_loaded();
         let mut guard = self.token_pool.lock().unwrap();

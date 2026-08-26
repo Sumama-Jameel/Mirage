@@ -21,6 +21,7 @@ use super::upload::{self, UploadCache};
 
 const GROK_BASE_URL: &str = "https://grok.com";
 const CONVERSATIONS_PATH: &str = "/rest/app-chat/conversations/new";
+#[allow(dead_code)]
 const PROVIDER_NAME: &str = "grok";
 
 fn new_uuid() -> String {
@@ -219,6 +220,7 @@ fn build_tool_call(id: &str, tool_name: &str, args: serde_json::Value) -> ToolCa
 }
 
 /// Build the cost estimate text for usage.
+#[allow(dead_code)]
 fn estimate_cost(prompt_text: &str, completion_text: &str) -> Usage {
     Usage {
         prompt_tokens: estimate_tokens(PROVIDER_NAME, "grok", prompt_text),
@@ -332,6 +334,7 @@ pub struct DirectClient {
     upload_cache: UploadCache,
 }
 
+#[allow(dead_code)]
 impl DirectClient {
     pub async fn new(
         session: SessionHandle,

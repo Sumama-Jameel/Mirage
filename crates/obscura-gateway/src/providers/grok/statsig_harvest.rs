@@ -10,11 +10,17 @@
 //! Fetch strategy: plain reqwest with Chrome UA — same as `current_release()`
 //! which reliably fetches grok.com. No stealth/TLS emulation needed for
 //! static asset discovery.
+//!
+//! NOTE: This module's V8 minting path is not yet wired into the live
+//! request flow (the browser-as-transport approach is used instead).
+//! The code is kept for when the SPA boot issue under automation is resolved.
+#![allow(dead_code)]
 
 use crate::error::GatewayError;
 
 use super::state::GrokSessionStore;
 
+#[allow(dead_code)]
 const GROK_HOME: &str = "https://grok.com/";
 
 #[derive(Debug, Clone)]
