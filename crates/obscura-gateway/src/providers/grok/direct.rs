@@ -42,7 +42,7 @@ fn mode_id_for_wire(model_id: &str) -> &str {
     }
 }
 
-fn current_timestamp() -> i64 {
+pub fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -52,14 +52,14 @@ fn current_timestamp() -> i64 {
 /// Represents a single NDJSON event from grok.com's stream.
 /// Mirrors the `result.response` object in grok.com's NDJSON format.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct GrokStreamResponse {
+pub struct GrokStreamResponse {
     #[serde(default)]
-    token: String,
-    is_thinking: Option<bool>,
+    pub token: String,
+    pub is_thinking: Option<bool>,
     #[serde(rename = "isSoftStop")]
-    is_soft_stop: Option<bool>,
+    pub is_soft_stop: Option<bool>,
     #[serde(default)]
-    message_tag: String,
+    pub message_tag: String,
     #[serde(default)]
     tool_usage_card_id: String,
     #[serde(default)]
@@ -76,7 +76,7 @@ struct GrokStreamEventResult {
     response: Option<GrokStreamResponse>,
 }
 
-fn parse_ndjson_line(line: &str) -> Option<GrokStreamResponse> {
+pub fn parse_ndjson_line(line: &str) -> Option<GrokStreamResponse> {
     let event: GrokStreamEvent = serde_json::from_str(line).ok()?;
     event.result?.response
 }
@@ -301,6 +301,30 @@ fn extract_build_token(html: &str) -> Option<String> {
     None
 }
 
+/// Parse a full NDJSON response body into (text, reasoning, finish_reason).
+pub fn parse_ndjson_body(body: &str) -> (String, String, String) {
+    let mut full_text = String::new();
+    let mut reasoning = String::new();
+    let mut finish_reason = "stop".to_string();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Some(ndjson) = parse_ndjson_line(line) {
+            use GrokResponseExt;
+            if !ndjson.token.is_empty() && !ndjson.is_thinking() {
+                full_text.push_str(&ndjson.token);
+            }
+            if ndjson.is_thinking() && !ndjson.token.is_empty() {
+                reasoning.push_str(&ndjson.token);
+            }
+            if ndjson.is_soft_stop() {
+                finish_reason = "stop".to_string();
+            }
+        }
+    }
+    (full_text, reasoning, finish_reason)
+}
+
 pub struct DirectClient {
     stealth: Arc<obscura_net::StealthHttpClient>,
     mode_id: String,
@@ -483,7 +507,7 @@ impl DirectClient {
         mtp::format_tool_results(&refs)
     }
 
-    fn build_conversation_payload(&self, request: &ChatCompletionRequest, processed_urls: &[String], conversation_id: &str) -> serde_json::Value {
+    pub fn build_conversation_payload(&self, request: &ChatCompletionRequest, processed_urls: &[String], conversation_id: &str) -> serde_json::Value {
         let mut user_message = request
             .messages
             .iter()
@@ -1133,7 +1157,7 @@ impl DirectClient {
     }
 }
 
-trait GrokResponseExt {
+pub(crate) trait GrokResponseExt {
     fn is_thinking(&self) -> bool;
     fn is_soft_stop(&self) -> bool;
 }
@@ -1142,7 +1166,6 @@ impl GrokResponseExt for GrokStreamResponse {
     fn is_thinking(&self) -> bool {
         self.is_thinking.unwrap_or(false)
     }
-
     fn is_soft_stop(&self) -> bool {
         self.is_soft_stop.unwrap_or(false)
     }

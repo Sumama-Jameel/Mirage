@@ -6,7 +6,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 use crate::error::GatewayError;
-use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model};
+use crate::models::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatMessage, Model, Usage};
 use crate::providers::session_guard::SessionGuardStream;
 use crate::providers::Provider;
 use crate::session::SessionManager;
@@ -106,31 +106,34 @@ impl Provider for GrokProvider {
     fn chat(
         &self,
         sessions: &SessionManager,
-        _state: &AppState,
+        state: &AppState,
         request: ChatCompletionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ChatCompletionResponse, GatewayError>> + Send>> {
         let this = self.clone();
         let sessions = sessions.clone();
         Box::pin(async move {
-            // Load captured tokens from Whelmer harvest (once).
             this.store.load_token_pool_if_empty();
 
             let session = sessions.acquire().await?;
-            // Priority: captured token pool → V8 mint → synthetic fallback.
-            if this.store.cached_statsig().is_none() {
-                if let Some(tok) = this.store.next_captured_token() {
-                    tracing::info!(token_len = tok.len(), "using captured statsig token from pool");
-                    this.store.store_statsig(tok);
+            // Browser-as-transport: navigate the session to grok.com and
+            // make the API call from within the page. The app's own JS
+            // interceptors add x-statsig-id, Baggage, and all other auth
+            // headers automatically — no token extraction needed.
+            sessions.navigate(&session.id, "https://grok.com").await?;
+            tracing::info!("grok browser-transport: navigating to grok.com");
+            for _ in 0..20 {
+                sessions.pump_event_loop(&session.id, 2000).await.ok();
+                let ready = sessions.execute_js(&session.id,
+                    r#"document.readyState === 'complete' && document.querySelector('textarea, [contenteditable]') !== null"#
+                ).await.unwrap_or(serde_json::Value::Null);
+                if ready.as_str() == Some("true") {
+                    tracing::info!("grok browser-transport: page ready");
+                    break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            if this.store.cached_statsig().is_none() {
-                match statsig_harvest::harvest_auth(&this.store).await {
-                    Some(h) => this.store.store_statsig(h.statsig_id),
-                    None => {
-                        tracing::warn!("Grok statsig harvest yielded nothing; using fallback marker");
-                    }
-                }
-            }
+
+            // Build payload using DirectClient's builder.
             let client = match DirectClient::new(session.clone(), &request.model, this.store.clone())
                 .await
             {
@@ -140,9 +143,83 @@ impl Provider for GrokProvider {
                     return Err(e);
                 }
             };
-            let result = client.chat(request).await;
-            let _ = sessions.release(session.id.clone(), false).await;
-            result
+            let conversation_id = uuid::Uuid::new_v4().to_string();
+            let processed_urls = Vec::new(); // TODO: attachments via page
+            let payload = client.build_conversation_payload(&request, &processed_urls, &conversation_id);
+
+            // Make the API call from within the grok.com page context.
+            // The app's own fetch wrapper adds x-statsig-id + Baggage.
+            let body_json = serde_json::to_string(&payload)
+                .map_err(|e| GatewayError::Internal(format!("grok payload serialize: {e}")))?;
+            let js = format!(
+                r#"(async function() {{
+                    try {{
+                        const resp = await fetch('/rest/app-chat/conversations/new', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            credentials: 'include',
+                            body: {}
+                        }});
+                        const text = await resp.text();
+                        return {{ status: resp.status, body: text.substring(0, 100000) }};
+                    }} catch(e) {{
+                        return {{ status: 0, error: String(e) }};
+                    }}
+                }})()"#, serde_json::to_string(&body_json).unwrap_or_default()
+            );
+
+            let result_raw = sessions.execute_js(&session.id, &js).await
+                .map_err(|e| GatewayError::Provider(format!("grok page fetch failed: {e}")))?;
+
+            let status = result_raw.get("status").and_then(|s| s.as_u64()).unwrap_or(0);
+            if status < 200 || status >= 300 {
+                let err_text = result_raw.get("error").and_then(|e| e.as_str())
+                    .unwrap_or("unknown error");
+                return Err(GatewayError::Provider(format!(
+                    "grok page transport error (status {status}): {err_text}"
+                )));
+            }
+
+            let body = result_raw.get("body").and_then(|b| b.as_str()).unwrap_or("");
+
+            // Parse NDJSON stream text.
+            let (full_text, reasoning_text, finish_reason) =
+                direct::parse_ndjson_body(body);
+
+            let prompt_tokens = crate::providers::tokenizer::estimate_tokens("grok", &request.model, &request.messages.iter().map(|m| m.content.as_text()).collect::<String>());
+            let completion_tokens = crate::providers::tokenizer::estimate_tokens("grok", &request.model, &full_text);
+            let usage = Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            };
+
+            let session_url = Some(format!("https://grok.com/chat/{conversation_id}"));
+
+            // Store conversation for continuation.
+            this.store.get_or_create(request.session_url.as_deref(), &request.model, conversation_id);
+
+            Ok(ChatCompletionResponse {
+                id: format!("chatcmpl-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                object: "chat.completion".to_string(),
+                created: direct::current_timestamp(),
+                model: request.model.clone(),
+                choices: vec![crate::models::ChatCompletionChoice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: "assistant".to_string(),
+                        content: ChatContent::String(full_text),
+                        name: None,
+                        reasoning_content: if reasoning_text.is_empty() { None } else { Some(reasoning_text) },
+                        citations: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    finish_reason,
+                }],
+                usage,
+                session_url,
+            })
         })
     }
 
