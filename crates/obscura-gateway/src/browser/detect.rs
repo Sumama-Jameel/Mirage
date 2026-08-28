@@ -26,7 +26,11 @@ pub fn detect_default_browser() -> Option<BrowserType> {
     {
         detect_default_browser_windows()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        detect_default_browser_macos()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         None
     }
@@ -65,7 +69,7 @@ pub fn select_source() -> Result<BrowserSource, GatewayError> {
 
     detect_any_installed_browser().ok_or_else(|| {
         GatewayError::Internal(
-            "no browser profile found (looked for Firefox, Chrome, Edge on Linux/Windows)"
+            "no browser profile found (looked for Firefox, Chrome, Edge on Linux/Windows/macOS)"
                 .to_string(),
         )
     })
@@ -153,6 +157,77 @@ pub fn map_progid_to_browser(prog_id: &str) -> Option<BrowserType> {
 }
 
 // =============================================================================
+// macOS detection
+// =============================================================================
+
+#[cfg(target_os = "macos")]
+fn detect_default_browser_macos() -> Option<BrowserType> {
+    // Use `defaults read com.apple.LaunchServices/com.apple.launchservices.secure` to find
+    // the default HTTP handler, or fall back to checking LSHandlers.
+    let output = std::process::Command::new("defaults")
+        .args([
+            "read",
+            "com.apple.LaunchServices/com.apple.launchservices.secure",
+            "LSHandlers",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        debug!("defaults read LSHandlers failed; default browser unknown");
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Look for the http scheme handler
+    let mut in_http_section = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("LSHandlerURLScheme = http") || trimmed.contains("LSHandlerURLScheme = https") {
+            in_http_section = true;
+        }
+        if in_http_section && trimmed.contains("LSHandlerRoleAll =") {
+            let bundle_id = trimmed.split('=').nth(1)?.trim();
+            return map_bundle_id_to_browser(bundle_id);
+        }
+    }
+
+    // Fallback: check if common browsers are in /Applications
+    let home = dirs::home_dir()?;
+    for (browser, app_name) in [
+        (BrowserType::Firefox, "Firefox.app"),
+        (BrowserType::Chrome, "Google Chrome.app"),
+        (BrowserType::Edge, "Microsoft Edge.app"),
+    ] {
+        let path = home.join("Applications").join(app_name);
+        if path.exists() {
+            return Some(browser);
+        }
+        let path = PathBuf::from("/Applications").join(app_name);
+        if path.exists() {
+            return Some(browser);
+        }
+    }
+
+    None
+}
+
+/// Map a macOS bundle ID to a browser type.
+#[cfg(target_os = "macos")]
+fn map_bundle_id_to_browser(bundle_id: &str) -> Option<BrowserType> {
+    let lower = bundle_id.to_lowercase();
+    if lower.contains("firefox") {
+        Some(BrowserType::Firefox)
+    } else if lower.contains("chrome") || lower.contains("chromium") {
+        Some(BrowserType::Chrome)
+    } else if lower.contains("edge") {
+        Some(BrowserType::Edge)
+    } else {
+        None
+    }
+}
+
+// =============================================================================
 // Chrome / Edge profile discovery (placeholders for Phase 4)
 // =============================================================================
 
@@ -206,7 +281,20 @@ fn chrome_default_profile_path() -> Option<PathBuf> {
         }
         None
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir()?;
+        for candidate in [
+            home.join("Library/Application Support/Google/Chrome"),
+            home.join("Library/Application Support/Chromium"),
+        ] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         None
     }
@@ -234,7 +322,17 @@ fn edge_default_profile_path() -> Option<PathBuf> {
             None
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir()?;
+        let candidate = home.join("Library/Application Support/Microsoft Edge");
+        if candidate.exists() {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         None
     }

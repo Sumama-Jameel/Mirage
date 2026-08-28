@@ -67,8 +67,7 @@ edit instead.
 
 x-statsig-id constants are **hardcoded** in
 `direct.rs` (`DEFAULT_HEADER_HEX`, `DEFAULT_SUFFIX`, `DEFAULT_TRAILER`).
-They were extracted via F12 Console capture script (see
-`EXTRACT_GROK_CONSTANTS.txt`). Override them at runtime without recompiling:
+They were extracted via F12 Console capture script. Override them at runtime without recompiling:
 
 ```bash
 export GROK_CHALLENGE_HEADER_HEX="..."     # 98 hex chars (49 bytes)
@@ -77,10 +76,9 @@ export GROK_CHALLENGE_TRAILER=3
 ```
 
 **Re-extraction:** When the constants expire (grok.com deploy cycle),
-open grok.com in a real browser, F12 console, paste the capture script
-from `EXTRACT_GROK_CONSTANTS.txt`, send a chat message, and run
+open grok.com in a real browser, F12 console, send a chat message, and run
 `JSON.stringify(window.__gc)`. Update the three `DEFAULT_*` constants
-in `direct.rs` and `EXTRACT_GROK_CONSTANTS.txt`. The suffix changes
+in `direct.rs`. The suffix changes
 rarely; the header prefix byte varies but the verification blob inside
 is stable.
 
@@ -175,7 +173,7 @@ Obscura discount codes: `OBSCURA35` (35% off mobile and residential),
 
 The Minimax provider at `providers/minimax/` was fully reverse-engineered from the `agent.minimax.io` web app JS bundle. Critical findings that cost hours of debugging:
 
-**Signing:** `x-signature = md5(ts_sec + "I*7Cf%WZ#S&%1RlZJ&C2" + body)`. The secret is a hardcoded string in the JS bundle, NOT the JWT. `x-timestamp` is UNIX SECONDS, not milliseconds.
+**Signing:** `x-signature = md5(ts_sec + SIGNING_SECRET + body)`. The secret is a hardcoded string in the JS bundle, NOT the JWT. `x-timestamp` is UNIX SECONDS, not milliseconds. Set via `MINIMAX_SIGNING_SECRET` env var.
 
 **JWT consistency:** Both the `token` header AND the `token` query param MUST be the EXACT SAME JWT string. Using different tokens (even with identical payloads but different signatures) causes HTTP 401.
 

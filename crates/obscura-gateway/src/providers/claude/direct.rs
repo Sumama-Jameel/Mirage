@@ -404,7 +404,7 @@ impl ClaudeDirectClient {
         let tool_prompt = match request.tools.as_ref() {
             Some(tools) => format!(
                 "{}\n\nUser request:\n{}",
-                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false),
+                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false, mtp::prompt_style_for_model(&request.model)),
                 prompt
             ),
             None => String::new(),
@@ -544,7 +544,7 @@ impl ClaudeDirectClient {
             let tool_prompt = match request.tools.as_ref() {
                 Some(tools) => format!(
                 "{}\n\nUser request:\n{}",
-                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false),
+                mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false, mtp::prompt_style_for_model(&request.model)),
                 prompt
             ),
                 None => String::new(),

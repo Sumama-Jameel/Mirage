@@ -579,7 +579,7 @@ impl DirectClient {
             if !tools.is_empty() {
                 // grok.com keeps conversation state server-side; we only send
                 // the newest instruction plus the dialect prompt (once).
-                let mtp_prompt = mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false);
+                let mtp_prompt = mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false, mtp::prompt_style_for_model(&request.model));
                 payload["message"] = serde_json::json!(mtp::compose_flat_prompt(
                     mtp::FlatPrompt {
                         system: Some(&mtp_prompt),

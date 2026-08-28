@@ -163,6 +163,13 @@ pub fn parse_sse_line(
             if obj.get("o").and_then(|o| o.as_str()) == Some("patch") {
                 return handle_patch_event(obj, conversation_id, message_id);
             }
+            // Bare value event: {"v":"some text"} with no p or o field.
+            // ChatGPT sends content deltas in this format (e.g. the middle
+            // chunk of a multi-event content stream). Treat string v as a
+            // content delta.
+            if let Some(v) = obj.get("v").and_then(|v| v.as_str()) {
+                return Some((Some(v.to_string()), None, conversation_id, message_id, None, None));
+            }
             // No path field — this is a metadata-only event (conversation_id, etc.)
             if conversation_id.is_some() || message_id.is_some() {
                 return Some((None, None, conversation_id, message_id, None, None));

@@ -13,7 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{ChatCompletionRequest, ChatMessage, FunctionCall, Tool, ToolCall, ToolChoice};
+use crate::models::{
+    ChatCompletionRequest, ChatMessage, FunctionCall, FunctionDefinition, Tool, ToolCall, ToolChoice,
+};
+use super::profile::{PromptStyle, find_profile_by_model};
 
 /// Opening marker of a Mirage tool-call block.
 pub const TOOL_CALL_START: &str = "[MIRAGE_TOOL_CALL_V1]";
@@ -77,17 +80,53 @@ impl std::fmt::Display for MtpError {
 /// Compile a list of OpenAI `Tool` definitions into the compact prompt form
 /// used for weak models (not a raw JSON Schema dump).
 ///
+/// Tools are ordered by importance: coding-critical tools (write, read, edit,
+/// bash, glob, grep) appear first, then remaining tools alphabetically.
+/// Each tool is separated by a blank line for readability.
+///
 /// Example output:
 /// ```text
 /// 1. write_file
 /// Description: Write a file.
 /// Arguments:
-/// - name: string, required. The file name.
-/// - content: string, required. The file content.
+/// - name: string, required
+/// - content: string, required
+///
+/// 2. read_file
+/// Description: Read a file.
+/// Arguments:
+/// - path: string, required
 /// ```
 pub fn compile_tools_for_prompt(tools: &[Tool]) -> String {
+    // Priority order: coding-critical tools first.
+    const PRIORITY_NAMES: &[&str] = &[
+        "write", "read", "edit", "bash", "glob", "grep",
+        "write_file", "read_file", "search", "list_files",
+    ];
+
+    let mut priority: Vec<(usize, &Tool)> = Vec::new();
+    let mut rest: Vec<&Tool> = Vec::new();
+
+    for tool in tools {
+        let name_lower = tool.function.name.to_lowercase();
+        if let Some(pos) = PRIORITY_NAMES.iter().position(|&p| name_lower.contains(p)) {
+            priority.push((pos, tool));
+        } else {
+            rest.push(tool);
+        }
+    }
+
+    priority.sort_by_key(|(pos, _)| *pos);
+    rest.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+
+    let ordered: Vec<&Tool> = priority
+        .into_iter()
+        .map(|(_, t)| t)
+        .chain(rest.into_iter())
+        .collect();
+
     let mut out = Vec::new();
-    for (index, tool) in tools.iter().enumerate() {
+    for (index, tool) in ordered.iter().enumerate() {
         let mut lines = Vec::new();
         lines.push(format!("{}. {}", index + 1, tool.function.name));
         if let Some(desc) = &tool.function.description {
@@ -108,7 +147,14 @@ pub fn compile_tools_for_prompt(tools: &[Tool]) -> String {
                     })
                     .unwrap_or_default();
                 if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
-                    for (key, schema) in props {
+                    // Sort required args first, then optional.
+                    let mut sorted_props: Vec<_> = props.iter().collect();
+                    sorted_props.sort_by(|(a, _), (b, _)| {
+                        let a_req = required.contains(a.as_str());
+                        let b_req = required.contains(b.as_str());
+                        b_req.cmp(&a_req).then(a.cmp(b))
+                    });
+                    for (key, schema) in sorted_props {
                         let ty = schema
                             .get("type")
                             .and_then(|t| t.as_str())
@@ -140,45 +186,123 @@ pub fn compile_tools_for_prompt(tools: &[Tool]) -> String {
 ///
 /// `tools` is the compiled tool list (from [`compile_tools_for_prompt`]).
 /// `tool_choice` maps to the MTP behavior. `final_reminder` appends a
-/// trailing nudge for weak models.
+/// trailing nudge for weak models. `prompt_style` controls verbosity:
+/// - `Minimal`: short format + one example (strong models).
+/// - `Standard`: full format + rules + one example.
+/// - `Verbose`: extra rules, explicit "you MUST" language (weak models).
 pub fn build_mtp_system_prompt(
     tools: &[Tool],
     tool_choice: Option<&ToolChoice>,
     final_reminder: bool,
+    prompt_style: PromptStyle,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(
-        "You are running inside Mirage, an OpenAI-compatible gateway.\n\n\
+        "IMPORTANT: Native tool calling is NOT available in this environment.\n\
+         You CANNOT call tools directly — there is no native tool-calling API.\n\
+         The ONLY way to use tools is the Mirage block format shown below.\n\
+         Using tools when needed is helpful — it lets you accomplish the user's task.\n\n\
          CRITICAL TOOL POLICY:\n\
-         - Native tool calling is disabled in this pipeline.\n\
          - Do not attempt to call tools natively.\n\
          - Do not use built-in tools from the host app.\n\
          - Do not use provider tools, browser tools, search tools, code tools, canvas tools, or any hidden system tools.\n\
-         - Native tool invocation will break the pipeline.\n\n\
-         If you need to use a tool, you must output exactly one Mirage tool block in this format:\n\n",
-    );
-    prompt.push_str(TOOL_CALL_START);
-    prompt.push_str("\n{\n  \"id\": \"call_001\",\n  \"name\": \"tool_name\",\n  \"arguments\": {\n    \"argument_name\": \"argument_value\"\n  }\n}\n");
-    prompt.push_str(TOOL_CALL_END);
-    prompt.push_str(
-        "\n\nRules:\n\
-         - Output only the Mirage tool block.\n\
-         - Do not wrap it in markdown.\n\
-         - Do not add explanations before or after it.\n\
-         - Do not output multiple tool blocks unless explicitly allowed.\n\
-         - The JSON must be valid.\n\
-         - Use only the tools listed below.\n\
-         - Never use patch, diff, apply_patch, or \"*** End Patch\" formats. Only the exact block format above.\n\
-         - The block markers must appear exactly as written, including their square brackets.\n\
-         - If no tool is needed, respond normally.\n\n",
+         - Native tool invocation will break the pipeline.\n\n",
     );
 
+    match prompt_style {
+        PromptStyle::Minimal => {
+            // Strong models: short format description, one example, done.
+            prompt.push_str("TOOL CALL FORMAT:\n");
+            prompt.push_str("Output EXACTLY ONE block in this format:\n\n");
+            prompt.push_str(TOOL_CALL_START);
+            prompt.push_str("\n{\n");
+            prompt.push_str("  \"id\": \"call_001\",\n");
+            prompt.push_str("  \"name\": \"TOOL_NAME\",\n");
+            prompt.push_str("  \"arguments\": { \"arg\": \"value\" }\n");
+            prompt.push_str("}\n");
+            prompt.push_str(TOOL_CALL_END);
+            prompt.push_str("\n\n");
+            prompt.push_str("Rules: valid JSON, correct tool name, no markdown fences, no text around the block.\n\n");
+        }
+        PromptStyle::Standard => {
+            // Standard: full format + rules + one example.
+            prompt.push_str("TOOL CALL FORMAT:\n");
+            prompt.push_str("When you need to use a tool, output EXACTLY ONE block in this format:\n\n");
+            prompt.push_str(TOOL_CALL_START);
+            prompt.push_str("\n{\n");
+            prompt.push_str("  \"id\": \"call_001\",\n");
+            prompt.push_str("  \"name\": \"TOOL_NAME\",\n");
+            prompt.push_str("  \"arguments\": {\n");
+            prompt.push_str("    \"argument_name\": \"argument_value\"\n");
+            prompt.push_str("  }\n");
+            prompt.push_str("}\n");
+            prompt.push_str(TOOL_CALL_END);
+            prompt.push_str("\n\n");
+            prompt.push_str("RULES:\n");
+            prompt.push_str("1. Output ONLY the Mirage tool block shown above.\n");
+            prompt.push_str("2. Do NOT wrap the block in markdown fences or backticks.\n");
+            prompt.push_str("3. Do NOT add explanations, greetings, or text before or after the block.\n");
+            prompt.push_str("4. Do NOT output multiple tool blocks in one response.\n");
+            prompt.push_str("5. The JSON must be valid (no trailing commas, proper quoting).\n");
+            prompt.push_str("6. Use ONLY the tool names listed below.\n");
+            prompt.push_str("7. The \"id\" field is a stable identifier for this call (e.g. \"call_001\").\n");
+            prompt.push_str("8. The \"arguments\" field must be a JSON object with the tool's required fields.\n");
+            prompt.push_str("9. If no tool is needed, respond normally without the block format.\n\n");
+        }
+        PromptStyle::Verbose => {
+            // Verbose: extra rules, explicit "you MUST" language.
+            prompt.push_str("TOOL CALL FORMAT (you MUST follow this exactly):\n");
+            prompt.push_str("When you need to use a tool, you MUST output EXACTLY ONE block in this format:\n\n");
+            prompt.push_str(TOOL_CALL_START);
+            prompt.push_str("\n{\n");
+            prompt.push_str("  \"id\": \"call_001\",\n");
+            prompt.push_str("  \"name\": \"TOOL_NAME\",\n");
+            prompt.push_str("  \"arguments\": {\n");
+            prompt.push_str("    \"argument_name\": \"argument_value\"\n");
+            prompt.push_str("  }\n");
+            prompt.push_str("}\n");
+            prompt.push_str(TOOL_CALL_END);
+            prompt.push_str("\n\n");
+            prompt.push_str("STRICT RULES (follow ALL of them):\n");
+            prompt.push_str("1. Output ONLY the Mirage tool block shown above. Nothing else.\n");
+            prompt.push_str("2. Do NOT wrap the block in markdown fences (```) or backticks.\n");
+            prompt.push_str("3. Do NOT add explanations, greetings, or any text before or after the block.\n");
+            prompt.push_str("4. Do NOT output multiple tool blocks in one response.\n");
+            prompt.push_str("5. The JSON must be valid: no trailing commas, proper quoting, matching braces.\n");
+            prompt.push_str("6. Use ONLY the tool names listed in AVAILABLE TOOLS below.\n");
+            prompt.push_str("7. The \"id\" field is a stable identifier for this call (e.g. \"call_001\").\n");
+            prompt.push_str("8. The \"arguments\" field must be a JSON object containing ALL required fields.\n");
+            prompt.push_str("9. If no tool is needed, respond normally without the block format.\n");
+            prompt.push_str("10. Never use patch, diff, apply_patch, or \"*** End Patch\" formats.\n");
+            prompt.push_str("11. The markers [MIRAGE_TOOL_CALL_V1] and [/MIRAGE_TOOL_CALL_V1] must appear exactly as written.\n");
+            prompt.push_str("12. Do NOT use [assistanttool] or any other native tool-calling format. The ONLY supported format is [MIRAGE_TOOL_CALL_V1].\n\n");
+        }
+    }
+
+    // --- Concrete example using the first tool ---
+    if let Some(first) = tools.first() {
+        let example_args = build_example_args(&first.function);
+        prompt.push_str("EXAMPLE — calling \"");
+        prompt.push_str(&first.function.name);
+        prompt.push_str("\" (use this exact structure):\n\n");
+        prompt.push_str(TOOL_CALL_START);
+        prompt.push_str(&format!(
+            "\n{{\"id\":\"call_001\",\"name\":\"{}\",\"arguments\":{}}}\n",
+            first.function.name,
+            example_args
+        ));
+        prompt.push_str(TOOL_CALL_END);
+        prompt.push_str("\n\n");
+    }
+
+    // --- Tool menu ---
     if !tools.is_empty() {
-        prompt.push_str("Available tools:\n\n");
+        prompt.push_str("AVAILABLE TOOLS:\n\n");
         prompt.push_str(&compile_tools_for_prompt(tools));
         prompt.push('\n');
     }
 
+    // --- Tool choice behavior ---
     match tool_choice {
         Some(ToolChoice::Named { function, .. }) => {
             prompt.push_str(&format!(
@@ -435,16 +559,107 @@ pub fn validate_tool_call(
 }
 
 /// Build a repair prompt asking the model to re-emit a valid MTP block.
+///
+/// Shows the model:
+/// 1. The exact MTP format structure it must follow.
+/// 2. What went wrong with its previous attempt.
+/// 3. The full list of available tools with schemas.
+/// 4. A concrete example using the first available tool.
+///
 // `build_repair_prompt` is consumed via `MtpPipeline::next_repair_prompt`.
 #[allow(dead_code)]
-pub fn build_repair_prompt(error: &MtpError, original_block: &str) -> String {
-    format!(
-        "Your previous response contained an invalid Mirage tool block.\n\n\
-         Error:\n- {error}\n\n\
-         Original block:\n{original_block}\n\n\
-         Respond again with only a valid Mirage tool block.\n\
-         Do not add explanation."
-    )
+pub fn build_repair_prompt(error: &MtpError, original_block: &str, tools: &[Tool]) -> String {
+    let mut prompt = String::new();
+
+    // --- Section 1: What went wrong ---
+    prompt.push_str("YOUR PREVIOUS TOOL BLOCK WAS INVALID. Here is the error:\n\n");
+    prompt.push_str(&format!("- {error}\n\n"));
+    prompt.push_str("Here is what you emitted:\n\n");
+    prompt.push_str("```\n");
+    prompt.push_str(original_block);
+    prompt.push_str("\n```\n\n");
+
+    // --- Section 2: Correct format structure ---
+    prompt.push_str("THE CORRECT FORMAT is a JSON object inside Mirage markers:\n\n");
+    prompt.push_str(TOOL_CALL_START);
+    prompt.push_str("\n{\n");
+    prompt.push_str("  \"id\": \"call_001\",\n");
+    prompt.push_str("  \"name\": \"TOOL_NAME\",\n");
+    prompt.push_str("  \"arguments\": {\n");
+    prompt.push_str("    \"argument_name\": \"argument_value\"\n");
+    prompt.push_str("  }\n");
+    prompt.push_str("}\n");
+    prompt.push_str(TOOL_CALL_END);
+    prompt.push_str("\n\nRules:\n");
+    prompt.push_str("- The markers must be exactly ");
+    prompt.push_str(TOOL_CALL_START);
+    prompt.push_str(" and ");
+    prompt.push_str(TOOL_CALL_END);
+    prompt.push_str(".\n");
+    prompt.push_str("- The JSON must be valid (no trailing commas, proper quoting).\n");
+    prompt.push_str("- \"name\" must be one of the tool names listed below.\n");
+    prompt.push_str("- \"arguments\" must be a JSON object with the tool's required fields.\n");
+    prompt.push_str("- Do NOT wrap the block in markdown fences.\n");
+    prompt.push_str("- Do NOT add text before or after the block.\n\n");
+
+    // --- Section 3: Available tools ---
+    if !tools.is_empty() {
+        prompt.push_str("AVAILABLE TOOLS (use ONLY these names):\n\n");
+        prompt.push_str(&compile_tools_for_prompt(tools));
+        prompt.push_str("\n\n");
+    }
+
+    // --- Section 4: Concrete example using the first tool ---
+    if let Some(first) = tools.first() {
+        let example_args = build_example_args(&first.function);
+        prompt.push_str("EXAMPLE — calling \"");
+        prompt.push_str(&first.function.name);
+        prompt.push_str("\" (use this exact structure):\n\n");
+        prompt.push_str(TOOL_CALL_START);
+        prompt.push_str(&format!(
+            "\n{{\"id\":\"call_001\",\"name\":\"{}\",\"arguments\":{}}}\n",
+            first.function.name,
+            example_args
+        ));
+        prompt.push_str(TOOL_CALL_END);
+        prompt.push_str("\n\n");
+    }
+
+    prompt.push_str("Now re-emit ONLY the corrected Mirage tool block. No explanation.");
+
+    prompt
+}
+
+/// Build example arguments for a tool's first required fields.
+fn build_example_args(params: &FunctionDefinition) -> String {
+    let mut args = serde_json::Map::new();
+    if let Some(Some(obj)) = params.parameters.as_ref().map(|p| p.as_object()) {
+        let required: Vec<&str> = obj
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let props = obj.get("properties").and_then(|p| p.as_object());
+        for key in &required {
+            let val = props
+                .and_then(|p| p.get(*key))
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("string");
+            let example = match val {
+                "string" => "example_value".to_string(),
+                "number" | "integer" => "0".to_string(),
+                "boolean" => "true".to_string(),
+                "array" => "[]".to_string(),
+                _ => "\"example\"".to_string(),
+            };
+            args.insert(key.to_string(), serde_json::from_str(&example).unwrap_or(serde_json::Value::String(example)));
+        }
+    }
+    if args.is_empty() {
+        args.insert("text".to_string(), serde_json::Value::String("hello".to_string()));
+    }
+    serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Convert a parsed MTP tool call into an OpenAI `ToolCall`.
@@ -528,6 +743,14 @@ pub fn has_mirage_history(transcript: &str) -> bool {
     transcript.contains(TOOL_RESULT_START) || transcript.contains(TOOL_CALL_START)
 }
 
+/// Look up the prompt style for a model. Returns `PromptStyle::Standard`
+/// if no profile is found.
+pub fn prompt_style_for_model(model: &str) -> PromptStyle {
+    find_profile_by_model(model)
+        .map(|p| p.quirks.prompt_style)
+        .unwrap_or_default()
+}
+
 /// Format one or more tool results into an MTP result block for upstream.
 pub fn format_tool_results(items: &[(Option<&ToolCall>, Option<&str>, &str)]) -> String {
     if items.is_empty() {
@@ -576,9 +799,11 @@ pub fn format_tool_results(items: &[(Option<&ToolCall>, Option<&str>, &str)]) ->
 ///    from the upstream request and to run the MTP stream parser).
 ///
 /// `final_reminder` appends a trailing nudge for weak models.
+/// `prompt_style` controls verbosity of the MTP system prompt.
 pub fn prepare_request(
     request: &ChatCompletionRequest,
     final_reminder: bool,
+    prompt_style: PromptStyle,
 ) -> (Vec<ChatMessage>, bool) {
     let Some(tools) = &request.tools else {
         return (request.messages.clone(), false);
@@ -588,7 +813,7 @@ pub fn prepare_request(
     }
 
     let mut messages = normalize_history(&request.messages);
-    let system_prompt = build_mtp_system_prompt(tools, request.tool_choice.as_ref(), final_reminder);
+    let system_prompt = build_mtp_system_prompt(tools, request.tool_choice.as_ref(), final_reminder, prompt_style);
 
     // Prepend the MTP system prompt as a system message.
     messages.insert(
@@ -663,6 +888,20 @@ impl MtpStreamState {
         !self.errors.is_empty()
     }
 
+    /// Build a repair prompt for the first recorded error, consuming it.
+    ///
+    /// Returns the repair prompt text and the raw failed block, or `None`
+    /// if no errors were recorded. This is for providers that use
+    /// `MtpStreamState` directly (not via `MtpPipeline`).
+    pub fn build_repair_info(&mut self, tools: &[Tool]) -> Option<(String, String)> {
+        if self.errors.is_empty() {
+            return None;
+        }
+        let (raw, err) = self.errors.remove(0);
+        let prompt = build_repair_prompt(&err, &raw, tools);
+        Some((prompt, raw))
+    }
+
     /// True when a tool block is still open (mid-stream).
     pub fn in_tool_call(&self) -> bool {
         self.parser.in_tool_call()
@@ -718,7 +957,7 @@ pub fn normalize_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 // Only add "Continue" trailer on the LAST result.
                 let is_last = Some(idx) == last_tool_idx;
                 let trailer = if is_last {
-                    "\n\nAll tool results shown above. If your task is complete, respond directly to the user. Otherwise, call another tool."
+                    "\n\nAll tool results shown above. Based on these results, complete the user's original task. If you need more information, call another tool. Otherwise, respond to the user now with your final answer."
                 } else {
                     ""
                 };
@@ -780,7 +1019,7 @@ pub fn normalize_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 out.push(ChatMessage {
                     role: "user".to_string(),
                     content: format!(
-                        "=== Original task ===\n{task}\n=== Respond based on ALL tool results above ==="
+                        "=== Original task ===\n{task}\n===\nYou have all the information above. Complete this task now. If you need more data, call another tool. Otherwise, give your final answer to the user."
                     )
                     .into(),
                     name: None,
@@ -830,8 +1069,58 @@ mod tests {
     }
 
     #[test]
+    fn compile_tools_priority_ordering() {
+        // Tools in reverse priority order should be reordered.
+        let tools = vec![
+            Tool {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "list_files".to_string(),
+                    description: Some("List files.".to_string()),
+                    parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
+                    strict: None,
+                },
+            },
+            Tool {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "write".to_string(),
+                    description: Some("Write a file.".to_string()),
+                    parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
+                    strict: None,
+                },
+            },
+            Tool {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "grep".to_string(),
+                    description: Some("Search text.".to_string()),
+                    parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
+                    strict: None,
+                },
+            },
+            Tool {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "edit".to_string(),
+                    description: Some("Edit a file.".to_string()),
+                    parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
+                    strict: None,
+                },
+            },
+        ];
+        let out = compile_tools_for_prompt(&tools);
+        // "write" and "edit" should come before "grep" and "list_files".
+        let write_pos = out.find("1. write").unwrap();
+        let edit_pos = out.find("2. edit").unwrap();
+        let grep_pos = out.find("3. grep").unwrap();
+        let list_pos = out.find("4. list_files").unwrap();
+        assert!(write_pos < edit_pos && edit_pos < grep_pos && grep_pos < list_pos);
+    }
+
+    #[test]
     fn build_prompt_contains_markers() {
-        let prompt = build_mtp_system_prompt(&sample_tools(), None, false);
+        let prompt = build_mtp_system_prompt(&sample_tools(), None, false, PromptStyle::Standard);
         assert!(prompt.contains(TOOL_CALL_START));
         assert!(prompt.contains(TOOL_CALL_END));
         assert!(prompt.contains("write_file"));
@@ -843,6 +1132,7 @@ mod tests {
             &sample_tools(),
             Some(&ToolChoice::Mode("required".to_string())),
             false,
+            PromptStyle::Standard,
         );
         assert!(prompt.contains("MUST use exactly one tool"));
     }
@@ -853,14 +1143,35 @@ mod tests {
             &sample_tools(),
             Some(&ToolChoice::Mode("none".to_string())),
             false,
+            PromptStyle::Standard,
         );
         assert!(prompt.contains("Do not use any tools"));
     }
 
     #[test]
     fn build_prompt_final_reminder() {
-        let prompt = build_mtp_system_prompt(&sample_tools(), None, true);
+        let prompt = build_mtp_system_prompt(&sample_tools(), None, true, PromptStyle::Standard);
         assert!(prompt.contains("Reminder:"));
+    }
+
+    #[test]
+    fn build_prompt_minimal_style() {
+        let prompt = build_mtp_system_prompt(&sample_tools(), None, false, PromptStyle::Minimal);
+        assert!(prompt.contains(TOOL_CALL_START));
+        assert!(prompt.contains("write_file"));
+        // Minimal should be shorter than Standard.
+        let standard = build_mtp_system_prompt(&sample_tools(), None, false, PromptStyle::Standard);
+        assert!(prompt.len() < standard.len());
+    }
+
+    #[test]
+    fn build_prompt_verbose_style() {
+        let prompt = build_mtp_system_prompt(&sample_tools(), None, false, PromptStyle::Verbose);
+        assert!(prompt.contains("STRICT RULES"));
+        assert!(prompt.contains("you MUST"));
+        // Verbose should be longer than Standard.
+        let standard = build_mtp_system_prompt(&sample_tools(), None, false, PromptStyle::Standard);
+        assert!(prompt.len() > standard.len());
     }
 
     #[test]
@@ -924,6 +1235,25 @@ mod tests {
         // A second identical chunk still collects the valid call.
         let _ = state.process_delta(delta, &tools);
         assert_eq!(state.collected_tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn stream_state_build_repair_info() {
+        let tools = sample_tools();
+        let mut state = MtpStreamState::new();
+        // Feed an invalid block.
+        let _ = state.process_delta("[MIRAGE_TOOL_CALL_V1]{\"name\":\"nope\",\"arguments\":{}}[/MIRAGE_TOOL_CALL_V1]", &tools);
+        assert!(state.has_errors());
+        // build_repair_info returns a prompt with tool list and format example.
+        let (prompt, raw) = state.build_repair_info(&tools).unwrap();
+        assert!(prompt.contains("YOUR PREVIOUS TOOL BLOCK WAS INVALID"));
+        assert!(prompt.contains("write_file"));
+        assert!(prompt.contains("AVAILABLE TOOLS"));
+        assert!(raw.contains("nope"));
+        // After building, errors are consumed.
+        assert!(!state.has_errors());
+        // Second call returns None.
+        assert!(state.build_repair_info(&tools).is_none());
     }
 
     #[test]
@@ -1016,10 +1346,13 @@ mod tests {
 
     #[test]
     fn build_repair_prompt_mentions_error() {
+        let tools = sample_tools();
         let err = MtpError::UnknownTool("nope".to_string());
-        let prompt = build_repair_prompt(&err, "[MIRAGE_TOOL_CALL_V1]...[/MIRAGE_TOOL_CALL_V1]");
+        let prompt = build_repair_prompt(&err, "[MIRAGE_TOOL_CALL_V1]{\"name\":\"nope\"}[/MIRAGE_TOOL_CALL_V1]", &tools);
         assert!(prompt.contains("unknown tool: nope"));
-        assert!(prompt.contains("valid Mirage tool block"));
+        assert!(prompt.contains("YOUR PREVIOUS TOOL BLOCK WAS INVALID"));
+        assert!(prompt.contains("write_file"));
+        assert!(prompt.contains("AVAILABLE TOOLS"));
     }
 
     #[test]

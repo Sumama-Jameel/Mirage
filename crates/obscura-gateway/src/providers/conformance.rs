@@ -126,7 +126,9 @@ fn c05_invalid_block_repair_path() {
 
     // Repair prompt is generated once within the profile's budget.
     let (repair_msg, raw) = pipe.next_repair_prompt().unwrap();
-    assert!(repair_msg.content.as_text().contains("invalid Mirage tool block"));
+    assert!(repair_msg.content.as_text().contains("YOUR PREVIOUS TOOL BLOCK WAS INVALID"));
+    assert!(repair_msg.content.as_text().contains("echo"));
+    assert!(repair_msg.content.as_text().contains("AVAILABLE TOOLS"));
     assert!(raw.contains("\"name\":\"ec"));
     assert!(pipe.next_repair_prompt().is_none());
 }

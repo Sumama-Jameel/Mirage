@@ -37,7 +37,7 @@ use super::state::{SessionStore, StoredConversation};
 use super::upload::{decode_data_uri, derive_filename, upload_files};
 use crate::providers::streaming_upload::download_and_hash_batch;
 
-const TIMEOUT_SECS: u64 = 120;
+const TIMEOUT_SECS: u64 = 300;
 const MAVIS_API_BASE: &str = "/mavis/api";
 
 fn new_session_token() -> String {
@@ -237,25 +237,37 @@ impl KimiDirectClient {
             "tags": [],
         });
 
-        let resp = self
-            .http
-            .post(format!("{}/api/chat", KIMI_API_URL))
-            .json(&payload)
-            .send()
+        let url = format!("{}/api/chat", KIMI_API_URL);
+        let req_builder = self.http.post(&url).json(&payload);
+        let resp = send_with_retry(req_builder)
             .await
             .map_err(|e| GatewayError::Provider(format!("create chat failed: {e}")))?;
 
         let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
+        let body_text = resp
+            .text()
             .await
-            .map_err(|e| GatewayError::Provider(format!("create chat parse failed: {e}")))?;
+            .map_err(|e| GatewayError::Provider(format!("create chat read failed: {e}")))?;
 
         if !status.is_success() {
             return Err(GatewayError::Provider(format!(
-                "create chat returned {status}: {body}"
+                "create chat returned {status}: {}",
+                body_text.chars().take(200).collect::<String>()
             )));
         }
+
+        if body_text.trim().is_empty() {
+            return Err(GatewayError::Provider(
+                "create chat returned empty body (rate limited or server overloaded)".to_string(),
+            ));
+        }
+
+        let body: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+            GatewayError::Provider(format!(
+                "create chat parse failed: {e} (body: {})",
+                body_text.chars().take(200).collect::<String>()
+            ))
+        })?;
 
         body["id"]
             .as_str()
@@ -402,7 +414,8 @@ impl KimiDirectClient {
                 crate::providers::mtp::build_mtp_system_prompt(
                     tools,
                     request.tool_choice.as_ref(),
-                    false
+                    false,
+                    crate::providers::mtp::prompt_style_for_model(&request.model)
                 ),
                 content
             ),

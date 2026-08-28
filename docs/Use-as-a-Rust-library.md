@@ -4,7 +4,7 @@ The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura" }
+obscura = { git = "https://github.com/Sumama-Jameel/Mirage" }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```
@@ -12,7 +12,7 @@ anyhow = "1"
 The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a tag for reproducible builds:
 
 ```toml
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
+obscura = { git = "https://github.com/Sumama-Jameel/Mirage", tag = "v0.1.7" }
 ```
 
 ## Quickstart

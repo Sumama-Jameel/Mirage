@@ -43,16 +43,8 @@ impl NssContext {
     pub fn new() -> Result<Self, GatewayError> {
         // SAFETY: libloading requires `unsafe`. We only load standard system
         // libraries and extract function pointers with correct signatures.
-        let nss = unsafe { Library::new("libnss3.so") }.map_err(|e| {
-            GatewayError::Internal(format!(
-                "failed to load libnss3.so (is Firefox/NSS installed?): {e}"
-            ))
-        })?;
-        let nspr = unsafe { Library::new("libnspr4.so") }.map_err(|e| {
-            GatewayError::Internal(format!(
-                "failed to load libnspr4.so (is Firefox/NSS installed?): {e}"
-            ))
-        })?;
+        let nss = Self::load_nss_library()?;
+        let nspr = Self::load_nspr_library()?;
 
         // Leak the libraries to give symbols 'static lifetime. The libraries
         // stay loaded for the process lifetime, which matches NSS semantics.
@@ -81,6 +73,100 @@ impl NssContext {
             secitem_free_item,
             initialized: false,
         })
+    }
+
+    /// Load the NSS library, trying platform-specific paths.
+    fn load_nss_library() -> Result<Library, GatewayError> {
+        #[cfg(target_os = "macos")]
+        {
+            let candidates = [
+                "/opt/homebrew/opt/nss/lib/libnss3.dylib",
+                "/opt/homebrew/lib/libnss3.dylib",
+                "/usr/local/opt/nss/lib/libnss3.dylib",
+                "/Library/Frameworks/NSS.framework/Versions/Current/NSS",
+            ];
+            for path in &candidates {
+                if std::path::Path::new(path).exists() {
+                    if let Ok(lib) = unsafe { Library::new(path) } {
+                        return Ok(lib);
+                    }
+                }
+            }
+            unsafe { Library::new("libnss3.dylib") }.map_err(|e| {
+                GatewayError::Internal(format!(
+                    "failed to load libnss3.dylib (install NSS via: brew install nss): {e}"
+                ))
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { Library::new("libnss3.so") }.map_err(|e| {
+                GatewayError::Internal(format!(
+                    "failed to load libnss3.so (is Firefox/NSS installed?): {e}"
+                ))
+            })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            unsafe { Library::new("nss3.dll") }.map_err(|e| {
+                GatewayError::Internal(format!(
+                    "failed to load nss3.dll (is Firefox/NSS installed?): {e}"
+                ))
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            Err(GatewayError::Internal(
+                "NSS is not supported on this platform".to_string(),
+            ))
+        }
+    }
+
+    /// Load the NSPR library, trying platform-specific paths.
+    fn load_nspr_library() -> Result<Library, GatewayError> {
+        #[cfg(target_os = "macos")]
+        {
+            let candidates = [
+                "/opt/homebrew/opt/nss/lib/libnspr4.dylib",
+                "/opt/homebrew/lib/libnspr4.dylib",
+                "/usr/local/opt/nss/lib/libnspr4.dylib",
+                "/Library/Frameworks/NSPR.framework/Versions/Current/NSPR",
+            ];
+            for path in &candidates {
+                if std::path::Path::new(path).exists() {
+                    if let Ok(lib) = unsafe { Library::new(path) } {
+                        return Ok(lib);
+                    }
+                }
+            }
+            unsafe { Library::new("libnspr4.dylib") }.map_err(|e| {
+                GatewayError::Internal(format!(
+                    "failed to load libnspr4.dylib (install NSS via: brew install nss): {e}"
+                ))
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { Library::new("libnspr4.so") }.map_err(|e| {
+                GatewayError::Internal(format!(
+                    "failed to load libnspr4.so (is Firefox/NSS installed?): {e}"
+                ))
+            })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            unsafe { Library::new("nspr4.dll") }.map_err(|e| {
+                GatewayError::Internal(format!(
+                    "failed to load nspr4.dll (is Firefox/NSS installed?): {e}"
+                ))
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            Err(GatewayError::Internal(
+                "NSPR is not supported on this platform".to_string(),
+            ))
+        }
     }
 
     /// Initialize NSS against a Firefox profile directory.

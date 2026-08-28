@@ -45,8 +45,8 @@ Obscura is an open-source headless browser engine written in Rust. It runs JavaS
 
 ## Links
 
-- Source: https://github.com/h4ckf0r0day/obscura
-- Releases: https://github.com/h4ckf0r0day/obscura/releases
-- Issues: https://github.com/h4ckf0r0day/obscura/issues
+- Source: https://github.com/Sumama-Jameel/Mirage
+- Releases: https://github.com/Sumama-Jameel/Mirage/releases
+- Issues: https://github.com/Sumama-Jameel/Mirage/issues
 
 License: Apache-2.0.

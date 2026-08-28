@@ -428,7 +428,8 @@ impl DirectClient {
                 crate::providers::mtp::build_mtp_system_prompt(
                     tools,
                     request.tool_choice.as_ref(),
-                    false
+                    false,
+                    crate::providers::mtp::prompt_style_for_model(&request.model)
                 ),
                 raw
             ),
@@ -503,6 +504,7 @@ impl DirectClient {
             tool_call_id: None,
         };
 
+        let has_tool_calls = !message.tool_calls.is_none();
         Ok(ChatCompletionResponse {
             id: response_id,
             object: "chat.completion".to_string(),
@@ -511,7 +513,11 @@ impl DirectClient {
             choices: vec![crate::models::ChatCompletionChoice {
                 index: 0,
                 message,
-                finish_reason: "stop".to_string(),
+                finish_reason: if has_tool_calls {
+                    "tool_calls".to_string()
+                } else {
+                    "stop".to_string()
+                },
             }],
             usage,
             session_url,
@@ -701,6 +707,7 @@ async fn consume_stream(
     let mut last_reasoning = String::new();
     // Accumulated tool calls (deduplicated by id, snapshot form).
     let mut seen_tool_calls: Vec<ToolCall> = Vec::new();
+    let mut had_tool_calls = false;
 
     let mut finished = false;
 
@@ -924,6 +931,7 @@ async fn consume_stream(
                                             .any(|s| s.id == call.id)
                                         {
                                             seen_tool_calls.push(call.clone());
+                                            had_tool_calls = true;
                                             let _ = tx.send(Ok(build_chunk(
                                                 response_id,
                                                 model_id,
@@ -968,6 +976,7 @@ async fn consume_stream(
                         if let Some(call) = tool_call_from_value(&value) {
                             if !seen_tool_calls.iter().any(|s| s.id == call.id) {
                                 seen_tool_calls.push(call.clone());
+                                had_tool_calls = true;
                                 let _ = tx.send(Ok(build_chunk(
                                     response_id,
                                     model_id,
@@ -996,13 +1005,14 @@ async fn consume_stream(
     if !tool_defs.is_empty() {
         mtp_state.finish(tool_defs);
         if !mtp_state.collected_tool_calls.is_empty() {
+            had_tool_calls = true;
             let _ = tx.send(Ok(build_chunk(
                 response_id,
                 model_id,
                 None,
                 None,
                 Some(std::mem::take(&mut mtp_state.collected_tool_calls)),
-                Some("tool_calls".to_string()),
+                None,
             )));
         }
     }
@@ -1043,7 +1053,11 @@ async fn consume_stream(
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChatMessageDelta::default(),
-            finish_reason: Some("stop".to_string()),
+            finish_reason: Some(if had_tool_calls {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            }),
         }],
         session_url,
     }));

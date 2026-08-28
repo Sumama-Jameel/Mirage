@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SERVER_BIN="$REPO_ROOT/target/release/obscura-gateway"
-API_KEY="test-key-123"
+API_KEY="${OBSCURA_API_KEY:-obscura-local}"
 BASE="http://127.0.0.1:${OBSCURA_PORT:-8080}"
 AUTH="Authorization: Bearer $API_KEY"
 

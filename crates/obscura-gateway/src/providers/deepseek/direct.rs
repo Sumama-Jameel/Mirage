@@ -356,7 +356,7 @@ impl DirectClient {
                 tracing::debug!(prompt = %p, "Full DeepSeek follow-up prompt sent to upstream");
                 p
             } else {
-                let mtp_prompt = mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false);
+                let mtp_prompt = mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false, mtp::prompt_style_for_model(&request.model));
                 let p = format!("{mtp_prompt}\n\nUser request:\n{prompt}");
                 tracing::info!(prompt_len = p.len(), tools_count = tools.len(), "DeepSeek prompt after MTP injection");
                 tracing::debug!(prompt = %p, "Full DeepSeek prompt sent to upstream");

@@ -66,7 +66,7 @@ The current implementation:
 **Test with this exact output from the screenshot:**
 ```
 Action: read
-Action Input: {"filePath": "/home/sumama/Private/Mirage/obscura/docs/InitialPlan"}
+Action Input: {"filePath": "./docs/InitialPlan"}
 ```
 
 ### CRITICAL: Verify `parse_standalone_json_tool_call` edge cases

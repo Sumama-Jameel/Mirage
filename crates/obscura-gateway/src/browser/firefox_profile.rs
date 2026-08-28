@@ -60,7 +60,21 @@ fn find_profiles_ini() -> Result<PathBuf, GatewayError> {
             )))
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir()
+            .ok_or_else(|| GatewayError::Internal("could not determine home directory".to_string()))?;
+        let path = home.join("Library/Application Support/Firefox/profiles.ini");
+        if path.exists() {
+            Ok(path)
+        } else {
+            Err(GatewayError::Internal(format!(
+                "Firefox profiles.ini not found at {}",
+                path.display()
+            )))
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Err(GatewayError::Internal(
             "Firefox profile discovery is not supported on this platform".to_string(),

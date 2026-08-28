@@ -434,7 +434,8 @@ impl GeminiDirectClient {
                     crate::providers::mtp::build_mtp_system_prompt(
                         tools,
                         request.tool_choice.as_ref(),
-                        false
+                        false,
+                        crate::providers::mtp::prompt_style_for_model(&request.model)
                     ),
                     base_prompt
                 ),

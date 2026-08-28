@@ -109,7 +109,7 @@ impl MtpPipeline {
             ToolDialect::None => request.messages.clone(),
             ToolDialect::Mtp => {
                 let mut messages =
-                    mtp::prepare_request(request, self.profile.quirks.requires_final_reminder).0;
+                    mtp::prepare_request(request, self.profile.quirks.requires_final_reminder, self.profile.quirks.prompt_style).0;
                 if self.profile.quirks.ignores_system_prompt {
                     messages = merge_system_into_first_user(messages);
                 }
@@ -295,7 +295,7 @@ impl MtpPipeline {
         }
         self.repairs_left -= 1;
         let (raw, err) = self.pending_repair.take()?;
-        let prompt = mtp::build_repair_prompt(&err, &raw);
+        let prompt = mtp::build_repair_prompt(&err, &raw, &self.tools);
         Some((
             ChatMessage {
                 role: "user".to_string(),
@@ -393,7 +393,7 @@ mod tests {
         // Emulate the quirk: prepare then fold the system prompt into the
         // first user message.
         let msgs = {
-            let prepared = mtp::prepare_request(&req, false).0;
+            let prepared = mtp::prepare_request(&req, false, mtp::prompt_style_for_model(&req.model)).0;
             merge_system_into_first_user(prepared)
         };
         assert_eq!(msgs[0].role, "user");
@@ -478,7 +478,8 @@ mod tests {
         pipe.finish();
         let (msg, raw) = pipe.next_repair_prompt().expect("one repair attempt");
         assert_eq!(msg.role, "user");
-        assert!(msg.content.as_text().contains("invalid Mirage tool block"));
+        assert!(msg.content.as_text().contains("YOUR PREVIOUS TOOL BLOCK WAS INVALID"));
+        assert!(msg.content.as_text().contains("get_weather"));
         assert!(raw.contains("broken"));
         // Budget exhausted (repair_attempts defaults to 1).
         assert!(pipe.next_repair_prompt().is_none());

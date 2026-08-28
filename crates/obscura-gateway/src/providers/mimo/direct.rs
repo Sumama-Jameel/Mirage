@@ -390,7 +390,8 @@ impl DirectClient {
                 Some(mtp::build_mtp_system_prompt(
                     tools,
                     request.tool_choice.as_ref(),
-                    false
+                    false,
+                    mtp::prompt_style_for_model(&request.model)
                 ))
             };
             crate::providers::mtp::compose_flat_prompt(crate::providers::mtp::FlatPrompt {

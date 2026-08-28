@@ -53,6 +53,29 @@ pub struct Quirks {
     /// The model ignores system prompts; the MTP prompt must be injected
     /// into the user message instead.
     pub ignores_system_prompt: bool,
+    /// Prompt verbosity level. Controls how much format explanation and
+    /// how many examples are included in the MTP system prompt.
+    pub prompt_style: PromptStyle,
+}
+
+/// Prompt verbosity level for the MTP system prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptStyle {
+    /// Short format description, one example. For strong models that
+    /// reliably emit correct MTP blocks (DeepSeek, Qwen).
+    Minimal,
+    /// Full format description, rules, one example, tool menu. Default.
+    Standard,
+    /// Extra rules, multiple examples, explicit "you MUST" language.
+    /// For weak models that frequently emit wrong formats (GLM, Mistral).
+    Verbose,
+}
+
+impl Default for PromptStyle {
+    fn default() -> Self {
+        Self::Standard
+    }
 }
 
 impl Default for Quirks {
@@ -62,6 +85,7 @@ impl Default for Quirks {
             markdown_wraps_tool_calls: false,
             requires_final_reminder: false,
             ignores_system_prompt: false,
+            prompt_style: PromptStyle::Standard,
         }
     }
 }
@@ -115,24 +139,224 @@ impl ProviderProfile {
 pub fn builtin_profiles() -> Vec<ProviderProfile> {
     use Transport::*;
     vec![
-        ProviderProfile::new("deepseek", "deepseek-chat", Sse),
-        ProviderProfile::new("deepseek", "deepseek-reasoner", Sse),
-        ProviderProfile::new("chatgpt", "gpt-4o", Sse),
-        ProviderProfile::new("chatgpt", "gpt-5.6", Sse),
+        // DeepSeek — strong models, minimal prompt needed.
+        ProviderProfile {
+            provider: "deepseek".to_string(),
+            model: "deepseek-chat".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 14,
+            force_one_tool_call: false,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: false,
+                prompt_style: PromptStyle::Minimal,
+                ..Default::default()
+            },
+        },
+        ProviderProfile {
+            provider: "deepseek".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 14,
+            force_one_tool_call: false,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: false,
+                prompt_style: PromptStyle::Minimal,
+                ..Default::default()
+            },
+        },
+        // ChatGPT — standard prompt, no builtin confusion.
+        ProviderProfile {
+            provider: "chatgpt".to_string(),
+            model: "gpt-4o".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 14,
+            force_one_tool_call: false,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: false,
+                prompt_style: PromptStyle::Standard,
+                ..Default::default()
+            },
+        },
+        ProviderProfile {
+            provider: "chatgpt".to_string(),
+            model: "gpt-5.6".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 14,
+            force_one_tool_call: true,
+            repair_attempts: 2,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                ignores_system_prompt: true,
+                requires_final_reminder: true,
+                prompt_style: PromptStyle::Standard,
+                ..Default::default()
+            },
+        },
+        // Claude — standard prompt.
         ProviderProfile::new("claude", "claude-opus-5", Sse),
         ProviderProfile::new("claude", "claude-sonnet-5", Sse),
-        ProviderProfile::new("gemini", "gemini-3.6-flash", Framed),
-        ProviderProfile::new("gemini", "gemini-3.1-pro", Framed),
-        ProviderProfile::new("glm", "glm-5.2", Sse),
-        ProviderProfile::new("glm", "glm-4-plus", Sse),
+        // Gemini — standard prompt, needs extra examples.
+        ProviderProfile {
+            provider: "gemini".to_string(),
+            model: "gemini-3.6-flash".to_string(),
+            transport: Framed,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                prompt_style: PromptStyle::Verbose,
+                ..Default::default()
+            },
+        },
+        ProviderProfile {
+            provider: "gemini".to_string(),
+            model: "gemini-3.1-pro".to_string(),
+            transport: Framed,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                prompt_style: PromptStyle::Verbose,
+                ..Default::default()
+            },
+        },
+        // GLM — weak model, verbose prompt, extra reminders.
+        ProviderProfile {
+            provider: "glm".to_string(),
+            model: "glm-5.2".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 2,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                requires_final_reminder: true,
+                prompt_style: PromptStyle::Verbose,
+                ..Default::default()
+            },
+        },
+        ProviderProfile {
+            provider: "glm".to_string(),
+            model: "glm-4-plus".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 2,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                requires_final_reminder: true,
+                prompt_style: PromptStyle::Verbose,
+                ..Default::default()
+            },
+        },
+        // Grok — standard prompt.
         ProviderProfile::new("grok", "grok-4", Sse),
-        ProviderProfile::new("kimi", "k2d6-chat", Framed),
-        ProviderProfile::new("kimi", "k2.6-thinking", Framed),
-        ProviderProfile::new("metaai", "meta-ai", WebSocket),
-        ProviderProfile::new("minimax", "minimax-m1", Sse),
-        ProviderProfile::new("mistral", "mistral-large", Sse),
-        ProviderProfile::new("mimo", "mimo", Sse),
-        ProviderProfile::new("qwen", "qwen3-max", Sse),
+        // Kimi — needs forced tool_choice, fewer tools.
+        ProviderProfile {
+            provider: "kimi".to_string(),
+            model: "k2d6-chat".to_string(),
+            transport: Framed,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                prompt_style: PromptStyle::Standard,
+                ..Default::default()
+            },
+        },
+        ProviderProfile {
+            provider: "kimi".to_string(),
+            model: "k2.6-thinking".to_string(),
+            transport: Framed,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                prompt_style: PromptStyle::Standard,
+                ..Default::default()
+            },
+        },
+        // MetaAI — weak model, verbose prompt, extra reminders, builtin confusion.
+        ProviderProfile {
+            provider: "metaai".to_string(),
+            model: "muse-spark".to_string(),
+            transport: WebSocket,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 2,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                requires_final_reminder: true,
+                prompt_style: PromptStyle::Verbose,
+                ..Default::default()
+            },
+        },
+        // Minimax — standard prompt.
+        ProviderProfile::new("minimax", "minimax-m3", Sse),
+        // Mistral — weak model, verbose prompt.
+        ProviderProfile {
+            provider: "mistral".to_string(),
+            model: "mistral-large-latest".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 5,
+            force_one_tool_call: true,
+            repair_attempts: 2,
+            quirks: Quirks {
+                builtin_tool_confusion: true,
+                requires_final_reminder: true,
+                prompt_style: PromptStyle::Verbose,
+                ..Default::default()
+            },
+        },
+        // MiMo — standard prompt.
+        ProviderProfile::new("mimo", "mimo-v2.5", Sse),
+        // Qwen — strong model, minimal prompt.
+        ProviderProfile {
+            provider: "qwen".to_string(),
+            model: "qwen3-max".to_string(),
+            transport: Sse,
+            tool_dialect: ToolDialect::Mtp,
+            strip_upstream_tools: true,
+            max_tools: 14,
+            force_one_tool_call: false,
+            repair_attempts: 1,
+            quirks: Quirks {
+                builtin_tool_confusion: false,
+                prompt_style: PromptStyle::Minimal,
+                ..Default::default()
+            },
+        },
     ]
 }
 

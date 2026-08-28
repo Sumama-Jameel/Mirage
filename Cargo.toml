@@ -12,7 +12,12 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/h4ckf0r0day/obscura"
+repository = "https://github.com/Sumama-Jameel/Mirage"
+homepage = "https://github.com/Sumama-Jameel/Mirage"
+description = "Open source AI gateway. Free internal APIs through one OpenAI-compatible endpoint."
+authors = ["Sumama Jameel"]
+keywords = ["ai", "gateway", "llm", "openai", "proxy"]
+categories = ["command-line-utilities", "web-programming"]
 
 [workspace.dependencies]
 obscura-dom = { path = "crates/obscura-dom" }

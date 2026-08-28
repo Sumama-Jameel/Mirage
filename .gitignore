@@ -4,6 +4,50 @@ target/
 .opencode/
 .kimchi/
 .DS_Store
+Thumbs.db
+Desktop.ini
 .gateway.pid
 gateway.log
 *.log
+
+# Sensitive data
+captures/
+obscura-gateway.toml
+*.ndjson
+*.sqlite
+cookies.sqlite
+session_vault/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# Internal docs (not for public consumption)
+docs/SESSION_*.md
+docs/STATUS_*.md
+docs/BROKEN_FEATURES.md
+docs/BROKEN_FEATURES_INVESTIGATION.md
+docs/WillAddLater
+docs/MINIMAX_ARCHON_CONSTANTS.txt
+docs/EXTRACT_GROK_CONSTANTS.txt
+docs/InitialPlan*
+docs/PROGRESS_SUMMARY.md
+docs/GOAL_VERIFICATION.md
+docs/RESEARCH_FEATURES*.md
+GOAL.md
+docs/MIMO_PROTOCOL.md
+docs/MISTRAL_PROTOCOL.md
+docs/GLM_FREE_WEB_PROTOCOL.md
+docs/GLM_LIMITATION.md
+docs/GEMINI_TOOL_CALLING_WIRE_FORMAT.md
+docs/KIMI_K3_NATIVE_RESPONSE.md
+docs/PROVIDER_AUTH_MATRIX.md

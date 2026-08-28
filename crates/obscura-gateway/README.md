@@ -1,6 +1,6 @@
 # Obscura Gateway
 
-A local, OpenAI-compatible API gateway that sits in front of free web UI AI models. It uses the [Obscura](https://github.com/h4ckf0r0day/obscura) Rust headless browser to reuse your own browser session cookies and expose provider chat interfaces as standard `/v1/chat/completions` endpoints.
+A local, OpenAI-compatible API gateway that sits in front of free web UI AI models. It uses the [Obscura](https://github.com/Sumama-Jameel/Mirage) Rust headless browser to reuse your own browser session cookies and expose provider chat interfaces as standard `/v1/chat/completions` endpoints.
 
 **Supported providers:** DeepSeek, ChatGPT, Gemini, Kimi, GLM, Claude, and Meta AI. Every provider prefers its web app's internal background API (no provider API keys or PoW solvers) using native browser-session auth imported from your profile; Kimi, GLM, and Claude fall back to driving the authenticated public chat page only when the direct path is unavailable. Meta AI talks directly to Meta's Ecto-era DGW WebSocket with native browser-session auth (meta.ai cookies + the page-injected `ecto1:` token).
 
@@ -25,7 +25,7 @@ A local, OpenAI-compatible API gateway that sits in front of free web UI AI mode
 From the workspace root:
 
 ```bash
-cd /home/sumama/Private/unnamed/obscura
+cd Mirage
 cargo build -p obscura-gateway
 ```
 

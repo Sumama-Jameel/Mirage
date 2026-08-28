@@ -7,7 +7,7 @@ description: Use Obscura — a Rust headless browser with a Chrome DevTools Prot
 
 Single-developer, open-source Rust headless browser. Boots instantly, ~70 MB binary, ~30 MB RAM at runtime, and serves a Chrome DevTools Protocol port that Puppeteer and Playwright connect to unchanged. **You swap the binary, not the code.**
 
-Repo: https://github.com/h4ckf0r0day/obscura
+Repo: https://github.com/Sumama-Jameel/Mirage
 
 ## Why pick Obscura over Chrome
 
@@ -25,8 +25,8 @@ Obscura is roughly as fast as warm Chrome, ~2× faster cold, parallelizes far be
 ## Build
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
-cd obscura
+git clone https://github.com/Sumama-Jameel/Mirage.git
+cd Mirage
 CARGO_TARGET_DIR=/tmp/obscura-target cargo build -p obscura-cli --bin obscura
 ```
 

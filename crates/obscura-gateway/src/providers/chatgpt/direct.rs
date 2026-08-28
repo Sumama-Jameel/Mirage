@@ -393,30 +393,39 @@ impl ChatGptDirectClient {
         Ok(resp)
     }
 
-    /// Set thinking effort for o-series models via the PATCH settings endpoint.
+    /// Set the model slug (and optionally thinking effort) via the PATCH
+    /// settings endpoint.
     ///
     /// Sends `PATCH /backend-api/settings/user_last_used_model_config`
-    /// with `model_slug` and `thinking_effort=extended` when thinking is
-    /// enabled. Results are cached per `(model_slug, effort)` for 5 minutes
+    /// with `model_slug=` on every request so the backend uses the
+    /// correct model. When `enabled` is true, also appends
+    /// `&thinking_effort=extended`.
+    ///
+    /// Results are cached per `(model_slug, effort)` for 5 minutes
     /// so a rapid sequence of calls does not hammer the endpoint.
     ///
     /// Non-fatal: if the PATCH fails, a warning is logged and the
-    /// conversation proceeds without thinking enabled.
-    async fn set_thinking_effort(&mut self, model_slug: &str, enabled: bool) {
-        if !enabled {
-            return;
-        }
-
-        let cache_key = format!("{}:extended", model_slug);
+    /// conversation proceeds.
+    async fn set_model_and_thinking(&mut self, model_slug: &str, enabled: bool) {
+        let effort_str = if enabled { "extended" } else { "default" };
+        let cache_key = format!("{}:{}", model_slug, effort_str);
         if self.thinking_cache.get(&cache_key).is_some_and(|expires| *expires > Instant::now()) {
             return;
         }
 
-        let url = format!(
-            "{}/backend-api/settings/user_last_used_model_config?model_slug={}&thinking_effort=extended",
-            CHATGPT_URL,
-            model_slug,
-        );
+        let url = if enabled {
+            format!(
+                "{}/backend-api/settings/user_last_used_model_config?model_slug={}&thinking_effort=extended",
+                CHATGPT_URL,
+                model_slug,
+            )
+        } else {
+            format!(
+                "{}/backend-api/settings/user_last_used_model_config?model_slug={}",
+                CHATGPT_URL,
+                model_slug,
+            )
+        };
 
         let resp = self
             .http
@@ -435,14 +444,14 @@ impl ChatGptDirectClient {
                     %status,
                     body = %body,
                     model = %model_slug,
-                    "thinking-effort PATCH returned non-success"
+                    "model-config PATCH returned non-success"
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     model = %model_slug,
-                    "thinking-effort PATCH failed"
+                    "model-config PATCH failed"
                 );
             }
         }
@@ -731,7 +740,7 @@ impl ChatGptDirectClient {
         // Universal MTP/1 dialect: compile tools into the prompted
         // tool-output protocol (replaces the legacy <tool_call> hint).
         let instruction =
-            mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false);
+            mtp::build_mtp_system_prompt(tools, request.tool_choice.as_ref(), false, mtp::prompt_style_for_model(&request.model));
 
         messages.insert(0, ChatMessage {
             role: "system".to_string(),
@@ -897,7 +906,7 @@ impl ChatGptDirectClient {
 
         // Set thinking effort via PATCH before the conversation request
         let model_slug = self.internal_model_id.clone();
-        self.set_thinking_effort(&model_slug, request.thinking == Some(true)).await;
+        self.set_model_and_thinking(&model_slug, request.thinking == Some(true)).await;
 
         let (_body, conversation_id, message_id, clean_text, thinking, parsed_tool_calls) =
             {
@@ -1132,7 +1141,7 @@ impl ChatGptDirectClient {
 
         // Set thinking effort via PATCH before spawning the stream task
         let model_slug = self.internal_model_id.clone();
-        self.set_thinking_effort(&model_slug, request.thinking == Some(true)).await;
+        self.set_model_and_thinking(&model_slug, request.thinking == Some(true)).await;
 
         // We need to track whether the request had tools so the post-loop
         // pass can decide whether to run `<tool_call>` extraction. A flag
